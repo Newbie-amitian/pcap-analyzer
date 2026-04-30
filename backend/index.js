@@ -351,8 +351,8 @@ function parsePcap(buffer) {
         const ihl = (packetData[ipStart] & 0x0f) * 4;
         const ipProto = packetData[ipStart + 9];
         packet.ttl = packetData[ipStart + 8];
-        packet.src_ip = `${packetData[ipStart + 12]}.${packetData[ipStart + 13]}.${packetData[ipStart + 14]}.${packetData[ipStart + 15]}`;
-        packet.dst_ip = `${packetData[ipStart + 16]}.${packetData[ipStart + 17]}.${packetData[ipStart + 18]}.${packetData[ipStart + 19]}`;
+        packet.src_ip = `${packetData[ipStart+12]}.${packetData[ipStart+13]}.${packetData[ipStart+14]}.${packetData[ipStart+15]}`;
+        packet.dst_ip = `${packetData[ipStart+16]}.${packetData[ipStart+17]}.${packetData[ipStart+18]}.${packetData[ipStart+19]}`;
         const transportStart = ipStart + ihl;
 
         if (ipProto === 6 && packetData.length >= transportStart + 20) {
@@ -481,62 +481,82 @@ function getQuery(url) {
 //  6. Handle chunked transfer encoding
 //  7. Return all object types (images, HTML, JS, CSS, JSON, etc.)
 // ══════════════════════════════════════════════════════════════
+// WIRESHARK-STYLE HTTP OBJECT EXTRACTOR — fully fixed
+// ══════════════════════════════════════════════════════════════
 function extractHttpObjects(packets) {
-  const HTTP_PORTS = [80, 8080, 8000, 8888, 3000, 3001];
+  // FIX 1: Broaden port detection — any port < 1024 on server side
+  // can serve HTTP. Also keep explicit list for common alt ports.
+  const KNOWN_HTTP_PORTS = new Set([80, 8080, 8000, 8008, 8888, 3000, 3001, 5000, 4000, 9090]);
 
   // ── Step 1: Group into TCP streams ───────────────────────────
-  // Each stream is keyed by canonical 4-tuple (lower port first)
   const streamMap = new Map();
 
   for (const pkt of packets) {
     if (!pkt.raw_payload || pkt.raw_payload.length === 0) continue;
     if (!pkt.src_ip || !pkt.dst_ip || !pkt.src_port || !pkt.dst_port) continue;
-    if (pkt.seq_num === null) continue;
+    // FIX 2: Don't skip packets with null seq_num — fall back to packet id
+    const seqNum = pkt.seq_num !== null ? pkt.seq_num : pkt.id * 1500;
 
-    // Only process HTTP traffic (both directions)
-    const isHttpPort = HTTP_PORTS.includes(pkt.src_port) || HTTP_PORTS.includes(pkt.dst_port);
-    if (!isHttpPort) continue;
+    // Determine direction: server is the lower-numbered port OR known HTTP port
+    const srcIsServer = KNOWN_HTTP_PORTS.has(pkt.src_port) || (!KNOWN_HTTP_PORTS.has(pkt.dst_port) && pkt.src_port < pkt.dst_port);
 
-    // Canonical key — same for both directions
-    let key, isServer;
-    if (HTTP_PORTS.includes(pkt.src_port)) {
-      // This packet is server → client (response)
-      key = `${pkt.dst_ip}:${pkt.dst_port}-${pkt.src_ip}:${pkt.src_port}`;
-      isServer = true;
-    } else {
-      // This packet is client → server (request)
-      key = `${pkt.src_ip}:${pkt.src_port}-${pkt.dst_ip}:${pkt.dst_port}`;
-      isServer = false;
-    }
+    // Only include packets where at least one side looks like HTTP
+    const srcIsHttp = KNOWN_HTTP_PORTS.has(pkt.src_port);
+    const dstIsHttp = KNOWN_HTTP_PORTS.has(pkt.dst_port);
+    // FIX 3: Also detect HTTP by payload content for non-standard ports
+    const payloadStr = pkt.raw_payload.slice(0, 16).toString('utf8', 0, 16);
+    const looksLikeHttp = payloadStr.startsWith('HTTP/') || /^(GET|POST|PUT|HEAD) /.test(payloadStr);
+    if (!srcIsHttp && !dstIsHttp && !looksLikeHttp) continue;
+
+    const isServer = srcIsServer;
+    // Canonical stream key: always clientIP:clientPort-serverIP:serverPort
+    const clientIp = isServer ? pkt.dst_ip : pkt.src_ip;
+    const clientPort = isServer ? pkt.dst_port : pkt.src_port;
+    const serverIp = isServer ? pkt.src_ip : pkt.dst_ip;
+    const serverPort = isServer ? pkt.src_port : pkt.dst_port;
+    const key = `${clientIp}:${clientPort}-${serverIp}:${serverPort}`;
 
     if (!streamMap.has(key)) {
       streamMap.set(key, {
-        clientIp: isServer ? pkt.dst_ip : pkt.src_ip,
-        serverIp: isServer ? pkt.src_ip : pkt.dst_ip,
-        serverPort: isServer ? pkt.src_port : pkt.dst_port,
-        requests: [],   // { seq_num, payload, packet_id }
-        responses: [],  // { seq_num, payload, packet_id }
+        clientIp, serverIp, serverPort, clientPort,
+        requests: [],
+        responses: [],
       });
     }
 
     const stream = streamMap.get(key);
+    const entry = { seq_num: seqNum, payload: pkt.raw_payload, packet_id: pkt.id };
     if (isServer) {
-      stream.responses.push({ seq_num: pkt.seq_num, payload: pkt.raw_payload, packet_id: pkt.id });
+      stream.responses.push(entry);
     } else {
-      stream.requests.push({ seq_num: pkt.seq_num, payload: pkt.raw_payload, packet_id: pkt.id });
+      stream.requests.push(entry);
     }
   }
 
   // ── Step 2 & 3: Sort by seq_num + reassemble ─────────────────
+  // FIX 4: Handle TCP sequence number wrap-around (32-bit rollover)
+  function seqSort(a, b) {
+    const diff = (a.seq_num - b.seq_num) | 0; // signed 32-bit subtraction handles wrap
+    return diff;
+  }
+
   const objects = [];
   const seen = new Set();
+  const extMap = {
+    'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/png': '.png',
+    'image/gif': '.gif', 'image/webp': '.webp', 'image/bmp': '.bmp',
+    'image/svg+xml': '.svg', 'image/x-icon': '.ico',
+    'text/html': '.html', 'text/css': '.css',
+    'text/javascript': '.js', 'application/javascript': '.js',
+    'application/x-javascript': '.js', 'application/json': '.json',
+    'application/xml': '.xml', 'text/xml': '.xml',
+    'application/pdf': '.pdf', 'font/woff': '.woff', 'font/woff2': '.woff2',
+  };
 
   for (const [, stream] of streamMap) {
-    // Sort both directions by TCP sequence number
-    stream.requests.sort((a, b) => a.seq_num - b.seq_num);
-    stream.responses.sort((a, b) => a.seq_num - b.seq_num);
+    stream.requests.sort(seqSort);
+    stream.responses.sort(seqSort);
 
-    // Reassemble bytes in order
     const reqBytes = stream.requests.length > 0
       ? Buffer.concat(stream.requests.map(r => r.payload))
       : Buffer.alloc(0);
@@ -544,120 +564,111 @@ function extractHttpObjects(packets) {
       ? Buffer.concat(stream.responses.map(r => r.payload))
       : Buffer.alloc(0);
 
-    const firstReqPacketId = stream.requests[0]?.packet_id ?? 0;
+    if (respBytes.length < 12) continue;
+
     const firstRespPacketId = stream.responses[0]?.packet_id ?? 0;
 
-    // ── Step 4: Parse HTTP request ────────────────────────────
+    // ── Step 4: Parse HTTP request for URI + Host ─────────────
     let requestUri = '/';
     let hostname = stream.serverIp;
     let method = 'GET';
 
-    if (reqBytes.length > 0) {
-      const reqStr = reqBytes.slice(0, 2048).toString('utf8', 0, 2048).replace(/[^\x09\x0a\x0d\x20-\x7e]/g, '');
-      // Parse request line: GET /path/file.jpg HTTP/1.1
-      const reqLine = reqStr.match(/^(GET|POST|PUT|HEAD|DELETE|OPTIONS)\s+([^\s]+)\s+HTTP/i);
+    if (reqBytes.length > 4) {
+      // FIX 5: Use regex search not startsWith — request may not start at byte 0
+      const reqStr = reqBytes.slice(0, 4096).toString('binary');
+      const reqLine = reqStr.match(/(GET|POST|PUT|HEAD|DELETE|OPTIONS)\s+([^\s]+)\s+HTTP/i);
       if (reqLine) {
         method = reqLine[1].toUpperCase();
         requestUri = reqLine[2];
       }
-      // Parse Host header
       const hostMatch = reqStr.match(/Host:\s*([^\r\n]+)/i);
-      if (hostMatch) hostname = hostMatch[1].trim().split(':')[0]; // strip port if present
+      if (hostMatch) hostname = hostMatch[1].trim().split(':')[0];
     }
 
-    if (respBytes.length < 12) continue;
+    // ── Step 5: Find HTTP response start (FIX 6: scan, not startsWith) ───
+    // Response may not start at byte 0 if stream was captured mid-way
+    let respStart = 0;
+    const httpMarker = respBytes.indexOf(Buffer.from('HTTP/'));
+    if (httpMarker === -1) continue; // no HTTP response in this stream
+    if (httpMarker > 0) respStart = httpMarker;
 
-    // ── Step 5: Parse HTTP response headers ───────────────────
-    const headerEnd = respBytes.indexOf(Buffer.from('\r\n\r\n'));
+    const headerSearchBuf = respBytes.slice(respStart);
+    const headerEnd = headerSearchBuf.indexOf(Buffer.from('\r\n\r\n'));
     if (headerEnd === -1) continue;
 
-    const headerStr = respBytes.slice(0, headerEnd).toString('utf8', 0, headerEnd).replace(/[^\x09\x0a\x0d\x20-\x7e]/g, '');
+    const headerStr = headerSearchBuf.slice(0, headerEnd).toString('binary');
 
-    // Must be HTTP response
-    if (!headerStr.startsWith('HTTP/')) continue;
-
-    // Parse status code
+    // Parse status — accept 200, 203, 206 (partial content)
     const statusMatch = headerStr.match(/HTTP\/[\d.]+\s+(\d+)/);
     const statusCode = statusMatch ? parseInt(statusMatch[1]) : 0;
-    if (statusCode < 200 || statusCode >= 400) continue; // skip errors and redirects
+    if (![200, 203, 206, 304].includes(statusCode) && (statusCode < 200 || statusCode > 299)) continue;
 
-    // Parse Content-Type
-    const ctMatch = headerStr.match(/Content-Type:\s*([^\r\n;]+)/i);
-    const contentType = ctMatch ? ctMatch[1].trim().toLowerCase() : 'application/octet-stream';
+    // Parse Content-Type — FIX 7: also match with charset suffix
+    const ctMatch = headerStr.match(/Content-Type:\s*([^\r\n]+)/i);
+    const rawCt = ctMatch ? ctMatch[1].trim().toLowerCase() : '';
+    const contentType = rawCt.split(';')[0].trim() || 'application/octet-stream';
 
-    // Skip types we don't care about
-    const skipTypes = ['text/plain', 'application/octet-stream'];
-    const isInteresting = contentType.startsWith('image/') ||
-      contentType.includes('html') ||
-      contentType.includes('javascript') ||
-      contentType.includes('css') ||
-      contentType.includes('json') ||
-      contentType.includes('xml') ||
-      contentType.includes('font') ||
-      contentType.includes('pdf');
-    if (!isInteresting && skipTypes.some(t => contentType.startsWith(t))) continue;
+    // FIX 8: Accept everything except truly boring types
+    const boringTypes = ['application/octet-stream', 'text/plain', 'application/x-www-form-urlencoded'];
+    if (boringTypes.includes(contentType) && !contentType.startsWith('image/')) continue;
+    // Must be something worth showing
+    const isWorthShowing = contentType.startsWith('image/') ||
+      contentType.includes('html') || contentType.includes('javascript') ||
+      contentType.includes('css') || contentType.includes('json') ||
+      contentType.includes('xml') || contentType.includes('font') ||
+      contentType.includes('pdf') || contentType.includes('svg');
+    if (!isWorthShowing) continue;
 
-    // Parse Content-Length
+    // Parse Content-Length + Transfer-Encoding
     const clMatch = headerStr.match(/Content-Length:\s*(\d+)/i);
     const contentLength = clMatch ? parseInt(clMatch[1]) : null;
-
-    // Parse Transfer-Encoding
     const isChunked = /Transfer-Encoding:\s*chunked/i.test(headerStr);
 
-    // ── Step 6: Extract body + handle chunked encoding ────────
-    let body = respBytes.slice(headerEnd + 4);
+    // ── Step 6: Extract + dechunk body ────────────────────────
+    let body = headerSearchBuf.slice(headerEnd + 4);
 
-    if (isChunked) {
+    if (isChunked && body.length > 0) {
       try {
         const dechunked = [];
         let pos = 0;
-        while (pos < body.length) {
+        let safety = 0;
+        while (pos < body.length && safety++ < 10000) {
           const lineEnd = body.indexOf(Buffer.from('\r\n'), pos);
-          if (lineEnd === -1 || lineEnd === pos) break;
-          const chunkSizeHex = body.slice(pos, lineEnd).toString().trim().split(';')[0]; // strip chunk extensions
+          if (lineEnd === -1) break;
+          const chunkSizeHex = body.slice(pos, lineEnd).toString().trim().split(';')[0];
           const chunkSize = parseInt(chunkSizeHex, 16);
           if (isNaN(chunkSize) || chunkSize === 0) break;
           const chunkStart = lineEnd + 2;
-          if (chunkStart + chunkSize > body.length) {
-            // Partial chunk — take what we have
-            dechunked.push(body.slice(chunkStart));
-            break;
-          }
-          dechunked.push(body.slice(chunkStart, chunkStart + chunkSize));
-          pos = chunkStart + chunkSize + 2; // skip trailing \r\n
+          if (chunkStart >= body.length) break;
+          const end = Math.min(chunkStart + chunkSize, body.length);
+          dechunked.push(body.slice(chunkStart, end));
+          pos = chunkStart + chunkSize + 2;
         }
         if (dechunked.length > 0) body = Buffer.concat(dechunked);
       } catch (_) { }
     }
 
-    if (body.length < 10) continue;
+    // FIX 9: Lower minimum body size — some files are small (favicon = ~32 bytes)
+    if (body.length < 4) continue;
 
-    // ── Step 7: Build filename from URI ───────────────────────
-    // e.g. /images/photo.jpg → photo.jpg
-    // e.g. /api/data → data (with extension from content-type)
-    let filename = requestUri.split('/').pop()?.split('?')[0] || 'index';
-    if (!filename || filename === '') filename = 'index';
+    // ── Step 7: Build filename ────────────────────────────────
+    let filename = (requestUri.split('/').pop() || '').split('?')[0];
+    if (!filename) filename = hostname.replace(/\./g, '_') + '_index';
 
     // Add extension from content-type if missing
-    const extMap = {
-      'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
-      'image/webp': '.webp', 'image/bmp': '.bmp', 'image/svg+xml': '.svg',
-      'text/html': '.html', 'text/css': '.css', 'text/javascript': '.js',
-      'application/javascript': '.js', 'application/json': '.json',
-      'application/xml': '.xml', 'text/xml': '.xml', 'application/pdf': '.pdf',
-    };
     const expectedExt = extMap[contentType];
     if (expectedExt && !filename.includes('.')) filename += expectedExt;
+    if (filename.length > 80) filename = filename.slice(0, 80); // cap length
 
-    // Deduplicate by hostname + uri
+    // Deduplicate by hostname+uri
     const dedupKey = `${hostname}${requestUri}`;
     if (seen.has(dedupKey)) continue;
     seen.add(dedupKey);
 
-    // Build data URL for images (for preview)
-    let url = undefined;
-    const isImage = contentType.startsWith('image/');
-    if (isImage && body.length < 4 * 1024 * 1024) { // only embed images < 4MB
+    // Build data URL for images only (keeps response size sane)
+    const isImage = contentType.startsWith('image/') || contentType.includes('svg');
+    let url;
+    if (isImage && body.length < 5 * 1024 * 1024) {
       url = `data:${contentType};base64,${body.toString('base64')}`;
     }
 
@@ -672,13 +683,12 @@ function extractHttpObjects(packets) {
       src_ip: stream.serverIp,
       dst_ip: stream.clientIp,
       src_port: stream.serverPort,
-      dst_port: stream.responses[0] ? stream.requests[0]?.seq_num ?? 0 : 0,
+      dst_port: stream.clientPort,  // FIX 10: was accidentally set to seq_num before
       url,
       is_image: isImage,
     });
   }
 
-  // Sort by packet number (Wireshark order)
   objects.sort((a, b) => a.packet_num - b.packet_num);
   return objects;
 }
@@ -687,7 +697,7 @@ function extractHttpObjects(packets) {
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || '';
 if (RENDER_URL) {
   setInterval(() => {
-    https.get(`${RENDER_URL}/pcap/health`, () => { }).on('error', () => { });
+    https.get(`${RENDER_URL}/pcap/health`, () => {}).on('error', () => {});
     console.log('[Keep-alive] ping sent');
   }, 9 * 60 * 1000);
 }
