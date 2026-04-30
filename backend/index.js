@@ -50,46 +50,46 @@ const PROTOCOL_MAP = {
 };
 
 const VULNERABLE_PORTS = {
-  21:    { risk: 'HIGH',     reason: 'FTP transmits credentials in plaintext' },
-  23:    { risk: 'CRITICAL', reason: 'Telnet transmits everything in plaintext including passwords' },
-  25:    { risk: 'MEDIUM',   reason: 'SMTP can be exploited for spam/relay if misconfigured' },
-  53:    { risk: 'LOW',      reason: 'DNS can be used for tunneling or amplification attacks' },
-  69:    { risk: 'HIGH',     reason: 'TFTP has no authentication' },
-  80:    { risk: 'MEDIUM',   reason: 'HTTP transmits data in plaintext' },
-  110:   { risk: 'HIGH',     reason: 'POP3 transmits credentials in plaintext' },
-  135:   { risk: 'HIGH',     reason: 'RPC endpoint mapper — common attack vector' },
-  137:   { risk: 'HIGH',     reason: 'NetBIOS — information leakage risk' },
-  139:   { risk: 'HIGH',     reason: 'NetBIOS Session — lateral movement risk' },
-  143:   { risk: 'MEDIUM',   reason: 'IMAP may transmit credentials in plaintext' },
-  161:   { risk: 'HIGH',     reason: 'SNMP v1/v2 use plaintext community strings' },
-  389:   { risk: 'MEDIUM',   reason: 'LDAP without TLS exposes directory data' },
-  445:   { risk: 'CRITICAL', reason: 'SMB — EternalBlue / ransomware vector' },
-  1080:  { risk: 'HIGH',     reason: 'SOCKS proxy — potential data exfiltration' },
-  1433:  { risk: 'HIGH',     reason: 'MSSQL exposed to network — brute force risk' },
-  1521:  { risk: 'HIGH',     reason: 'Oracle DB exposed — brute force risk' },
-  1723:  { risk: 'MEDIUM',   reason: 'PPTP VPN — weak encryption (MS-CHAPv2)' },
-  3306:  { risk: 'HIGH',     reason: 'MySQL exposed — brute force / data exfil risk' },
-  3389:  { risk: 'HIGH',     reason: 'RDP — BlueKeep / brute force attack vector' },
-  4444:  { risk: 'CRITICAL', reason: 'Metasploit default port — likely backdoor!' },
-  5432:  { risk: 'HIGH',     reason: 'PostgreSQL exposed — brute force risk' },
-  5900:  { risk: 'HIGH',     reason: 'VNC often uses weak/no authentication' },
-  6379:  { risk: 'CRITICAL', reason: 'Redis with no auth — full server compromise risk' },
-  6667:  { risk: 'MEDIUM',   reason: 'IRC — often used by botnets for C2' },
-  8080:  { risk: 'LOW',      reason: 'Alternate HTTP — may expose dev/admin panels' },
-  9200:  { risk: 'CRITICAL', reason: 'Elasticsearch with no auth — data breach risk' },
+  21: { risk: 'HIGH', reason: 'FTP transmits credentials in plaintext' },
+  23: { risk: 'CRITICAL', reason: 'Telnet transmits everything in plaintext including passwords' },
+  25: { risk: 'MEDIUM', reason: 'SMTP can be exploited for spam/relay if misconfigured' },
+  53: { risk: 'LOW', reason: 'DNS can be used for tunneling or amplification attacks' },
+  69: { risk: 'HIGH', reason: 'TFTP has no authentication' },
+  80: { risk: 'MEDIUM', reason: 'HTTP transmits data in plaintext' },
+  110: { risk: 'HIGH', reason: 'POP3 transmits credentials in plaintext' },
+  135: { risk: 'HIGH', reason: 'RPC endpoint mapper — common attack vector' },
+  137: { risk: 'HIGH', reason: 'NetBIOS — information leakage risk' },
+  139: { risk: 'HIGH', reason: 'NetBIOS Session — lateral movement risk' },
+  143: { risk: 'MEDIUM', reason: 'IMAP may transmit credentials in plaintext' },
+  161: { risk: 'HIGH', reason: 'SNMP v1/v2 use plaintext community strings' },
+  389: { risk: 'MEDIUM', reason: 'LDAP without TLS exposes directory data' },
+  445: { risk: 'CRITICAL', reason: 'SMB — EternalBlue / ransomware vector' },
+  1080: { risk: 'HIGH', reason: 'SOCKS proxy — potential data exfiltration' },
+  1433: { risk: 'HIGH', reason: 'MSSQL exposed to network — brute force risk' },
+  1521: { risk: 'HIGH', reason: 'Oracle DB exposed — brute force risk' },
+  1723: { risk: 'MEDIUM', reason: 'PPTP VPN — weak encryption (MS-CHAPv2)' },
+  3306: { risk: 'HIGH', reason: 'MySQL exposed — brute force / data exfil risk' },
+  3389: { risk: 'HIGH', reason: 'RDP — BlueKeep / brute force attack vector' },
+  4444: { risk: 'CRITICAL', reason: 'Metasploit default port — likely backdoor!' },
+  5432: { risk: 'HIGH', reason: 'PostgreSQL exposed — brute force risk' },
+  5900: { risk: 'HIGH', reason: 'VNC often uses weak/no authentication' },
+  6379: { risk: 'CRITICAL', reason: 'Redis with no auth — full server compromise risk' },
+  6667: { risk: 'MEDIUM', reason: 'IRC — often used by botnets for C2' },
+  8080: { risk: 'LOW', reason: 'Alternate HTTP — may expose dev/admin panels' },
+  9200: { risk: 'CRITICAL', reason: 'Elasticsearch with no auth — data breach risk' },
   27017: { risk: 'CRITICAL', reason: 'MongoDB with no auth — full DB exposure risk' },
 };
 
 const PORT_KNOWLEDGE = {
-  21:    { name: 'FTP', description: 'File Transfer Protocol', risk: 'HIGH', secure_alternative: 'Use SFTP (port 22) or FTPS (port 990)', common_uses: ['File transfers', 'Web hosting uploads'], vulnerabilities: ['Plaintext credentials', 'Anonymous login', 'Bounce attacks'], recommendations: ['Disable FTP, use SFTP instead', 'If required, use FTPS with TLS', 'Disable anonymous login'] },
-  22:    { name: 'SSH', description: 'Secure Shell', risk: 'SECURE', secure_alternative: 'Already secure', common_uses: ['Remote admin', 'Tunneling', 'SFTP'], vulnerabilities: ['Brute force', 'Weak keys'], recommendations: ['Use key-based auth', 'Disable root login', 'Use fail2ban'] },
-  23:    { name: 'TELNET', description: 'Telnet Protocol', risk: 'CRITICAL', secure_alternative: 'Use SSH (port 22)', common_uses: ['Legacy remote admin', 'Network device management'], vulnerabilities: ['Plaintext everything', 'No encryption', 'MITM attacks'], recommendations: ['Immediately disable Telnet', 'Replace with SSH', 'Block at firewall'] },
-  80:    { name: 'HTTP', description: 'HyperText Transfer Protocol', risk: 'MEDIUM', secure_alternative: 'Use HTTPS (port 443)', common_uses: ['Web browsing', 'APIs', 'Web apps'], vulnerabilities: ['Plaintext data', 'Session hijacking', 'MITM'], recommendations: ['Redirect all HTTP to HTTPS', 'Use HSTS headers'] },
-  443:   { name: 'HTTPS', description: 'HTTP Secure', risk: 'SECURE', secure_alternative: 'Already secure', common_uses: ['Secure web browsing', 'APIs', 'Web apps'], vulnerabilities: ['Weak TLS configs', 'Expired certs'], recommendations: ['Use TLS 1.2+', 'Enable HSTS', 'Renew certificates'] },
-  445:   { name: 'SMB', description: 'Server Message Block', risk: 'CRITICAL', secure_alternative: 'Use VPN + SMB, or SFTP', common_uses: ['File sharing', 'Windows networking'], vulnerabilities: ['EternalBlue (MS17-010)', 'WannaCry', 'NotPetya'], recommendations: ['Block at perimeter', 'Patch immediately', 'Disable SMBv1'] },
-  3389:  { name: 'RDP', description: 'Remote Desktop Protocol', risk: 'HIGH', secure_alternative: 'RDP over VPN only', common_uses: ['Windows remote desktop', 'IT support'], vulnerabilities: ['BlueKeep (CVE-2019-0708)', 'Brute force', 'DejaBlue'], recommendations: ['Never expose to internet', 'Use VPN', 'Enable NLA'] },
-  3306:  { name: 'MySQL', description: 'MySQL Database', risk: 'HIGH', secure_alternative: 'Bind to localhost only', common_uses: ['Database access', 'Web apps'], vulnerabilities: ['Brute force', 'SQL injection', 'Unauthorized access'], recommendations: ['Bind to 127.0.0.1', 'Use strong passwords', 'Restrict remote access'] },
-  6379:  { name: 'Redis', description: 'Redis Cache/DB', risk: 'CRITICAL', secure_alternative: 'Bind to localhost, enable AUTH', common_uses: ['Caching', 'Session storage', 'Pub/Sub'], vulnerabilities: ['No auth by default', 'Remote code execution', 'Data theft'], recommendations: ['Bind to localhost only', 'Enable AUTH', 'Use firewall rules'] },
+  21: { name: 'FTP', description: 'File Transfer Protocol', risk: 'HIGH', secure_alternative: 'Use SFTP (port 22) or FTPS (port 990)', common_uses: ['File transfers', 'Web hosting uploads'], vulnerabilities: ['Plaintext credentials', 'Anonymous login', 'Bounce attacks'], recommendations: ['Disable FTP, use SFTP instead', 'If required, use FTPS with TLS', 'Disable anonymous login'] },
+  22: { name: 'SSH', description: 'Secure Shell', risk: 'SECURE', secure_alternative: 'Already secure', common_uses: ['Remote admin', 'Tunneling', 'SFTP'], vulnerabilities: ['Brute force', 'Weak keys'], recommendations: ['Use key-based auth', 'Disable root login', 'Use fail2ban'] },
+  23: { name: 'TELNET', description: 'Telnet Protocol', risk: 'CRITICAL', secure_alternative: 'Use SSH (port 22)', common_uses: ['Legacy remote admin', 'Network device management'], vulnerabilities: ['Plaintext everything', 'No encryption', 'MITM attacks'], recommendations: ['Immediately disable Telnet', 'Replace with SSH', 'Block at firewall'] },
+  80: { name: 'HTTP', description: 'HyperText Transfer Protocol', risk: 'MEDIUM', secure_alternative: 'Use HTTPS (port 443)', common_uses: ['Web browsing', 'APIs', 'Web apps'], vulnerabilities: ['Plaintext data', 'Session hijacking', 'MITM'], recommendations: ['Redirect all HTTP to HTTPS', 'Use HSTS headers'] },
+  443: { name: 'HTTPS', description: 'HTTP Secure', risk: 'SECURE', secure_alternative: 'Already secure', common_uses: ['Secure web browsing', 'APIs', 'Web apps'], vulnerabilities: ['Weak TLS configs', 'Expired certs'], recommendations: ['Use TLS 1.2+', 'Enable HSTS', 'Renew certificates'] },
+  445: { name: 'SMB', description: 'Server Message Block', risk: 'CRITICAL', secure_alternative: 'Use VPN + SMB, or SFTP', common_uses: ['File sharing', 'Windows networking'], vulnerabilities: ['EternalBlue (MS17-010)', 'WannaCry', 'NotPetya'], recommendations: ['Block at perimeter', 'Patch immediately', 'Disable SMBv1'] },
+  3389: { name: 'RDP', description: 'Remote Desktop Protocol', risk: 'HIGH', secure_alternative: 'RDP over VPN only', common_uses: ['Windows remote desktop', 'IT support'], vulnerabilities: ['BlueKeep (CVE-2019-0708)', 'Brute force', 'DejaBlue'], recommendations: ['Never expose to internet', 'Use VPN', 'Enable NLA'] },
+  3306: { name: 'MySQL', description: 'MySQL Database', risk: 'HIGH', secure_alternative: 'Bind to localhost only', common_uses: ['Database access', 'Web apps'], vulnerabilities: ['Brute force', 'SQL injection', 'Unauthorized access'], recommendations: ['Bind to 127.0.0.1', 'Use strong passwords', 'Restrict remote access'] },
+  6379: { name: 'Redis', description: 'Redis Cache/DB', risk: 'CRITICAL', secure_alternative: 'Bind to localhost, enable AUTH', common_uses: ['Caching', 'Session storage', 'Pub/Sub'], vulnerabilities: ['No auth by default', 'Remote code execution', 'Data theft'], recommendations: ['Bind to localhost only', 'Enable AUTH', 'Use firewall rules'] },
   27017: { name: 'MongoDB', description: 'MongoDB Database', risk: 'CRITICAL', secure_alternative: 'Bind to localhost, enable auth', common_uses: ['NoSQL database', 'Web apps'], vulnerabilities: ['No auth by default', 'Mass data breaches'], recommendations: ['Enable authentication', 'Bind to localhost', 'Use TLS'] },
 };
 
@@ -148,8 +148,8 @@ function parsePcap(buffer) {
         const ihl = (packetData[ipStart] & 0x0f) * 4;
         const ipProto = packetData[ipStart + 9];
         packet.ttl = packetData[ipStart + 8];
-        packet.src_ip = `${packetData[ipStart+12]}.${packetData[ipStart+13]}.${packetData[ipStart+14]}.${packetData[ipStart+15]}`;
-        packet.dst_ip = `${packetData[ipStart+16]}.${packetData[ipStart+17]}.${packetData[ipStart+18]}.${packetData[ipStart+19]}`;
+        packet.src_ip = `${packetData[ipStart + 12]}.${packetData[ipStart + 13]}.${packetData[ipStart + 14]}.${packetData[ipStart + 15]}`;
+        packet.dst_ip = `${packetData[ipStart + 16]}.${packetData[ipStart + 17]}.${packetData[ipStart + 18]}.${packetData[ipStart + 19]}`;
 
         const transportStart = ipStart + ihl;
 
@@ -380,7 +380,7 @@ function getQuery(url) {
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || '';
 if (RENDER_URL) {
   setInterval(() => {
-    https.get(`${RENDER_URL}/pcap/health`, () => {}).on('error', () => {});
+    https.get(`${RENDER_URL}/pcap/health`, () => { }).on('error', () => { });
     console.log('[Keep-alive] ping sent to', RENDER_URL);
   }, 9 * 60 * 1000);
 }
@@ -521,13 +521,13 @@ const server = http.createServer(async (req, res) => {
                     hostnames: parsed.hostnames || [],
                   });
                 }
-              } catch (_) {}
+              } catch (_) { }
               resolve();
             });
           }).on('error', () => resolve());
           setTimeout(resolve, 3000);
         });
-      } catch (_) {}
+      } catch (_) { }
     }
 
     const summary = { critical: 0, high: 0, medium: 0, low: 0 };
@@ -551,6 +551,112 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       return json(res, { error: 'Agent error: ' + e.message }, 500, requestOrigin);
     }
+  }
+  // ── Images ────────────────────────────────────────────────────
+  // Add this block RIGHT BEFORE the Port Intelligence block
+  if (url.startsWith('/pcap/images') && method === 'GET') {
+    const q = getQuery(url);
+    const session = sessions.get(q.session_id);
+    if (!session) return json(res, { error: 'Session not found' }, 404, requestOrigin);
+
+    // ── Magic byte signatures for image formats ──────────────
+    const MAGIC = [
+      { sig: [0xFF, 0xD8, 0xFF], ext: 'jpg', mime: 'image/jpeg' },
+      { sig: [0x89, 0x50, 0x4E, 0x47], ext: 'png', mime: 'image/png' },
+      { sig: [0x47, 0x49, 0x46, 0x38, 0x37], ext: 'gif', mime: 'image/gif' },
+      { sig: [0x47, 0x49, 0x46, 0x38, 0x39], ext: 'gif', mime: 'image/gif' },
+      { sig: [0x42, 0x4D], ext: 'bmp', mime: 'image/bmp' },
+    ];
+
+    // ── Build a raw buffer from all TCP payloads on port 80 ──
+    // We reconstruct what Wireshark's "Export Objects → HTTP" does:
+    // collect raw payload bytes from HTTP traffic and carve images out
+    const httpPayloads = [];
+
+    for (const pkt of session.packets) {
+      // Only look at HTTP traffic (port 80 src or dst)
+      const isHttp = pkt.dst_port === 80 || pkt.src_port === 80;
+      if (!isHttp) continue;
+
+      // payload_preview is a string — convert back to bytes
+      // Note: payload_preview is already stored as utf8 string in our parser
+      // For carving we need the raw bytes, so we re-parse from the stored preview
+      if (pkt.payload_preview && pkt.payload_preview.length > 0) {
+        httpPayloads.push({
+          data: Buffer.from(pkt.payload_preview, 'utf8'),
+          src_ip: pkt.src_ip,
+          dst_ip: pkt.dst_ip,
+          timestamp: pkt.timestamp,
+        });
+      }
+    }
+
+    // ── Carve images using magic byte signatures ──────────────
+    const images = [];
+    const seen = new Set();
+
+    for (const payload of httpPayloads) {
+      const buf = payload.data;
+
+      for (const magic of MAGIC) {
+        let searchFrom = 0;
+
+        while (searchFrom < buf.length) {
+          // Find magic byte signature in buffer
+          let found = -1;
+          outer: for (let i = searchFrom; i <= buf.length - magic.sig.length; i++) {
+            for (let j = 0; j < magic.sig.length; j++) {
+              if (buf[i + j] !== magic.sig[j]) continue outer;
+            }
+            found = i;
+            break;
+          }
+
+          if (found === -1) break;
+
+          // Extract chunk from found offset (max 2MB)
+          const chunk = buf.slice(found, Math.min(found + 2 * 1024 * 1024, buf.length));
+
+          // Skip tiny chunks — not real images
+          if (chunk.length < 100) {
+            searchFrom = found + 1;
+            continue;
+          }
+
+          // Deduplicate by first 32 bytes
+          const fingerprint = chunk.slice(0, 32).toString('hex');
+          if (!seen.has(fingerprint)) {
+            seen.add(fingerprint);
+
+            // Convert to base64 data URL so frontend can display directly
+            // No file system needed — works on Render without disk access
+            const base64 = chunk.toString('base64');
+            const dataUrl = `data:${magic.mime};base64,${base64}`;
+
+            images.push({
+              filename: `extracted_${images.length}.${magic.ext}`,
+              url: dataUrl,           // ← data URL, works directly in <img src>
+              size: chunk.length,
+              content_type: magic.mime,
+              method: 'magic-carve',
+              src_ip: payload.src_ip || 'unknown',
+              dst_ip: payload.dst_ip || 'unknown',
+              timestamp: payload.timestamp,
+            });
+          }
+
+          searchFrom = found + 1;
+        }
+      }
+    }
+
+    return json(res, {
+      images,
+      total: images.length,
+      message: images.length === 0
+        ? 'No images found. Images can only be extracted from unencrypted HTTP (port 80) traffic.'
+        : `Extracted ${images.length} image(s) from HTTP traffic.`,
+    }, 200, requestOrigin);
   }
 
   // ── Port Intelligence ─────────────────────────────────────────
@@ -577,15 +683,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── 404 ───────────────────────────────────────────────────────
-  json(res, { error: 'Not found', available_endpoints: [
-    'GET  /pcap/health',
-    'GET  /ping',
-    'POST /pcap/upload',
-    'GET  /pcap/packets?session_id=X',
-    'GET  /pcap/vulnerabilities?session_id=X',
-    'POST /pcap/agent/query',
-    'GET  /pcap/port-intel?query=X',
-  ]}, 404, requestOrigin);
+  json(res, {
+    error: 'Not found', available_endpoints: [
+      'GET  /pcap/health',
+      'GET  /ping',
+      'POST /pcap/upload',
+      'GET  /pcap/packets?session_id=X',
+      'GET  /pcap/vulnerabilities?session_id=X',
+      'POST /pcap/agent/query',
+      'GET  /pcap/port-intel?query=X',
+    ]
+  }, 404, requestOrigin);
 });
 
 const PORT = process.env.PORT || 4000;
