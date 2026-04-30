@@ -1,0 +1,15 @@
+{
+  "name": "pcap-analyzer-backend",
+  "version": "1.0.0",
+  "description": "PCAP Network Analyzer Backend - Node.js",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Newbie-amitian",
+  "license": "MIT"
+}

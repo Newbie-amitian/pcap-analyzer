@@ -1,0 +1,43 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+:root {
+  --background: 220 20% 6%;
+  --foreground: 210 40% 98%;
+  --card: 220 20% 8%;
+  --card-foreground: 210 40% 98%;
+  --popover: 220 20% 8%;
+  --popover-foreground: 210 40% 98%;
+  --primary: 189 100% 50%;
+  --primary-foreground: 220 20% 6%;
+  --secondary: 220 20% 12%;
+  --secondary-foreground: 210 40% 98%;
+  --muted: 220 20% 12%;
+  --muted-foreground: 215 20% 65%;
+  --accent: 265 100% 50%;
+  --accent-foreground: 210 40% 98%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 210 40% 98%;
+  --border: 215 20% 15%;
+  --input: 215 20% 15%;
+  --ring: 189 100% 50%;
+  --radius: 0.75rem;
+  --cyan: 189 100% 50%;
+  --violet: 265 100% 50%;
+  --green: 150 100% 50%;
+  --red: 0 84% 60%;
+  --orange: 25 95% 53%;
+  --amber: 45 93% 47%;
+  --navy: 220 30% 6%;
+}
+
+* { border-color: hsl(var(--border)); }
+body {
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: system-ui, sans-serif;
+}
+
+.custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+.custom-scrollbar::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); border-radius: 3px; }
+.custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
