@@ -6,19 +6,15 @@ const { Buffer } = require('buffer');
 const sessions = new Map();
 
 // ── CORS ──────────────────────────────────────────────────────
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
 function getCorsHeaders(requestOrigin) {
-  const origin = requestOrigin || '';
-  if (origin === ALLOWED_ORIGIN) {
-    return {
-      'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-      'Vary': 'Origin',
-    };
-  }
-  return {};
+  return {
+    'Access-Control-Allow-Origin': ALLOWED_ORIGIN === '*' ? '*' : (requestOrigin === ALLOWED_ORIGIN ? requestOrigin : ''),
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Vary': 'Origin',
+  };
 }
 
 // ── Groq ──────────────────────────────────────────────────────
@@ -28,7 +24,6 @@ const GROQ_MODEL = 'llama-3.3-70b-versatile';
 function groqRequest(messages, maxTokens = 1024) {
   return new Promise((resolve) => {
     if (!GROQ_API_KEY) return resolve(null);
-
     const body = JSON.stringify({ model: GROQ_MODEL, max_tokens: maxTokens, messages });
     const options = {
       hostname: 'api.groq.com',
@@ -40,15 +35,12 @@ function groqRequest(messages, maxTokens = 1024) {
         'Content-Length': Buffer.byteLength(body),
       },
     };
-
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          resolve(json.choices?.[0]?.message?.content?.trim() || null);
-        } catch (_) { resolve(null); }
+        try { resolve(JSON.parse(data).choices?.[0]?.message?.content?.trim() || null); }
+        catch (_) { resolve(null); }
       });
     });
     req.on('error', () => resolve(null));
@@ -58,30 +50,24 @@ function groqRequest(messages, maxTokens = 1024) {
   });
 }
 
-// ── CVE enrichment from live APIs ─────────────────────────────
-async function fetchCveDetails(cveId) {
-  return new Promise((resolve) => {
-    https.get(`https://cve.circl.lu/api/cve/${cveId}`, (res) => {
-      let data = '';
-      res.on('data', d => data += d);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (_) { resolve(null); }
-      });
-    }).on('error', () => resolve(null));
-    setTimeout(() => resolve(null), 4000);
-  });
-}
-
+// ── CVE/Shodan helpers ─────────────────────────────────────────
 async function fetchShodanIp(ip) {
   return new Promise((resolve) => {
     https.get(`https://internetdb.shodan.io/${ip}`, (res) => {
       let data = '';
       res.on('data', d => data += d);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (_) { resolve(null); }
-      });
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (_) { resolve(null); } });
+    }).on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 4000);
+  });
+}
+
+async function fetchCveDetails(cveId) {
+  return new Promise((resolve) => {
+    https.get(`https://cve.circl.lu/api/cve/${cveId}`, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (_) { resolve(null); } });
     }).on('error', () => resolve(null));
     setTimeout(() => resolve(null), 4000);
   });
@@ -133,7 +119,7 @@ const VULNERABLE_PORTS = {
   27017: { risk: 'CRITICAL', reason: 'MongoDB with no auth — full DB exposure risk' },
 };
 
-// ── Tool executor (all deterministic tools) ───────────────────
+// ── Tool executor ──────────────────────────────────────────────
 function runTool(toolName, params, packets) {
   switch (toolName) {
     case 'filter_by_port': {
@@ -160,7 +146,7 @@ function runTool(toolName, params, packets) {
       const result = Object.entries(ipPorts)
         .filter(([, ports]) => ports.size > 15)
         .map(([ip, ports]) => ({ ip, ports_scanned: ports.size, ports: [...ports].slice(0, 20) }));
-      return { result, response: result.length ? `Detected ${result.length} potential port scanners.` : 'No port scanning detected.' };
+      return { result, response: result.length ? `Detected ${result.length} potential port scanner(s).` : 'No port scanning detected.' };
     }
     case 'get_dns_queries': {
       const result = packets.filter(pk => pk.protocol === 'DNS');
@@ -171,7 +157,10 @@ function runTool(toolName, params, packets) {
           if (match) match.forEach(d => { domains[d] = (domains[d] || 0) + 1; });
         }
       }
-      return { result: { packets: result.slice(0, 50), top_domains: Object.entries(domains).sort((a, b) => b[1] - a[1]).slice(0, 10) }, response: `Found ${result.length} DNS packets.` };
+      return {
+        result: { packets: result.slice(0, 50), top_domains: Object.entries(domains).sort((a, b) => b[1] - a[1]).slice(0, 10) },
+        response: `Found ${result.length} DNS packets.`,
+      };
     }
     case 'get_top_talkers': {
       const ipCount = {};
@@ -194,7 +183,7 @@ function runTool(toolName, params, packets) {
         if (!byPort[p]) byPort[p] = { port: p, count: 0, risk: VULNERABLE_PORTS[p]?.risk, reason: VULNERABLE_PORTS[p]?.reason };
         byPort[p].count++;
       }
-      return { result: Object.values(byPort), response: `Found traffic on ${Object.keys(byPort).length} vulnerable ports affecting ${result.length} packets.` };
+      return { result: Object.values(byPort), response: `Found traffic on ${Object.keys(byPort).length} vulnerable port(s) across ${result.length} packets.` };
     }
     case 'domain_lookup': {
       const domain = (params.domain || '').toLowerCase();
@@ -225,23 +214,22 @@ function runTool(toolName, params, packets) {
       const duration = Math.round(Math.max(...timestamps) - Math.min(...timestamps));
       return {
         result: { total_packets: packets.length, protocols, top_ips: topIps, total_bytes: totalBytes, duration_seconds: duration },
-        response: `${packets.length} packets, ${duration}s capture duration.`,
+        response: `${packets.length} packets, ${duration}s capture.`,
       };
     }
   }
 }
 
-// ── Dynamic agent: Groq picks the tool ────────────────────────
+// ── Dynamic agent ──────────────────────────────────────────────
 async function dynamicAgent(userPrompt, packets) {
   const protocols = {};
   for (const pk of packets) protocols[pk.protocol] = (protocols[pk.protocol] || 0) + 1;
 
-  const toolSchema = `
-Available tools (respond ONLY with valid JSON, no markdown, no explanation):
+  const toolSchema = `Available tools (respond ONLY with valid JSON, no markdown):
 - get_summary → {}
 - filter_by_port → {"port": number}
 - filter_by_ip → {"ip": "x.x.x.x"}
-- filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"ARP"|"IPv6"|"HTTPS"|"FTP"|"SSH"|...}
+- filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"FTP"|"SSH"...}
 - find_credentials → {}
 - detect_port_scan → {}
 - get_dns_queries → {}
@@ -250,9 +238,8 @@ Available tools (respond ONLY with valid JSON, no markdown, no explanation):
 - get_vulnerability_report → {}
 - domain_lookup → {"domain": "example.com"}
 
-Capture has ${packets.length} packets. Protocol breakdown: ${JSON.stringify(protocols)}.
-
-Pick the best tool for the user's question. Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
+Capture: ${packets.length} packets. Protocols: ${JSON.stringify(protocols)}.
+Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
 
   let toolName = 'get_summary';
   let toolParams = {};
@@ -262,67 +249,44 @@ Pick the best tool for the user's question. Respond ONLY with: {"tool": "tool_na
       { role: 'system', content: toolSchema },
       { role: 'user', content: userPrompt },
     ], 100);
-
     if (decision) {
       try {
-        const clean = decision.replace(/```json|```/g, '').trim();
-        const parsed = JSON.parse(clean);
-        if (parsed.tool) {
-          toolName = parsed.tool;
-          toolParams = parsed.params || {};
-        }
+        const parsed = JSON.parse(decision.replace(/```json|```/g, '').trim());
+        if (parsed.tool) { toolName = parsed.tool; toolParams = parsed.params || {}; }
       } catch (_) { }
     }
   }
 
-  // Run the tool
   const toolResult = runTool(toolName, toolParams, packets);
 
-  // Summarize result for Groq (avoid token overflow)
   const resultSummary = Array.isArray(toolResult.result) && toolResult.result.length > 30
     ? { sample: toolResult.result.slice(0, 30), total_count: toolResult.result.length }
     : toolResult.result;
 
-  // Fetch live CVE/Shodan data if vulnerability report
+  // Live enrichment for vulnerability queries
   let liveEnrichment = '';
-  if (toolName === 'get_vulnerability_report' && Array.isArray(toolResult.result)) {
-    const ports = toolResult.result.map(r => r.port).filter(Boolean).slice(0, 3);
+  if (toolName === 'get_vulnerability_report') {
     const publicIps = [...new Set(packets.filter(pk => !isPrivateIP(pk.src_ip)).map(pk => pk.src_ip))].slice(0, 2);
-
     for (const ip of publicIps) {
       const shodan = await fetchShodanIp(ip);
       if (shodan?.cves?.length) {
-        liveEnrichment += `\nShodan data for ${ip}: ${shodan.cves.length} known CVEs including ${shodan.cves.slice(0, 3).join(', ')}.`;
+        liveEnrichment += `\nShodan data for ${ip}: ${shodan.cves.length} CVEs including ${shodan.cves.slice(0, 3).join(', ')}.`;
         for (const cveId of shodan.cves.slice(0, 2)) {
           const cveDetail = await fetchCveDetails(cveId);
-          if (cveDetail?.summary) {
-            liveEnrichment += `\n${cveId}: ${cveDetail.summary.slice(0, 150)}`;
-          }
+          if (cveDetail?.summary) liveEnrichment += `\n${cveId}: ${cveDetail.summary.slice(0, 150)}`;
         }
       }
     }
   }
 
-  // Ask Groq to explain like a human — no markdown, no bullet points
   const explanation = await groqRequest([
     {
       role: 'system',
-      content: `You are a network security expert talking casually to a developer. 
-You just ran a tool on their PCAP file and got results. 
-Explain what you found in plain conversational English — like a colleague explaining over chat.
-No markdown. No bullet points. No asterisks. No headers. Just natural sentences.
-Be direct, specific, and mention actual numbers and IPs from the data.
-If there are security risks, explain them plainly. Keep it under 200 words.
-${liveEnrichment ? `Live threat intelligence gathered: ${liveEnrichment}` : ''}`,
+      content: `You are a network security expert. Explain findings conversationally in plain English. No markdown, no bullet points, no asterisks. Be specific with numbers and IPs. Under 200 words.${liveEnrichment ? `\nLive threat intel: ${liveEnrichment}` : ''}`,
     },
     {
       role: 'user',
-      content: `User asked: "${userPrompt}"
-Tool used: ${toolName}
-Tool result: ${JSON.stringify(resultSummary)}
-Raw response: ${toolResult.response}
-
-Explain this to the user conversationally.`,
+      content: `User asked: "${userPrompt}"\nTool: ${toolName}\nResult: ${JSON.stringify(resultSummary)}\nRaw: ${toolResult.response}\n\nExplain conversationally.`,
     },
   ], 512);
 
@@ -343,17 +307,14 @@ function isPrivateIP(ip) {
 function parsePcap(buffer) {
   const packets = [];
   let offset = 0;
-
   if (buffer.length < 24) return packets;
 
   const magicNumber = buffer.readUInt32LE(0);
   const isLE = magicNumber === 0xa1b2c3d4 || magicNumber === 0xa1b23c4d;
   const isNano = magicNumber === 0xa1b23c4d;
-
   if (!isLE && magicNumber !== 0xd4c3b2a1 && magicNumber !== 0x4d3cb2a1) return packets;
 
   const read32 = (off) => isLE ? buffer.readUInt32LE(off) : buffer.readUInt32BE(off);
-
   const linkType = read32(20);
   offset = 24;
   let packetId = 0;
@@ -364,14 +325,12 @@ function parsePcap(buffer) {
     const inclLen = read32(offset + 8);
     const origLen = read32(offset + 12);
     offset += 16;
-
     if (offset + inclLen > buffer.length || inclLen > 65536) break;
 
     const packetData = buffer.slice(offset, offset + inclLen);
     offset += inclLen;
 
     const timestamp = tsSec + tsUsec / (isNano ? 1e9 : 1e6);
-
     let packet = {
       id: packetId++,
       timestamp,
@@ -382,11 +341,11 @@ function parsePcap(buffer) {
       ttl: null, flags: null,
       payload_preview: '',
       raw_payload: null,
+      seq_num: null,
     };
 
     if (linkType === 1 && packetData.length >= 14) {
       const etherType = packetData.readUInt16BE(12);
-
       if (etherType === 0x0800 && packetData.length >= 34) {
         const ipStart = 14;
         const ihl = (packetData[ipStart] & 0x0f) * 4;
@@ -394,12 +353,13 @@ function parsePcap(buffer) {
         packet.ttl = packetData[ipStart + 8];
         packet.src_ip = `${packetData[ipStart + 12]}.${packetData[ipStart + 13]}.${packetData[ipStart + 14]}.${packetData[ipStart + 15]}`;
         packet.dst_ip = `${packetData[ipStart + 16]}.${packetData[ipStart + 17]}.${packetData[ipStart + 18]}.${packetData[ipStart + 19]}`;
-
         const transportStart = ipStart + ihl;
 
         if (ipProto === 6 && packetData.length >= transportStart + 20) {
           packet.src_port = packetData.readUInt16BE(transportStart);
           packet.dst_port = packetData.readUInt16BE(transportStart + 2);
+          // Read TCP sequence number for proper reassembly
+          packet.seq_num = packetData.readUInt32BE(transportStart + 4);
 
           const tcpFlags = packetData[transportStart + 13];
           const flagStr = [];
@@ -412,22 +372,16 @@ function parsePcap(buffer) {
 
           const dataOffset = (packetData[transportStart + 12] >> 4) * 4;
           const payloadStart = transportStart + dataOffset;
-
           if (packetData.length > payloadStart) {
-            packet.payload_preview = packetData
-              .slice(payloadStart, payloadStart + 128)
-              .toString('utf8', 0, 128)
-              .replace(/[^\x20-\x7E]/g, '.');
+            packet.payload_preview = packetData.slice(payloadStart, payloadStart + 128).toString('utf8', 0, 128).replace(/[^\x20-\x7E]/g, '.');
             packet.raw_payload = packetData.slice(payloadStart);
           }
-
           packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'TCP';
 
         } else if (ipProto === 17 && packetData.length >= transportStart + 8) {
           packet.src_port = packetData.readUInt16BE(transportStart);
           packet.dst_port = packetData.readUInt16BE(transportStart + 2);
           packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'UDP';
-
         } else if (ipProto === 1) {
           packet.protocol = 'ICMP';
         }
@@ -437,10 +391,8 @@ function parsePcap(buffer) {
         packet.protocol = 'ARP';
       }
     }
-
     packets.push(packet);
   }
-
   return packets;
 }
 
@@ -456,39 +408,19 @@ function detectVulnerabilities(packets) {
       const key = `${pkt.src_ip}-${pkt.dst_ip}-${port}`;
       if (!seenPortPairs.has(key)) {
         seenPortPairs.add(key);
-        alerts.push({
-          layer: 1,
-          risk: VULNERABLE_PORTS[port].risk,
-          protocol: pkt.protocol,
-          port,
-          src_ip: pkt.src_ip,
-          dst_ip: pkt.dst_ip,
-          reason: VULNERABLE_PORTS[port].reason,
-        });
+        alerts.push({ layer: 1, risk: VULNERABLE_PORTS[port].risk, protocol: pkt.protocol, port, src_ip: pkt.src_ip, dst_ip: pkt.dst_ip, reason: VULNERABLE_PORTS[port].reason });
       }
     }
-
     if (pkt.payload_preview) {
       const payload = pkt.payload_preview.toUpperCase();
       if (payload.includes('USER ') || payload.includes('PASS ') || payload.includes('PASSWORD=') || payload.includes('LOGIN:') || payload.includes('AUTHORIZATION: BASIC')) {
-        alerts.push({
-          layer: 2,
-          risk: 'CRITICAL',
-          protocol: pkt.protocol,
-          port: pkt.dst_port || pkt.src_port,
-          src_ip: pkt.src_ip,
-          dst_ip: pkt.dst_ip,
-          reason: 'Plaintext credentials detected in packet payload!',
-          payload_snippet: pkt.payload_preview.slice(0, 100),
-        });
+        alerts.push({ layer: 2, risk: 'CRITICAL', protocol: pkt.protocol, port: pkt.dst_port || pkt.src_port, src_ip: pkt.src_ip, dst_ip: pkt.dst_ip, reason: 'Plaintext credentials detected in packet payload!', payload_snippet: pkt.payload_preview.slice(0, 100) });
       }
     }
-
     for (const ip of [pkt.src_ip, pkt.dst_ip]) {
       if (ip && !isPrivateIP(ip)) publicIps.add(ip);
     }
   }
-
   return { alerts, publicIps: [...publicIps].slice(0, 10) };
 }
 
@@ -506,7 +438,6 @@ function parseMultipart(buffer, boundary) {
   const boundaryBuf = Buffer.from('--' + boundary);
   const parts = [];
   let start = 0;
-
   while (start < buffer.length) {
     const bStart = buffer.indexOf(boundaryBuf, start);
     if (bStart === -1) break;
@@ -524,12 +455,8 @@ function parseMultipart(buffer, boundary) {
 }
 
 function json(res, data, status = 200, requestOrigin = '') {
-  const body = JSON.stringify(data);
-  res.writeHead(status, {
-    'Content-Type': 'application/json',
-    ...getCorsHeaders(requestOrigin),
-  });
-  res.end(body);
+  res.writeHead(status, { 'Content-Type': 'application/json', ...getCorsHeaders(requestOrigin) });
+  res.end(JSON.stringify(data));
 }
 
 function getQuery(url) {
@@ -543,12 +470,225 @@ function getQuery(url) {
   return q;
 }
 
+// ══════════════════════════════════════════════════════════════
+// WIRESHARK-STYLE HTTP OBJECT EXTRACTOR
+// Steps:
+//  1. Group packets into TCP streams by 4-tuple
+//  2. Sort each stream by TCP sequence number
+//  3. Reassemble stream bytes in order
+//  4. Split stream into HTTP request/response pairs
+//  5. Parse Host, GET/POST URI, Content-Type from headers
+//  6. Handle chunked transfer encoding
+//  7. Return all object types (images, HTML, JS, CSS, JSON, etc.)
+// ══════════════════════════════════════════════════════════════
+function extractHttpObjects(packets) {
+  const HTTP_PORTS = [80, 8080, 8000, 8888, 3000, 3001];
+
+  // ── Step 1: Group into TCP streams ───────────────────────────
+  // Each stream is keyed by canonical 4-tuple (lower port first)
+  const streamMap = new Map();
+
+  for (const pkt of packets) {
+    if (!pkt.raw_payload || pkt.raw_payload.length === 0) continue;
+    if (!pkt.src_ip || !pkt.dst_ip || !pkt.src_port || !pkt.dst_port) continue;
+    if (pkt.seq_num === null) continue;
+
+    // Only process HTTP traffic (both directions)
+    const isHttpPort = HTTP_PORTS.includes(pkt.src_port) || HTTP_PORTS.includes(pkt.dst_port);
+    if (!isHttpPort) continue;
+
+    // Canonical key — same for both directions
+    let key, isServer;
+    if (HTTP_PORTS.includes(pkt.src_port)) {
+      // This packet is server → client (response)
+      key = `${pkt.dst_ip}:${pkt.dst_port}-${pkt.src_ip}:${pkt.src_port}`;
+      isServer = true;
+    } else {
+      // This packet is client → server (request)
+      key = `${pkt.src_ip}:${pkt.src_port}-${pkt.dst_ip}:${pkt.dst_port}`;
+      isServer = false;
+    }
+
+    if (!streamMap.has(key)) {
+      streamMap.set(key, {
+        clientIp: isServer ? pkt.dst_ip : pkt.src_ip,
+        serverIp: isServer ? pkt.src_ip : pkt.dst_ip,
+        serverPort: isServer ? pkt.src_port : pkt.dst_port,
+        requests: [],   // { seq_num, payload, packet_id }
+        responses: [],  // { seq_num, payload, packet_id }
+      });
+    }
+
+    const stream = streamMap.get(key);
+    if (isServer) {
+      stream.responses.push({ seq_num: pkt.seq_num, payload: pkt.raw_payload, packet_id: pkt.id });
+    } else {
+      stream.requests.push({ seq_num: pkt.seq_num, payload: pkt.raw_payload, packet_id: pkt.id });
+    }
+  }
+
+  // ── Step 2 & 3: Sort by seq_num + reassemble ─────────────────
+  const objects = [];
+  const seen = new Set();
+
+  for (const [, stream] of streamMap) {
+    // Sort both directions by TCP sequence number
+    stream.requests.sort((a, b) => a.seq_num - b.seq_num);
+    stream.responses.sort((a, b) => a.seq_num - b.seq_num);
+
+    // Reassemble bytes in order
+    const reqBytes = stream.requests.length > 0
+      ? Buffer.concat(stream.requests.map(r => r.payload))
+      : Buffer.alloc(0);
+    const respBytes = stream.responses.length > 0
+      ? Buffer.concat(stream.responses.map(r => r.payload))
+      : Buffer.alloc(0);
+
+    const firstReqPacketId = stream.requests[0]?.packet_id ?? 0;
+    const firstRespPacketId = stream.responses[0]?.packet_id ?? 0;
+
+    // ── Step 4: Parse HTTP request ────────────────────────────
+    let requestUri = '/';
+    let hostname = stream.serverIp;
+    let method = 'GET';
+
+    if (reqBytes.length > 0) {
+      const reqStr = reqBytes.slice(0, 2048).toString('utf8', 0, 2048).replace(/[^\x09\x0a\x0d\x20-\x7e]/g, '');
+      // Parse request line: GET /path/file.jpg HTTP/1.1
+      const reqLine = reqStr.match(/^(GET|POST|PUT|HEAD|DELETE|OPTIONS)\s+([^\s]+)\s+HTTP/i);
+      if (reqLine) {
+        method = reqLine[1].toUpperCase();
+        requestUri = reqLine[2];
+      }
+      // Parse Host header
+      const hostMatch = reqStr.match(/Host:\s*([^\r\n]+)/i);
+      if (hostMatch) hostname = hostMatch[1].trim().split(':')[0]; // strip port if present
+    }
+
+    if (respBytes.length < 12) continue;
+
+    // ── Step 5: Parse HTTP response headers ───────────────────
+    const headerEnd = respBytes.indexOf(Buffer.from('\r\n\r\n'));
+    if (headerEnd === -1) continue;
+
+    const headerStr = respBytes.slice(0, headerEnd).toString('utf8', 0, headerEnd).replace(/[^\x09\x0a\x0d\x20-\x7e]/g, '');
+
+    // Must be HTTP response
+    if (!headerStr.startsWith('HTTP/')) continue;
+
+    // Parse status code
+    const statusMatch = headerStr.match(/HTTP\/[\d.]+\s+(\d+)/);
+    const statusCode = statusMatch ? parseInt(statusMatch[1]) : 0;
+    if (statusCode < 200 || statusCode >= 400) continue; // skip errors and redirects
+
+    // Parse Content-Type
+    const ctMatch = headerStr.match(/Content-Type:\s*([^\r\n;]+)/i);
+    const contentType = ctMatch ? ctMatch[1].trim().toLowerCase() : 'application/octet-stream';
+
+    // Skip types we don't care about
+    const skipTypes = ['text/plain', 'application/octet-stream'];
+    const isInteresting = contentType.startsWith('image/') ||
+      contentType.includes('html') ||
+      contentType.includes('javascript') ||
+      contentType.includes('css') ||
+      contentType.includes('json') ||
+      contentType.includes('xml') ||
+      contentType.includes('font') ||
+      contentType.includes('pdf');
+    if (!isInteresting && skipTypes.some(t => contentType.startsWith(t))) continue;
+
+    // Parse Content-Length
+    const clMatch = headerStr.match(/Content-Length:\s*(\d+)/i);
+    const contentLength = clMatch ? parseInt(clMatch[1]) : null;
+
+    // Parse Transfer-Encoding
+    const isChunked = /Transfer-Encoding:\s*chunked/i.test(headerStr);
+
+    // ── Step 6: Extract body + handle chunked encoding ────────
+    let body = respBytes.slice(headerEnd + 4);
+
+    if (isChunked) {
+      try {
+        const dechunked = [];
+        let pos = 0;
+        while (pos < body.length) {
+          const lineEnd = body.indexOf(Buffer.from('\r\n'), pos);
+          if (lineEnd === -1 || lineEnd === pos) break;
+          const chunkSizeHex = body.slice(pos, lineEnd).toString().trim().split(';')[0]; // strip chunk extensions
+          const chunkSize = parseInt(chunkSizeHex, 16);
+          if (isNaN(chunkSize) || chunkSize === 0) break;
+          const chunkStart = lineEnd + 2;
+          if (chunkStart + chunkSize > body.length) {
+            // Partial chunk — take what we have
+            dechunked.push(body.slice(chunkStart));
+            break;
+          }
+          dechunked.push(body.slice(chunkStart, chunkStart + chunkSize));
+          pos = chunkStart + chunkSize + 2; // skip trailing \r\n
+        }
+        if (dechunked.length > 0) body = Buffer.concat(dechunked);
+      } catch (_) { }
+    }
+
+    if (body.length < 10) continue;
+
+    // ── Step 7: Build filename from URI ───────────────────────
+    // e.g. /images/photo.jpg → photo.jpg
+    // e.g. /api/data → data (with extension from content-type)
+    let filename = requestUri.split('/').pop()?.split('?')[0] || 'index';
+    if (!filename || filename === '') filename = 'index';
+
+    // Add extension from content-type if missing
+    const extMap = {
+      'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
+      'image/webp': '.webp', 'image/bmp': '.bmp', 'image/svg+xml': '.svg',
+      'text/html': '.html', 'text/css': '.css', 'text/javascript': '.js',
+      'application/javascript': '.js', 'application/json': '.json',
+      'application/xml': '.xml', 'text/xml': '.xml', 'application/pdf': '.pdf',
+    };
+    const expectedExt = extMap[contentType];
+    if (expectedExt && !filename.includes('.')) filename += expectedExt;
+
+    // Deduplicate by hostname + uri
+    const dedupKey = `${hostname}${requestUri}`;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
+
+    // Build data URL for images (for preview)
+    let url = undefined;
+    const isImage = contentType.startsWith('image/');
+    if (isImage && body.length < 4 * 1024 * 1024) { // only embed images < 4MB
+      url = `data:${contentType};base64,${body.toString('base64')}`;
+    }
+
+    objects.push({
+      packet_num: firstRespPacketId,
+      filename,
+      request_uri: requestUri,
+      hostname,
+      content_type: contentType,
+      size: contentLength ?? body.length,
+      method,
+      src_ip: stream.serverIp,
+      dst_ip: stream.clientIp,
+      src_port: stream.serverPort,
+      dst_port: stream.responses[0] ? stream.requests[0]?.seq_num ?? 0 : 0,
+      url,
+      is_image: isImage,
+    });
+  }
+
+  // Sort by packet number (Wireshark order)
+  objects.sort((a, b) => a.packet_num - b.packet_num);
+  return objects;
+}
+
 // ── Keep-alive ────────────────────────────────────────────────
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || '';
 if (RENDER_URL) {
   setInterval(() => {
     https.get(`${RENDER_URL}/pcap/health`, () => { }).on('error', () => { });
-    console.log('[Keep-alive] ping sent to', RENDER_URL);
+    console.log('[Keep-alive] ping sent');
   }, 9 * 60 * 1000);
 }
 
@@ -571,10 +711,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url === '/pcap/health' || url === '/health') {
-    return json(res, { status: 'ok', service: 'pcap-analyzer', sessions: sessions.size }, 200, requestOrigin);
+    return json(res, { status: 'ok', service: 'pcap-analyzer', sessions: sessions.size, groq: !!GROQ_API_KEY }, 200, requestOrigin);
   }
 
-  // ── Upload ────────────────────────────────────────────────────
+  // ── Upload ─────────────────────────────────────────────────
   if (url === '/pcap/upload' && method === 'POST') {
     try {
       const contentType = req.headers['content-type'] || '';
@@ -586,7 +726,6 @@ const server = http.createServer(async (req, res) => {
 
       let fileData = null;
       let filename = 'upload.pcap';
-
       for (const part of parts) {
         if (part.headers.includes('filename=')) {
           const fnMatch = part.headers.match(/filename="([^"]+)"/);
@@ -598,7 +737,7 @@ const server = http.createServer(async (req, res) => {
       if (!fileData) return json(res, { error: 'No file found in upload' }, 400, requestOrigin);
 
       const packets = parsePcap(fileData);
-      if (packets.length === 0) return json(res, { error: 'Could not parse PCAP file.' }, 400, requestOrigin);
+      if (packets.length === 0) return json(res, { error: 'Could not parse PCAP file. Make sure it is a valid .pcap or .pcapng file.' }, 400, requestOrigin);
 
       const protocols = {};
       let totalBytes = 0;
@@ -606,7 +745,6 @@ const server = http.createServer(async (req, res) => {
         protocols[pk.protocol] = (protocols[pk.protocol] || 0) + 1;
         totalBytes += pk.length;
       }
-
       const timestamps = packets.map(p => p.timestamp);
       const minT = Math.min(...timestamps);
       const maxT = Math.max(...timestamps);
@@ -617,36 +755,27 @@ const server = http.createServer(async (req, res) => {
 
       return json(res, {
         session_id,
-        summary: {
-          total_packets: packets.length,
-          protocols,
-          duration_seconds: Math.round(maxT - minT),
-          total_bytes: totalBytes,
-          time_range: { start: minT, end: maxT },
-        },
+        summary: { total_packets: packets.length, protocols, duration_seconds: Math.round(maxT - minT), total_bytes: totalBytes, time_range: { start: minT, end: maxT } },
       }, 200, requestOrigin);
-
     } catch (e) {
       console.error('[Upload Error]', e);
       return json(res, { error: 'Upload failed: ' + e.message }, 500, requestOrigin);
     }
   }
 
-  // ── Packets ───────────────────────────────────────────────────
+  // ── Packets ────────────────────────────────────────────────
   if (url.startsWith('/pcap/packets') && method === 'GET') {
     const q = getQuery(url);
     const session = sessions.get(q.session_id);
     if (!session) return json(res, { error: 'Session not found' }, 404, requestOrigin);
-
     const page = parseInt(q.page || '1');
     const per_page = parseInt(q.per_page || '50');
     const start = (page - 1) * per_page;
     const paginated = session.packets.slice(start, start + per_page);
-
     return json(res, { packets: paginated, total: session.packets.length, page, per_page }, 200, requestOrigin);
   }
 
-  // ── Vulnerabilities ───────────────────────────────────────────
+  // ── Vulnerabilities ────────────────────────────────────────
   if (url.startsWith('/pcap/vulnerabilities') && method === 'GET') {
     const q = getQuery(url);
     const session = sessions.get(q.session_id);
@@ -659,13 +788,7 @@ const server = http.createServer(async (req, res) => {
       try {
         const shodan = await fetchShodanIp(ip);
         if (shodan?.cves?.length) {
-          enrichedAlerts.push({
-            layer: 3, risk: 'HIGH', ip,
-            reason: `Shodan reports ${shodan.cves.length} known CVEs for this IP`,
-            open_ports: shodan.ports || [],
-            cves: shodan.cves.slice(0, 5),
-            hostnames: shodan.hostnames || [],
-          });
+          enrichedAlerts.push({ layer: 3, risk: 'HIGH', ip, reason: `Shodan: ${shodan.cves.length} known CVEs`, open_ports: shodan.ports || [], cves: shodan.cves.slice(0, 5), hostnames: shodan.hostnames || [] });
         }
       } catch (_) { }
     }
@@ -675,169 +798,64 @@ const server = http.createServer(async (req, res) => {
       const r = a.risk?.toLowerCase();
       if (summary[r] !== undefined) summary[r]++;
     }
-
     return json(res, { alerts: enrichedAlerts, summary }, 200, requestOrigin);
   }
 
-  // ── Agent Query — fully dynamic ────────────────────────────────
+  // ── Agent ──────────────────────────────────────────────────
   if (url === '/pcap/agent/query' && method === 'POST') {
     try {
       const body = await parseBody(req);
       const { prompt, session_id } = JSON.parse(body.toString());
       const session = sessions.get(session_id);
       if (!session) return json(res, { error: 'Session not found' }, 404, requestOrigin);
-
       const result = await dynamicAgent(prompt, session.packets);
       return json(res, result, 200, requestOrigin);
-
     } catch (e) {
       console.error('[Agent Error]', e);
       return json(res, { error: 'Agent error: ' + e.message }, 500, requestOrigin);
     }
   }
 
-  // ── Images ────────────────────────────────────────────────────
+  // ── HTTP Objects (Wireshark-style Export Objects) ──────────
   if (url.startsWith('/pcap/images') && method === 'GET') {
     const q = getQuery(url);
     const session = sessions.get(q.session_id);
     if (!session) return json(res, { error: 'Session not found' }, 404, requestOrigin);
 
-    const MAGIC = [
-      { sig: [0xFF, 0xD8, 0xFF], ext: 'jpg', mime: 'image/jpeg' },
-      { sig: [0x89, 0x50, 0x4E, 0x47], ext: 'png', mime: 'image/png' },
-      { sig: [0x47, 0x49, 0x46, 0x38, 0x37], ext: 'gif', mime: 'image/gif' },
-      { sig: [0x47, 0x49, 0x46, 0x38, 0x39], ext: 'gif', mime: 'image/gif' },
-      { sig: [0x42, 0x4D], ext: 'bmp', mime: 'image/bmp' },
-      { sig: [0x52, 0x49, 0x46, 0x46], ext: 'webp', mime: 'image/webp' },
-    ];
-
-    // Collect ALL TCP streams (any port, not just 80)
-    const streams = {};
-    for (const pkt of session.packets) {
-      if (!pkt.raw_payload || pkt.raw_payload.length === 0) continue;
-      if (!pkt.src_ip || !pkt.dst_ip || !pkt.src_port || !pkt.dst_port) continue;
-
-      // Server→client only: server has lower port OR src_port is 80/8080/8443
-      const isServerResponse = pkt.src_port === 80 || pkt.src_port === 8080 || pkt.src_port === 8443 || pkt.src_port < pkt.dst_port;
-      if (!isServerResponse) continue;
-
-      const streamKey = `${pkt.src_ip}:${pkt.src_port}-${pkt.dst_ip}:${pkt.dst_port}`;
-      if (!streams[streamKey]) streams[streamKey] = { chunks: [], src_ip: pkt.src_ip, dst_ip: pkt.dst_ip };
-      streams[streamKey].chunks.push(pkt.raw_payload);
-    }
-
-    // Reassemble streams and strip HTTP headers
-    const httpBodies = [];
-    for (const stream of Object.values(streams)) {
-      if (!stream.chunks.length) continue;
-      const combined = Buffer.concat(stream.chunks);
-
-      // Strip HTTP response headers
-      const headerEnd = combined.indexOf(Buffer.from('\r\n\r\n'));
-      let body = headerEnd !== -1 ? combined.slice(headerEnd + 4) : combined;
-
-      // Handle chunked transfer encoding — strip chunk size lines
-      const headerStr = headerEnd !== -1 ? combined.slice(0, headerEnd).toString() : '';
-      if (headerStr.toLowerCase().includes('transfer-encoding: chunked')) {
-        try {
-          const dechunked = [];
-          let pos = 0;
-          while (pos < body.length) {
-            const lineEnd = body.indexOf(Buffer.from('\r\n'), pos);
-            if (lineEnd === -1) break;
-            const chunkSizeHex = body.slice(pos, lineEnd).toString().trim();
-            const chunkSize = parseInt(chunkSizeHex, 16);
-            if (isNaN(chunkSize) || chunkSize === 0) break;
-            const chunkStart = lineEnd + 2;
-            dechunked.push(body.slice(chunkStart, chunkStart + chunkSize));
-            pos = chunkStart + chunkSize + 2;
-          }
-          if (dechunked.length > 0) body = Buffer.concat(dechunked);
-        } catch (_) { }
-      }
-
-      if (body.length > 50) httpBodies.push({ data: body, src_ip: stream.src_ip, dst_ip: stream.dst_ip });
-    }
-
-    // Carve images by magic bytes
-    const images = [];
-    const seen = new Set();
-
-    for (const payload of httpBodies) {
-      const buf = payload.data;
-
-      for (const magic of MAGIC) {
-        let searchFrom = 0;
-        while (searchFrom < buf.length) {
-          let found = -1;
-          outer: for (let i = searchFrom; i <= buf.length - magic.sig.length; i++) {
-            for (let j = 0; j < magic.sig.length; j++) {
-              if (buf[i + j] !== magic.sig[j]) continue outer;
-            }
-            found = i;
-            break;
-          }
-          if (found === -1) break;
-
-          const chunk = buf.slice(found, Math.min(found + 3 * 1024 * 1024, buf.length));
-          if (chunk.length < 50) { searchFrom = found + 1; continue; }
-
-          const fingerprint = chunk.slice(0, 32).toString('hex');
-          if (!seen.has(fingerprint)) {
-            seen.add(fingerprint);
-            const base64 = chunk.toString('base64');
-            images.push({
-              filename: `extracted_${images.length}.${magic.ext}`,
-              url: `data:${magic.mime};base64,${base64}`,
-              size: chunk.length,
-              content_type: magic.mime,
-              method: 'magic-carve',
-              src_ip: payload.src_ip || 'unknown',
-              dst_ip: payload.dst_ip || 'unknown',
-            });
-          }
-          searchFrom = found + magic.sig.length;
-        }
-      }
-    }
+    const images = extractHttpObjects(session.packets);
 
     return json(res, {
       images,
       total: images.length,
       message: images.length === 0
-        ? 'No images found. Images can only be extracted from unencrypted HTTP traffic.'
-        : `Extracted ${images.length} image(s) from HTTP traffic.`,
+        ? 'No HTTP objects found. Objects can only be extracted from unencrypted HTTP traffic (port 80). HTTPS is encrypted.'
+        : `Extracted ${images.length} HTTP object(s) from traffic.`,
     }, 200, requestOrigin);
   }
 
-  // ── Port Intelligence — live CVE enrichment ───────────────────
+  // ── Port Intelligence ──────────────────────────────────────
   if (url.startsWith('/pcap/port-intel') && method === 'GET') {
     const q = getQuery(url);
     const query = q.query || '';
 
-    // Ask Groq for dynamic port info instead of hardcoded knowledge base
     if (GROQ_API_KEY) {
       const portInfo = await groqRequest([
-        {
-          role: 'system',
-          content: `You are a network security expert. When given a port number or protocol name, provide accurate security information about it. Respond in plain JSON only with these fields: name, description, risk (CRITICAL/HIGH/MEDIUM/LOW/SECURE), secure_alternative, common_uses (array), vulnerabilities (array), recommendations (array). No markdown.`,
-        },
-        { role: 'user', content: `Tell me about port/protocol: ${query}` },
+        { role: 'system', content: 'You are a network security expert. Given a port number or protocol name, return security info as plain JSON only with these fields: name, description, risk (CRITICAL/HIGH/MEDIUM/LOW/SECURE), secure_alternative, common_uses (array of strings), vulnerabilities (array of strings), recommendations (array of strings). No markdown, no extra text.' },
+        { role: 'user', content: `Port/protocol: ${query}` },
       ], 400);
 
       if (portInfo) {
         try {
-          const clean = portInfo.replace(/```json|```/g, '').trim();
-          const parsed = JSON.parse(clean);
+          const parsed = JSON.parse(portInfo.replace(/```json|```/g, '').trim());
           return json(res, { ...parsed, port: parseInt(query) || query, source: 'groq' }, 200, requestOrigin);
         } catch (_) { }
       }
     }
 
-    return json(res, { error: 'Port not found' }, 404, requestOrigin);
+    return json(res, { error: 'Port not found — set GROQ_API_KEY for dynamic port intelligence' }, 404, requestOrigin);
   }
 
-  // ── 404 ───────────────────────────────────────────────────────
+  // ── 404 ───────────────────────────────────────────────────
   json(res, {
     error: 'Not found',
     available_endpoints: [
@@ -855,6 +873,6 @@ const server = http.createServer(async (req, res) => {
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
   console.log(`✅ PCAP Analyzer Backend running on port ${PORT}`);
-  console.log(`🌐 CORS allowed origin: ${ALLOWED_ORIGIN}`);
-  console.log(`🤖 Groq AI: ${GROQ_API_KEY ? 'enabled ✅' : 'MISSING ❌ — set GROQ_API_KEY'}`);
+  console.log(`🌐 CORS origin: ${ALLOWED_ORIGIN}`);
+  console.log(`🤖 Groq AI: ${GROQ_API_KEY ? 'enabled ✅' : 'MISSING ❌ — set GROQ_API_KEY on Render'}`);
 });
