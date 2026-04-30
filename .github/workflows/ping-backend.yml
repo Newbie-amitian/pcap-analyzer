@@ -1,0 +1,26 @@
+name: Keep Backend Alive
+
+on:
+  schedule:
+    - cron: '*/9 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    name: Ping PCAP Backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Ping /ping endpoint
+        run: |
+          STATUS=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+            --max-time 15 \
+            "${{ secrets.BACKEND_URL }}/ping")
+          echo "Response status: $STATUS"
+          if [ "$STATUS" -ne 200 ]; then
+            echo "Backend cold starting - normal"
+            exit 0
+          else
+            echo "Backend is alive"
+          fi
