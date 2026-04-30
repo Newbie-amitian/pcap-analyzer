@@ -1,4 +1,4 @@
-const http  = require('http');
+const http = require('http');
 const https = require('https');
 const { Buffer } = require('buffer');
 
@@ -21,18 +21,22 @@ function getCorsHeaders(requestOrigin) {
   return {};
 }
 
-// ── OpenRouter / Qwen3 ────────────────────────────────────────
-// Set OPENROUTER_KEY in your Render environment variables (NOT NEXT_PUBLIC_)
-// Keeping the key server-side means it is never exposed to the browser.
-const OPENROUTER_KEY = process.env.OPENROUTER_KEY || '';
-const OR_MODEL       = 'qwen/qwen3-next-80b-a3b-instruct:free';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
-async function askQwen(userPrompt, toolName, toolResponse, toolResult) {
-  if (!OPENROUTER_KEY) return toolResponse; // no key → return raw response
+async function askGroq(userPrompt, toolName, toolResponse, toolResult) {
+  if (!GROQ_API_KEY) return toolResponse;
 
   return new Promise((resolve) => {
+    // Summarize large results so Groq doesn't choke on 5000 packets
+    const resultSummary = Array.isArray(toolResult) && toolResult.length > 50
+      ? { sample: toolResult.slice(0, 50), total_count: toolResult.length, note: 'Showing first 50 of full result set' }
+      : toolResult;
+
+    const resultJson = JSON.stringify(resultSummary);
     const body = JSON.stringify({
-      model: OR_MODEL,
+      model: GROQ_MODEL,
+      max_tokens: 1024,
       messages: [
         {
           role: 'system',
@@ -42,7 +46,7 @@ async function askQwen(userPrompt, toolName, toolResponse, toolResult) {
             'Explain those results clearly, highlight security risks, ' +
             'and give concrete remediation steps. ' +
             'Use markdown: bold key terms, bullet lists for findings. ' +
-            'Be concise (under 280 words). Never invent packet counts or IPs not in the data.',
+            'Be concise (under 300 words). Never invent packet counts or IPs not in the data.',
         },
         {
           role: 'user',
@@ -50,21 +54,19 @@ async function askQwen(userPrompt, toolName, toolResponse, toolResult) {
             `User asked: "${userPrompt}"\n\n` +
             `Backend tool: \`${toolName}\`\n` +
             `Backend response: ${toolResponse}\n\n` +
-            `Raw result data (truncated):\n${JSON.stringify(toolResult).slice(0, 1200)}\n\n` +
+            `Full result data:\n${resultJson}\n\n` +
             'Explain these findings to the user.',
         },
       ],
     });
 
     const options = {
-      hostname: 'openrouter.ai',
-      path:     '/api/v1/chat/completions',
-      method:   'POST',
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
+      method: 'POST',
       headers: {
-        'Authorization': `Bearer ${OPENROUTER_KEY}`,
-        'Content-Type':  'application/json',
-        'HTTP-Referer':  'https://pcap-analyzer-backend.onrender.com',
-        'X-Title':       'PCAP Analyzer',
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
       },
     };
@@ -84,7 +86,7 @@ async function askQwen(userPrompt, toolName, toolResponse, toolResult) {
     });
 
     req.on('error', () => resolve(toolResponse));
-    setTimeout(() => resolve(toolResponse), 15000); // 15 s hard timeout
+    setTimeout(() => resolve(toolResponse), 20000);
     req.write(body);
     req.end();
   });
@@ -106,47 +108,47 @@ const PROTOCOL_MAP = {
 };
 
 const VULNERABLE_PORTS = {
-  21:    { risk: 'HIGH',     reason: 'FTP transmits credentials in plaintext' },
-  23:    { risk: 'CRITICAL', reason: 'Telnet transmits everything in plaintext including passwords' },
-  25:    { risk: 'MEDIUM',   reason: 'SMTP can be exploited for spam/relay if misconfigured' },
-  53:    { risk: 'LOW',      reason: 'DNS can be used for tunneling or amplification attacks' },
-  69:    { risk: 'HIGH',     reason: 'TFTP has no authentication' },
-  80:    { risk: 'MEDIUM',   reason: 'HTTP transmits data in plaintext' },
-  110:   { risk: 'HIGH',     reason: 'POP3 transmits credentials in plaintext' },
-  135:   { risk: 'HIGH',     reason: 'RPC endpoint mapper — common attack vector' },
-  137:   { risk: 'HIGH',     reason: 'NetBIOS — information leakage risk' },
-  139:   { risk: 'HIGH',     reason: 'NetBIOS Session — lateral movement risk' },
-  143:   { risk: 'MEDIUM',   reason: 'IMAP may transmit credentials in plaintext' },
-  161:   { risk: 'HIGH',     reason: 'SNMP v1/v2 use plaintext community strings' },
-  389:   { risk: 'MEDIUM',   reason: 'LDAP without TLS exposes directory data' },
-  445:   { risk: 'CRITICAL', reason: 'SMB — EternalBlue / ransomware vector' },
-  1080:  { risk: 'HIGH',     reason: 'SOCKS proxy — potential data exfiltration' },
-  1433:  { risk: 'HIGH',     reason: 'MSSQL exposed to network — brute force risk' },
-  1521:  { risk: 'HIGH',     reason: 'Oracle DB exposed — brute force risk' },
-  1723:  { risk: 'MEDIUM',   reason: 'PPTP VPN — weak encryption (MS-CHAPv2)' },
-  3306:  { risk: 'HIGH',     reason: 'MySQL exposed — brute force / data exfil risk' },
-  3389:  { risk: 'HIGH',     reason: 'RDP — BlueKeep / brute force attack vector' },
-  4444:  { risk: 'CRITICAL', reason: 'Metasploit default port — likely backdoor!' },
-  5432:  { risk: 'HIGH',     reason: 'PostgreSQL exposed — brute force risk' },
-  5900:  { risk: 'HIGH',     reason: 'VNC often uses weak/no authentication' },
-  6379:  { risk: 'CRITICAL', reason: 'Redis with no auth — full server compromise risk' },
-  6667:  { risk: 'MEDIUM',   reason: 'IRC — often used by botnets for C2' },
-  8080:  { risk: 'LOW',      reason: 'Alternate HTTP — may expose dev/admin panels' },
-  9200:  { risk: 'CRITICAL', reason: 'Elasticsearch with no auth — data breach risk' },
+  21: { risk: 'HIGH', reason: 'FTP transmits credentials in plaintext' },
+  23: { risk: 'CRITICAL', reason: 'Telnet transmits everything in plaintext including passwords' },
+  25: { risk: 'MEDIUM', reason: 'SMTP can be exploited for spam/relay if misconfigured' },
+  53: { risk: 'LOW', reason: 'DNS can be used for tunneling or amplification attacks' },
+  69: { risk: 'HIGH', reason: 'TFTP has no authentication' },
+  80: { risk: 'MEDIUM', reason: 'HTTP transmits data in plaintext' },
+  110: { risk: 'HIGH', reason: 'POP3 transmits credentials in plaintext' },
+  135: { risk: 'HIGH', reason: 'RPC endpoint mapper — common attack vector' },
+  137: { risk: 'HIGH', reason: 'NetBIOS — information leakage risk' },
+  139: { risk: 'HIGH', reason: 'NetBIOS Session — lateral movement risk' },
+  143: { risk: 'MEDIUM', reason: 'IMAP may transmit credentials in plaintext' },
+  161: { risk: 'HIGH', reason: 'SNMP v1/v2 use plaintext community strings' },
+  389: { risk: 'MEDIUM', reason: 'LDAP without TLS exposes directory data' },
+  445: { risk: 'CRITICAL', reason: 'SMB — EternalBlue / ransomware vector' },
+  1080: { risk: 'HIGH', reason: 'SOCKS proxy — potential data exfiltration' },
+  1433: { risk: 'HIGH', reason: 'MSSQL exposed to network — brute force risk' },
+  1521: { risk: 'HIGH', reason: 'Oracle DB exposed — brute force risk' },
+  1723: { risk: 'MEDIUM', reason: 'PPTP VPN — weak encryption (MS-CHAPv2)' },
+  3306: { risk: 'HIGH', reason: 'MySQL exposed — brute force / data exfil risk' },
+  3389: { risk: 'HIGH', reason: 'RDP — BlueKeep / brute force attack vector' },
+  4444: { risk: 'CRITICAL', reason: 'Metasploit default port — likely backdoor!' },
+  5432: { risk: 'HIGH', reason: 'PostgreSQL exposed — brute force risk' },
+  5900: { risk: 'HIGH', reason: 'VNC often uses weak/no authentication' },
+  6379: { risk: 'CRITICAL', reason: 'Redis with no auth — full server compromise risk' },
+  6667: { risk: 'MEDIUM', reason: 'IRC — often used by botnets for C2' },
+  8080: { risk: 'LOW', reason: 'Alternate HTTP — may expose dev/admin panels' },
+  9200: { risk: 'CRITICAL', reason: 'Elasticsearch with no auth — data breach risk' },
   27017: { risk: 'CRITICAL', reason: 'MongoDB with no auth — full DB exposure risk' },
 };
 
 const PORT_KNOWLEDGE = {
-  21:    { name: 'FTP',         description: 'File Transfer Protocol',     risk: 'HIGH',     secure_alternative: 'Use SFTP (port 22) or FTPS (port 990)',    common_uses: ['File transfers', 'Web hosting uploads'],           vulnerabilities: ['Plaintext credentials', 'Anonymous login', 'Bounce attacks'],  recommendations: ['Disable FTP, use SFTP instead', 'If required, use FTPS with TLS', 'Disable anonymous login'] },
-  22:    { name: 'SSH',         description: 'Secure Shell',               risk: 'SECURE',   secure_alternative: 'Already secure',                           common_uses: ['Remote admin', 'Tunneling', 'SFTP'],               vulnerabilities: ['Brute force', 'Weak keys'],                                    recommendations: ['Use key-based auth', 'Disable root login', 'Use fail2ban'] },
-  23:    { name: 'TELNET',      description: 'Telnet Protocol',            risk: 'CRITICAL', secure_alternative: 'Use SSH (port 22)',                         common_uses: ['Legacy remote admin', 'Network device management'], vulnerabilities: ['Plaintext everything', 'No encryption', 'MITM attacks'],       recommendations: ['Immediately disable Telnet', 'Replace with SSH', 'Block at firewall'] },
-  80:    { name: 'HTTP',        description: 'HyperText Transfer Protocol',risk: 'MEDIUM',   secure_alternative: 'Use HTTPS (port 443)',                      common_uses: ['Web browsing', 'APIs', 'Web apps'],                vulnerabilities: ['Plaintext data', 'Session hijacking', 'MITM'],                recommendations: ['Redirect all HTTP to HTTPS', 'Use HSTS headers'] },
-  443:   { name: 'HTTPS',       description: 'HTTP Secure',                risk: 'SECURE',   secure_alternative: 'Already secure',                           common_uses: ['Secure web browsing', 'APIs', 'Web apps'],         vulnerabilities: ['Weak TLS configs', 'Expired certs'],                          recommendations: ['Use TLS 1.2+', 'Enable HSTS', 'Renew certificates'] },
-  445:   { name: 'SMB',         description: 'Server Message Block',       risk: 'CRITICAL', secure_alternative: 'Use VPN + SMB, or SFTP',                   common_uses: ['File sharing', 'Windows networking'],              vulnerabilities: ['EternalBlue (MS17-010)', 'WannaCry', 'NotPetya'],             recommendations: ['Block at perimeter', 'Patch immediately', 'Disable SMBv1'] },
-  3389:  { name: 'RDP',         description: 'Remote Desktop Protocol',    risk: 'HIGH',     secure_alternative: 'RDP over VPN only',                        common_uses: ['Windows remote desktop', 'IT support'],            vulnerabilities: ['BlueKeep (CVE-2019-0708)', 'Brute force', 'DejaBlue'],        recommendations: ['Never expose to internet', 'Use VPN', 'Enable NLA'] },
-  3306:  { name: 'MySQL',       description: 'MySQL Database',             risk: 'HIGH',     secure_alternative: 'Bind to localhost only',                   common_uses: ['Database access', 'Web apps'],                     vulnerabilities: ['Brute force', 'SQL injection', 'Unauthorized access'],         recommendations: ['Bind to 127.0.0.1', 'Use strong passwords', 'Restrict remote access'] },
-  6379:  { name: 'Redis',       description: 'Redis Cache/DB',             risk: 'CRITICAL', secure_alternative: 'Bind to localhost, enable AUTH',           common_uses: ['Caching', 'Session storage', 'Pub/Sub'],           vulnerabilities: ['No auth by default', 'Remote code execution', 'Data theft'],  recommendations: ['Bind to localhost only', 'Enable AUTH', 'Use firewall rules'] },
-  27017: { name: 'MongoDB',     description: 'MongoDB Database',           risk: 'CRITICAL', secure_alternative: 'Bind to localhost, enable auth',           common_uses: ['NoSQL database', 'Web apps'],                      vulnerabilities: ['No auth by default', 'Mass data breaches'],                   recommendations: ['Enable authentication', 'Bind to localhost', 'Use TLS'] },
+  21: { name: 'FTP', description: 'File Transfer Protocol', risk: 'HIGH', secure_alternative: 'Use SFTP (port 22) or FTPS (port 990)', common_uses: ['File transfers', 'Web hosting uploads'], vulnerabilities: ['Plaintext credentials', 'Anonymous login', 'Bounce attacks'], recommendations: ['Disable FTP, use SFTP instead', 'If required, use FTPS with TLS', 'Disable anonymous login'] },
+  22: { name: 'SSH', description: 'Secure Shell', risk: 'SECURE', secure_alternative: 'Already secure', common_uses: ['Remote admin', 'Tunneling', 'SFTP'], vulnerabilities: ['Brute force', 'Weak keys'], recommendations: ['Use key-based auth', 'Disable root login', 'Use fail2ban'] },
+  23: { name: 'TELNET', description: 'Telnet Protocol', risk: 'CRITICAL', secure_alternative: 'Use SSH (port 22)', common_uses: ['Legacy remote admin', 'Network device management'], vulnerabilities: ['Plaintext everything', 'No encryption', 'MITM attacks'], recommendations: ['Immediately disable Telnet', 'Replace with SSH', 'Block at firewall'] },
+  80: { name: 'HTTP', description: 'HyperText Transfer Protocol', risk: 'MEDIUM', secure_alternative: 'Use HTTPS (port 443)', common_uses: ['Web browsing', 'APIs', 'Web apps'], vulnerabilities: ['Plaintext data', 'Session hijacking', 'MITM'], recommendations: ['Redirect all HTTP to HTTPS', 'Use HSTS headers'] },
+  443: { name: 'HTTPS', description: 'HTTP Secure', risk: 'SECURE', secure_alternative: 'Already secure', common_uses: ['Secure web browsing', 'APIs', 'Web apps'], vulnerabilities: ['Weak TLS configs', 'Expired certs'], recommendations: ['Use TLS 1.2+', 'Enable HSTS', 'Renew certificates'] },
+  445: { name: 'SMB', description: 'Server Message Block', risk: 'CRITICAL', secure_alternative: 'Use VPN + SMB, or SFTP', common_uses: ['File sharing', 'Windows networking'], vulnerabilities: ['EternalBlue (MS17-010)', 'WannaCry', 'NotPetya'], recommendations: ['Block at perimeter', 'Patch immediately', 'Disable SMBv1'] },
+  3389: { name: 'RDP', description: 'Remote Desktop Protocol', risk: 'HIGH', secure_alternative: 'RDP over VPN only', common_uses: ['Windows remote desktop', 'IT support'], vulnerabilities: ['BlueKeep (CVE-2019-0708)', 'Brute force', 'DejaBlue'], recommendations: ['Never expose to internet', 'Use VPN', 'Enable NLA'] },
+  3306: { name: 'MySQL', description: 'MySQL Database', risk: 'HIGH', secure_alternative: 'Bind to localhost only', common_uses: ['Database access', 'Web apps'], vulnerabilities: ['Brute force', 'SQL injection', 'Unauthorized access'], recommendations: ['Bind to 127.0.0.1', 'Use strong passwords', 'Restrict remote access'] },
+  6379: { name: 'Redis', description: 'Redis Cache/DB', risk: 'CRITICAL', secure_alternative: 'Bind to localhost, enable AUTH', common_uses: ['Caching', 'Session storage', 'Pub/Sub'], vulnerabilities: ['No auth by default', 'Remote code execution', 'Data theft'], recommendations: ['Bind to localhost only', 'Enable AUTH', 'Use firewall rules'] },
+  27017: { name: 'MongoDB', description: 'MongoDB Database', risk: 'CRITICAL', secure_alternative: 'Bind to localhost, enable auth', common_uses: ['NoSQL database', 'Web apps'], vulnerabilities: ['No auth by default', 'Mass data breaches'], recommendations: ['Enable authentication', 'Bind to localhost', 'Use TLS'] },
 };
 
 // ── PCAP Parser ────────────────────────────────────────────────
@@ -157,7 +159,7 @@ function parsePcap(buffer) {
   if (buffer.length < 24) return packets;
 
   const magicNumber = buffer.readUInt32LE(0);
-  const isLE  = magicNumber === 0xa1b2c3d4 || magicNumber === 0xa1b23c4d;
+  const isLE = magicNumber === 0xa1b2c3d4 || magicNumber === 0xa1b23c4d;
   const isNano = magicNumber === 0xa1b23c4d;
 
   if (!isLE && magicNumber !== 0xd4c3b2a1 && magicNumber !== 0x4d3cb2a1) return packets;
@@ -171,7 +173,7 @@ function parsePcap(buffer) {
   let packetId = 0;
 
   while (offset + 16 <= buffer.length && packetId < 10000) {
-    const tsSec  = read32(offset);
+    const tsSec = read32(offset);
     const tsUsec = read32(offset + 4);
     const inclLen = read32(offset + 8);
     const origLen = read32(offset + 12);
@@ -201,11 +203,11 @@ function parsePcap(buffer) {
 
       if (etherType === 0x0800 && packetData.length >= 34) {
         const ipStart = 14;
-        const ihl     = (packetData[ipStart] & 0x0f) * 4;
+        const ihl = (packetData[ipStart] & 0x0f) * 4;
         const ipProto = packetData[ipStart + 9];
-        packet.ttl    = packetData[ipStart + 8];
-        packet.src_ip = `${packetData[ipStart+12]}.${packetData[ipStart+13]}.${packetData[ipStart+14]}.${packetData[ipStart+15]}`;
-        packet.dst_ip = `${packetData[ipStart+16]}.${packetData[ipStart+17]}.${packetData[ipStart+18]}.${packetData[ipStart+19]}`;
+        packet.ttl = packetData[ipStart + 8];
+        packet.src_ip = `${packetData[ipStart + 12]}.${packetData[ipStart + 13]}.${packetData[ipStart + 14]}.${packetData[ipStart + 15]}`;
+        packet.dst_ip = `${packetData[ipStart + 16]}.${packetData[ipStart + 17]}.${packetData[ipStart + 18]}.${packetData[ipStart + 19]}`;
 
         const transportStart = ipStart + ihl;
 
@@ -214,7 +216,7 @@ function parsePcap(buffer) {
           packet.dst_port = packetData.readUInt16BE(transportStart + 2);
 
           const tcpFlags = packetData[transportStart + 13];
-          const flagStr  = [];
+          const flagStr = [];
           if (tcpFlags & 0x02) flagStr.push('S');
           if (tcpFlags & 0x10) flagStr.push('A');
           if (tcpFlags & 0x08) flagStr.push('P');
@@ -222,7 +224,7 @@ function parsePcap(buffer) {
           if (tcpFlags & 0x04) flagStr.push('R');
           packet.flags = flagStr.join('') || null;
 
-          const dataOffset   = (packetData[transportStart + 12] >> 4) * 4;
+          const dataOffset = (packetData[transportStart + 12] >> 4) * 4;
           const payloadStart = transportStart + dataOffset;
 
           if (packetData.length > payloadStart) {
@@ -260,9 +262,9 @@ function parsePcap(buffer) {
 
 // ── Vulnerability Engine ───────────────────────────────────────
 function detectVulnerabilities(packets) {
-  const alerts       = [];
+  const alerts = [];
   const seenPortPairs = new Set();
-  const publicIps    = new Set();
+  const publicIps = new Set();
 
   for (const pkt of packets) {
     const port = pkt.dst_port || pkt.src_port;
@@ -361,28 +363,28 @@ function agentQuery(prompt, packets) {
 
   const ipMatch = prompt.match(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/);
   if (ipMatch) {
-    const ip     = ipMatch[1];
+    const ip = ipMatch[1];
     const result = packets.filter(pk => pk.src_ip === ip || pk.dst_ip === ip);
     return { tool_called: 'filter_by_ip', parameters: { ip }, result, response: `Found ${result.length} packets involving IP ${ip}.` };
   }
 
   const portMatch = prompt.match(/port\s+(\d+)/i);
   if (portMatch) {
-    const port   = parseInt(portMatch[1]);
+    const port = parseInt(portMatch[1]);
     const result = packets.filter(pk => pk.src_port === port || pk.dst_port === port);
     return { tool_called: 'filter_by_port', parameters: { port }, result, response: `Found ${result.length} packets on port ${port}.` };
   }
 
   const totalPackets = packets.length;
-  const protocols    = {};
+  const protocols = {};
   for (const pk of packets) protocols[pk.protocol] = (protocols[pk.protocol] || 0) + 1;
-  const topProtocol  = Object.entries(protocols).sort((a, b) => b[1] - a[1])[0];
+  const topProtocol = Object.entries(protocols).sort((a, b) => b[1] - a[1])[0];
 
   return {
     tool_called: 'summary',
-    parameters:  {},
-    result:      { total_packets: totalPackets, protocols },
-    response:    `This capture has ${totalPackets} packets. Most common protocol: ${topProtocol ? topProtocol[0] : 'unknown'} (${topProtocol ? topProtocol[1] : 0} packets). Try asking about specific ports, IPs, credentials, DNS, or port scans!`,
+    parameters: {},
+    result: { total_packets: totalPackets, protocols },
+    response: `This capture has ${totalPackets} packets. Most common protocol: ${topProtocol ? topProtocol[0] : 'unknown'} (${topProtocol ? topProtocol[1] : 0} packets). Try asking about specific ports, IPs, credentials, DNS, or port scans!`,
   };
 }
 
@@ -391,26 +393,26 @@ function parseBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
-    req.on('end',  () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
 function parseMultipart(buffer, boundary) {
   const boundaryBuf = Buffer.from('--' + boundary);
-  const parts       = [];
-  let start         = 0;
+  const parts = [];
+  let start = 0;
 
   while (start < buffer.length) {
     const bStart = buffer.indexOf(boundaryBuf, start);
     if (bStart === -1) break;
     const headerStart = bStart + boundaryBuf.length + 2;
-    const headerEnd   = buffer.indexOf(Buffer.from('\r\n\r\n'), headerStart);
+    const headerEnd = buffer.indexOf(Buffer.from('\r\n\r\n'), headerStart);
     if (headerEnd === -1) break;
-    const headers  = buffer.slice(headerStart, headerEnd).toString();
+    const headers = buffer.slice(headerStart, headerEnd).toString();
     const dataStart = headerEnd + 4;
     const nextBound = buffer.indexOf(boundaryBuf, dataStart);
-    const dataEnd   = nextBound === -1 ? buffer.length : nextBound - 2;
+    const dataEnd = nextBound === -1 ? buffer.length : nextBound - 2;
     parts.push({ headers, data: buffer.slice(dataStart, dataEnd) });
     start = nextBound === -1 ? buffer.length : nextBound;
   }
@@ -427,7 +429,7 @@ function json(res, data, status = 200, requestOrigin = '') {
 }
 
 function getQuery(url) {
-  const q   = {};
+  const q = {};
   const idx = url.indexOf('?');
   if (idx === -1) return q;
   for (const part of url.slice(idx + 1).split('&')) {
@@ -441,15 +443,15 @@ function getQuery(url) {
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || '';
 if (RENDER_URL) {
   setInterval(() => {
-    https.get(`${RENDER_URL}/pcap/health`, () => {}).on('error', () => {});
+    https.get(`${RENDER_URL}/pcap/health`, () => { }).on('error', () => { });
     console.log('[Keep-alive] ping sent to', RENDER_URL);
   }, 9 * 60 * 1000);
 }
 
 // ── Main HTTP Server ───────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  const url           = req.url || '/';
-  const method        = req.method || 'GET';
+  const url = req.url || '/';
+  const method = req.method || 'GET';
   const requestOrigin = req.headers['origin'] || '';
 
   if (method === 'OPTIONS') {
@@ -473,11 +475,11 @@ const server = http.createServer(async (req, res) => {
   // ── Upload PCAP ───────────────────────────────────────────────
   if (url === '/pcap/upload' && method === 'POST') {
     try {
-      const contentType    = req.headers['content-type'] || '';
-      const boundaryMatch  = contentType.match(/boundary=(.+)/);
+      const contentType = req.headers['content-type'] || '';
+      const boundaryMatch = contentType.match(/boundary=(.+)/);
       if (!boundaryMatch) return json(res, { error: 'Missing multipart boundary' }, 400, requestOrigin);
 
-      const body  = await parseBody(req);
+      const body = await parseBody(req);
       const parts = parseMultipart(body, boundaryMatch[1]);
 
       let fileData = null;
@@ -497,15 +499,15 @@ const server = http.createServer(async (req, res) => {
       if (packets.length === 0) return json(res, { error: 'Could not parse PCAP file. Make sure it is a valid .pcap file.' }, 400, requestOrigin);
 
       const protocols = {};
-      let totalBytes  = 0;
+      let totalBytes = 0;
       for (const pk of packets) {
         protocols[pk.protocol] = (protocols[pk.protocol] || 0) + 1;
         totalBytes += pk.length;
       }
 
       const timestamps = packets.map(p => p.timestamp);
-      const minT       = Math.min(...timestamps);
-      const maxT       = Math.max(...timestamps);
+      const minT = Math.min(...timestamps);
+      const maxT = Math.max(...timestamps);
       const session_id = `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
       sessions.set(session_id, { session_id, filename, packets, created_at: Date.now() });
@@ -534,13 +536,13 @@ const server = http.createServer(async (req, res) => {
 
   // ── Get Packets ───────────────────────────────────────────────
   if (url.startsWith('/pcap/packets') && method === 'GET') {
-    const q       = getQuery(url);
+    const q = getQuery(url);
     const session = sessions.get(q.session_id);
     if (!session) return json(res, { error: 'Session not found' }, 404, requestOrigin);
 
-    const page     = parseInt(q.page     || '1');
+    const page = parseInt(q.page || '1');
     const per_page = parseInt(q.per_page || '50');
-    const start    = (page - 1) * per_page;
+    const start = (page - 1) * per_page;
     const paginated = session.packets.slice(start, start + per_page);
 
     return json(res, { packets: paginated, total: session.packets.length, page, per_page }, 200, requestOrigin);
@@ -548,12 +550,12 @@ const server = http.createServer(async (req, res) => {
 
   // ── Vulnerabilities ───────────────────────────────────────────
   if (url.startsWith('/pcap/vulnerabilities') && method === 'GET') {
-    const q       = getQuery(url);
+    const q = getQuery(url);
     const session = sessions.get(q.session_id);
     if (!session) return json(res, { error: 'Session not found' }, 404, requestOrigin);
 
     const { alerts, publicIps } = detectVulnerabilities(session.packets);
-    const enrichedAlerts        = [...alerts];
+    const enrichedAlerts = [...alerts];
 
     for (const ip of publicIps.slice(0, 5)) {
       try {
@@ -573,13 +575,13 @@ const server = http.createServer(async (req, res) => {
                     hostnames: parsed.hostnames || [],
                   });
                 }
-              } catch (_) {}
+              } catch (_) { }
               resolve();
             });
           }).on('error', () => resolve());
           setTimeout(resolve, 3000);
         });
-      } catch (_) {}
+      } catch (_) { }
     }
 
     const summary = { critical: 0, high: 0, medium: 0, low: 0 };
@@ -594,16 +596,16 @@ const server = http.createServer(async (req, res) => {
   // ── Agent Query (keyword-tool + Qwen3 enrichment) ─────────────
   if (url === '/pcap/agent/query' && method === 'POST') {
     try {
-      const body                       = await parseBody(req);
-      const { prompt, session_id }     = JSON.parse(body.toString());
-      const session                    = sessions.get(session_id);
+      const body = await parseBody(req);
+      const { prompt, session_id } = JSON.parse(body.toString());
+      const session = sessions.get(session_id);
       if (!session) return json(res, { error: 'Session not found' }, 404, requestOrigin);
 
       // 1 — keyword-based backend tool (fast, deterministic)
       const toolResult = agentQuery(prompt, session.packets);
 
-      // 2 — Qwen3 enrichment via OpenRouter (async, falls back if no key)
-      const aiResponse = await askQwen(
+      // ── Agent Query (keyword-tool + Groq enrichment) ──────────────
+      const aiResponse = await askGroq(
         prompt,
         toolResult.tool_called,
         toolResult.response,
@@ -624,16 +626,16 @@ const server = http.createServer(async (req, res) => {
   // FIX: strips HTTP response headers before carving so magic-byte scanner
   //      actually finds JPEG/PNG bytes instead of searching through header text.
   if (url.startsWith('/pcap/images') && method === 'GET') {
-    const q       = getQuery(url);
+    const q = getQuery(url);
     const session = sessions.get(q.session_id);
     if (!session) return json(res, { error: 'Session not found' }, 404, requestOrigin);
 
     const MAGIC = [
-      { sig: [0xFF, 0xD8, 0xFF],             ext: 'jpg', mime: 'image/jpeg' },
-      { sig: [0x89, 0x50, 0x4E, 0x47],       ext: 'png', mime: 'image/png' },
+      { sig: [0xFF, 0xD8, 0xFF], ext: 'jpg', mime: 'image/jpeg' },
+      { sig: [0x89, 0x50, 0x4E, 0x47], ext: 'png', mime: 'image/png' },
       { sig: [0x47, 0x49, 0x46, 0x38, 0x37], ext: 'gif', mime: 'image/gif' },
       { sig: [0x47, 0x49, 0x46, 0x38, 0x39], ext: 'gif', mime: 'image/gif' },
-      { sig: [0x42, 0x4D],                   ext: 'bmp', mime: 'image/bmp' },
+      { sig: [0x42, 0x4D], ext: 'bmp', mime: 'image/bmp' },
     ];
 
     // Group server→client TCP payloads by HTTP response stream.
@@ -659,9 +661,9 @@ const server = http.createServer(async (req, res) => {
     const httpBodies = [];
     for (const stream of Object.values(streams)) {
       if (!stream.chunks.length) continue;
-      const combined  = Buffer.concat(stream.chunks);
+      const combined = Buffer.concat(stream.chunks);
       const headerEnd = combined.indexOf(Buffer.from('\r\n\r\n'));
-      const body      = headerEnd !== -1 ? combined.slice(headerEnd + 4) : combined;
+      const body = headerEnd !== -1 ? combined.slice(headerEnd + 4) : combined;
       if (body.length > 10) {
         httpBodies.push({ data: body, src_ip: stream.src_ip, dst_ip: stream.dst_ip });
       }
@@ -669,7 +671,7 @@ const server = http.createServer(async (req, res) => {
 
     // Carve images
     const images = [];
-    const seen   = new Set();
+    const seen = new Set();
 
     for (const payload of httpBodies) {
       const buf = payload.data;
@@ -694,15 +696,15 @@ const server = http.createServer(async (req, res) => {
           const fingerprint = chunk.slice(0, 32).toString('hex');
           if (!seen.has(fingerprint)) {
             seen.add(fingerprint);
-            const base64  = chunk.toString('base64');
+            const base64 = chunk.toString('base64');
             images.push({
-              filename:     `extracted_${images.length}.${magic.ext}`,
-              url:          `data:${magic.mime};base64,${base64}`,
-              size:         chunk.length,
+              filename: `extracted_${images.length}.${magic.ext}`,
+              url: `data:${magic.mime};base64,${base64}`,
+              size: chunk.length,
               content_type: magic.mime,
-              method:       'magic-carve',
-              src_ip:       payload.src_ip || 'unknown',
-              dst_ip:       payload.dst_ip || 'unknown',
+              method: 'magic-carve',
+              src_ip: payload.src_ip || 'unknown',
+              dst_ip: payload.dst_ip || 'unknown',
             });
           }
           searchFrom = found + 1;
@@ -712,7 +714,7 @@ const server = http.createServer(async (req, res) => {
 
     return json(res, {
       images,
-      total:   images.length,
+      total: images.length,
       message: images.length === 0
         ? 'No images found. Images can only be extracted from unencrypted HTTP (port 80) traffic.'
         : `Extracted ${images.length} image(s) from HTTP traffic.`,
@@ -721,8 +723,8 @@ const server = http.createServer(async (req, res) => {
 
   // ── Port Intelligence ─────────────────────────────────────────
   if (url.startsWith('/pcap/port-intel') && method === 'GET') {
-    const q       = getQuery(url);
-    const query   = q.query || '';
+    const q = getQuery(url);
+    const query = q.query || '';
     const portNum = parseInt(query);
 
     if (!isNaN(portNum) && PORT_KNOWLEDGE[portNum]) {
@@ -762,6 +764,6 @@ const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
   console.log(`✅ PCAP Analyzer Backend running on port ${PORT}`);
   console.log(`🌐 CORS allowed origin: ${ALLOWED_ORIGIN}`);
-  console.log(`🤖 OpenRouter/Qwen3: ${OPENROUTER_KEY ? 'enabled' : 'disabled (set OPENROUTER_KEY to enable)'}`);
+  console.log(`🤖 Groq AI: ${GROQ_API_KEY ? 'enabled ✅' : 'disabled — set GROQ_API_KEY to enable'}`);
   console.log(`📡 Endpoints available at /pcap/*`);
 });
