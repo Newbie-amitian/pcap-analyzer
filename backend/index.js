@@ -21,47 +21,15 @@ function getCorsHeaders(requestOrigin) {
   return {};
 }
 
+// ── Groq ──────────────────────────────────────────────────────
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
-async function askGroq(userPrompt, toolName, toolResponse, toolResult) {
-  console.log('[Groq] KEY:', GROQ_API_KEY ? 'FOUND ✅' : 'MISSING ❌');
-
-  if (!GROQ_API_KEY) return toolResponse;
-
+function groqRequest(messages, maxTokens = 1024) {
   return new Promise((resolve) => {
-    // Summarize large results so Groq doesn't choke on 5000 packets
-    const resultSummary = Array.isArray(toolResult) && toolResult.length > 50
-      ? { sample: toolResult.slice(0, 50), total_count: toolResult.length, note: 'Showing first 50 of full result set' }
-      : toolResult;
+    if (!GROQ_API_KEY) return resolve(null);
 
-    const resultJson = JSON.stringify(resultSummary);
-    const body = JSON.stringify({
-      model: GROQ_MODEL,
-      max_tokens: 1024,
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You are an expert network security analyst embedded in a PCAP analysis tool. ' +
-            'A backend keyword-tool already ran and returned raw results. ' +
-            'Explain those results clearly, highlight security risks, ' +
-            'and give concrete remediation steps. ' +
-            'Use markdown: bold key terms, bullet lists for findings. ' +
-            'Be concise (under 300 words). Never invent packet counts or IPs not in the data.',
-        },
-        {
-          role: 'user',
-          content:
-            `User asked: "${userPrompt}"\n\n` +
-            `Backend tool: \`${toolName}\`\n` +
-            `Backend response: ${toolResponse}\n\n` +
-            `Full result data:\n${resultJson}\n\n` +
-            'Explain these findings to the user.',
-        },
-      ],
-    });
-
+    const body = JSON.stringify({ model: GROQ_MODEL, max_tokens: maxTokens, messages });
     const options = {
       hostname: 'api.groq.com',
       path: '/openai/v1/chat/completions',
@@ -75,26 +43,51 @@ async function askGroq(userPrompt, toolName, toolResponse, toolResult) {
 
     const req = https.request(options, (res) => {
       let data = '';
-      res.on('data', (chunk) => { data += chunk; });
+      res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
           const json = JSON.parse(data);
-          const text = json.choices?.[0]?.message?.content?.trim();
-          resolve(text || toolResponse);
-        } catch (_) {
-          resolve(toolResponse);
-        }
+          resolve(json.choices?.[0]?.message?.content?.trim() || null);
+        } catch (_) { resolve(null); }
       });
     });
-
-    req.on('error', () => resolve(toolResponse));
-    setTimeout(() => resolve(toolResponse), 20000);
+    req.on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 25000);
     req.write(body);
     req.end();
   });
 }
 
-// ── PCAP Protocol/Port Knowledge ──────────────────────────────
+// ── CVE enrichment from live APIs ─────────────────────────────
+async function fetchCveDetails(cveId) {
+  return new Promise((resolve) => {
+    https.get(`https://cve.circl.lu/api/cve/${cveId}`, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (_) { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 4000);
+  });
+}
+
+async function fetchShodanIp(ip) {
+  return new Promise((resolve) => {
+    https.get(`https://internetdb.shodan.io/${ip}`, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (_) { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 4000);
+  });
+}
+
+// ── Protocol/Port maps ─────────────────────────────────────────
 const PROTOCOL_MAP = {
   20: 'FTP-DATA', 21: 'FTP', 22: 'SSH', 23: 'TELNET', 25: 'SMTP',
   53: 'DNS', 67: 'DHCP', 68: 'DHCP', 69: 'TFTP', 80: 'HTTP',
@@ -140,18 +133,211 @@ const VULNERABLE_PORTS = {
   27017: { risk: 'CRITICAL', reason: 'MongoDB with no auth — full DB exposure risk' },
 };
 
-const PORT_KNOWLEDGE = {
-  21: { name: 'FTP', description: 'File Transfer Protocol', risk: 'HIGH', secure_alternative: 'Use SFTP (port 22) or FTPS (port 990)', common_uses: ['File transfers', 'Web hosting uploads'], vulnerabilities: ['Plaintext credentials', 'Anonymous login', 'Bounce attacks'], recommendations: ['Disable FTP, use SFTP instead', 'If required, use FTPS with TLS', 'Disable anonymous login'] },
-  22: { name: 'SSH', description: 'Secure Shell', risk: 'SECURE', secure_alternative: 'Already secure', common_uses: ['Remote admin', 'Tunneling', 'SFTP'], vulnerabilities: ['Brute force', 'Weak keys'], recommendations: ['Use key-based auth', 'Disable root login', 'Use fail2ban'] },
-  23: { name: 'TELNET', description: 'Telnet Protocol', risk: 'CRITICAL', secure_alternative: 'Use SSH (port 22)', common_uses: ['Legacy remote admin', 'Network device management'], vulnerabilities: ['Plaintext everything', 'No encryption', 'MITM attacks'], recommendations: ['Immediately disable Telnet', 'Replace with SSH', 'Block at firewall'] },
-  80: { name: 'HTTP', description: 'HyperText Transfer Protocol', risk: 'MEDIUM', secure_alternative: 'Use HTTPS (port 443)', common_uses: ['Web browsing', 'APIs', 'Web apps'], vulnerabilities: ['Plaintext data', 'Session hijacking', 'MITM'], recommendations: ['Redirect all HTTP to HTTPS', 'Use HSTS headers'] },
-  443: { name: 'HTTPS', description: 'HTTP Secure', risk: 'SECURE', secure_alternative: 'Already secure', common_uses: ['Secure web browsing', 'APIs', 'Web apps'], vulnerabilities: ['Weak TLS configs', 'Expired certs'], recommendations: ['Use TLS 1.2+', 'Enable HSTS', 'Renew certificates'] },
-  445: { name: 'SMB', description: 'Server Message Block', risk: 'CRITICAL', secure_alternative: 'Use VPN + SMB, or SFTP', common_uses: ['File sharing', 'Windows networking'], vulnerabilities: ['EternalBlue (MS17-010)', 'WannaCry', 'NotPetya'], recommendations: ['Block at perimeter', 'Patch immediately', 'Disable SMBv1'] },
-  3389: { name: 'RDP', description: 'Remote Desktop Protocol', risk: 'HIGH', secure_alternative: 'RDP over VPN only', common_uses: ['Windows remote desktop', 'IT support'], vulnerabilities: ['BlueKeep (CVE-2019-0708)', 'Brute force', 'DejaBlue'], recommendations: ['Never expose to internet', 'Use VPN', 'Enable NLA'] },
-  3306: { name: 'MySQL', description: 'MySQL Database', risk: 'HIGH', secure_alternative: 'Bind to localhost only', common_uses: ['Database access', 'Web apps'], vulnerabilities: ['Brute force', 'SQL injection', 'Unauthorized access'], recommendations: ['Bind to 127.0.0.1', 'Use strong passwords', 'Restrict remote access'] },
-  6379: { name: 'Redis', description: 'Redis Cache/DB', risk: 'CRITICAL', secure_alternative: 'Bind to localhost, enable AUTH', common_uses: ['Caching', 'Session storage', 'Pub/Sub'], vulnerabilities: ['No auth by default', 'Remote code execution', 'Data theft'], recommendations: ['Bind to localhost only', 'Enable AUTH', 'Use firewall rules'] },
-  27017: { name: 'MongoDB', description: 'MongoDB Database', risk: 'CRITICAL', secure_alternative: 'Bind to localhost, enable auth', common_uses: ['NoSQL database', 'Web apps'], vulnerabilities: ['No auth by default', 'Mass data breaches'], recommendations: ['Enable authentication', 'Bind to localhost', 'Use TLS'] },
-};
+// ── Tool executor (all deterministic tools) ───────────────────
+function runTool(toolName, params, packets) {
+  switch (toolName) {
+    case 'filter_by_port': {
+      const port = params.port;
+      const result = packets.filter(pk => pk.dst_port === port || pk.src_port === port);
+      return { result, response: `Found ${result.length} packets on port ${port}.` };
+    }
+    case 'filter_by_ip': {
+      const result = packets.filter(pk => pk.src_ip === params.ip || pk.dst_ip === params.ip);
+      return { result, response: `Found ${result.length} packets involving IP ${params.ip}.` };
+    }
+    case 'find_credentials': {
+      const result = packets.filter(pk => pk.payload_preview && /USER |PASS |PASSWORD=|AUTHORIZATION: BASIC|LOGIN:/i.test(pk.payload_preview));
+      return { result, response: `Found ${result.length} packets with potential plaintext credentials.` };
+    }
+    case 'detect_port_scan': {
+      const ipPorts = {};
+      for (const pk of packets) {
+        if (pk.src_ip && pk.dst_port) {
+          if (!ipPorts[pk.src_ip]) ipPorts[pk.src_ip] = new Set();
+          ipPorts[pk.src_ip].add(pk.dst_port);
+        }
+      }
+      const result = Object.entries(ipPorts)
+        .filter(([, ports]) => ports.size > 15)
+        .map(([ip, ports]) => ({ ip, ports_scanned: ports.size, ports: [...ports].slice(0, 20) }));
+      return { result, response: result.length ? `Detected ${result.length} potential port scanners.` : 'No port scanning detected.' };
+    }
+    case 'get_dns_queries': {
+      const result = packets.filter(pk => pk.protocol === 'DNS');
+      const domains = {};
+      for (const pk of result) {
+        if (pk.payload_preview) {
+          const match = pk.payload_preview.match(/[a-zA-Z0-9-]+\.[a-zA-Z]{2,}/g);
+          if (match) match.forEach(d => { domains[d] = (domains[d] || 0) + 1; });
+        }
+      }
+      return { result: { packets: result.slice(0, 50), top_domains: Object.entries(domains).sort((a, b) => b[1] - a[1]).slice(0, 10) }, response: `Found ${result.length} DNS packets.` };
+    }
+    case 'get_top_talkers': {
+      const ipCount = {};
+      for (const pk of packets) {
+        if (pk.src_ip) ipCount[pk.src_ip] = (ipCount[pk.src_ip] || 0) + pk.length;
+      }
+      const result = Object.entries(ipCount).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([ip, bytes]) => ({ ip, bytes }));
+      return { result, response: `Top ${result.length} IPs by traffic volume.` };
+    }
+    case 'filter_large_packets': {
+      const result = [...packets].sort((a, b) => b.length - a.length).slice(0, 20);
+      return { result, response: `Top ${result.length} largest packets.` };
+    }
+    case 'get_vulnerability_report': {
+      const vulnPorts = Object.keys(VULNERABLE_PORTS).map(Number);
+      const result = packets.filter(pk => vulnPorts.includes(pk.dst_port) || vulnPorts.includes(pk.src_port));
+      const byPort = {};
+      for (const pk of result) {
+        const p = pk.dst_port || pk.src_port;
+        if (!byPort[p]) byPort[p] = { port: p, count: 0, risk: VULNERABLE_PORTS[p]?.risk, reason: VULNERABLE_PORTS[p]?.reason };
+        byPort[p].count++;
+      }
+      return { result: Object.values(byPort), response: `Found traffic on ${Object.keys(byPort).length} vulnerable ports affecting ${result.length} packets.` };
+    }
+    case 'domain_lookup': {
+      const domain = (params.domain || '').toLowerCase();
+      const result = packets.filter(pk => pk.payload_preview?.toLowerCase().includes(domain));
+      const dns = packets.filter(pk => pk.protocol === 'DNS' && pk.payload_preview?.toLowerCase().includes(domain));
+      return {
+        result: { domain_packets: result.slice(0, 30), dns_hits: dns.slice(0, 10), total_hits: result.length },
+        response: `Found ${result.length} packets referencing "${domain}", including ${dns.length} DNS queries.`,
+      };
+    }
+    case 'filter_by_protocol': {
+      const proto = (params.protocol || '').toUpperCase();
+      const result = packets.filter(pk => pk.protocol === proto);
+      return { result: result.slice(0, 100), response: `Found ${result.length} ${proto} packets.` };
+    }
+    case 'get_summary':
+    default: {
+      const protocols = {};
+      const ipCount = {};
+      let totalBytes = 0;
+      for (const pk of packets) {
+        protocols[pk.protocol] = (protocols[pk.protocol] || 0) + 1;
+        if (pk.src_ip) ipCount[pk.src_ip] = (ipCount[pk.src_ip] || 0) + pk.length;
+        totalBytes += pk.length;
+      }
+      const topIps = Object.entries(ipCount).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([ip, bytes]) => ({ ip, bytes }));
+      const timestamps = packets.map(p => p.timestamp);
+      const duration = Math.round(Math.max(...timestamps) - Math.min(...timestamps));
+      return {
+        result: { total_packets: packets.length, protocols, top_ips: topIps, total_bytes: totalBytes, duration_seconds: duration },
+        response: `${packets.length} packets, ${duration}s capture duration.`,
+      };
+    }
+  }
+}
+
+// ── Dynamic agent: Groq picks the tool ────────────────────────
+async function dynamicAgent(userPrompt, packets) {
+  const protocols = {};
+  for (const pk of packets) protocols[pk.protocol] = (protocols[pk.protocol] || 0) + 1;
+
+  const toolSchema = `
+Available tools (respond ONLY with valid JSON, no markdown, no explanation):
+- get_summary → {}
+- filter_by_port → {"port": number}
+- filter_by_ip → {"ip": "x.x.x.x"}
+- filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"ARP"|"IPv6"|"HTTPS"|"FTP"|"SSH"|...}
+- find_credentials → {}
+- detect_port_scan → {}
+- get_dns_queries → {}
+- get_top_talkers → {}
+- filter_large_packets → {}
+- get_vulnerability_report → {}
+- domain_lookup → {"domain": "example.com"}
+
+Capture has ${packets.length} packets. Protocol breakdown: ${JSON.stringify(protocols)}.
+
+Pick the best tool for the user's question. Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
+
+  let toolName = 'get_summary';
+  let toolParams = {};
+
+  if (GROQ_API_KEY) {
+    const decision = await groqRequest([
+      { role: 'system', content: toolSchema },
+      { role: 'user', content: userPrompt },
+    ], 100);
+
+    if (decision) {
+      try {
+        const clean = decision.replace(/```json|```/g, '').trim();
+        const parsed = JSON.parse(clean);
+        if (parsed.tool) {
+          toolName = parsed.tool;
+          toolParams = parsed.params || {};
+        }
+      } catch (_) { }
+    }
+  }
+
+  // Run the tool
+  const toolResult = runTool(toolName, toolParams, packets);
+
+  // Summarize result for Groq (avoid token overflow)
+  const resultSummary = Array.isArray(toolResult.result) && toolResult.result.length > 30
+    ? { sample: toolResult.result.slice(0, 30), total_count: toolResult.result.length }
+    : toolResult.result;
+
+  // Fetch live CVE/Shodan data if vulnerability report
+  let liveEnrichment = '';
+  if (toolName === 'get_vulnerability_report' && Array.isArray(toolResult.result)) {
+    const ports = toolResult.result.map(r => r.port).filter(Boolean).slice(0, 3);
+    const publicIps = [...new Set(packets.filter(pk => !isPrivateIP(pk.src_ip)).map(pk => pk.src_ip))].slice(0, 2);
+
+    for (const ip of publicIps) {
+      const shodan = await fetchShodanIp(ip);
+      if (shodan?.cves?.length) {
+        liveEnrichment += `\nShodan data for ${ip}: ${shodan.cves.length} known CVEs including ${shodan.cves.slice(0, 3).join(', ')}.`;
+        for (const cveId of shodan.cves.slice(0, 2)) {
+          const cveDetail = await fetchCveDetails(cveId);
+          if (cveDetail?.summary) {
+            liveEnrichment += `\n${cveId}: ${cveDetail.summary.slice(0, 150)}`;
+          }
+        }
+      }
+    }
+  }
+
+  // Ask Groq to explain like a human — no markdown, no bullet points
+  const explanation = await groqRequest([
+    {
+      role: 'system',
+      content: `You are a network security expert talking casually to a developer. 
+You just ran a tool on their PCAP file and got results. 
+Explain what you found in plain conversational English — like a colleague explaining over chat.
+No markdown. No bullet points. No asterisks. No headers. Just natural sentences.
+Be direct, specific, and mention actual numbers and IPs from the data.
+If there are security risks, explain them plainly. Keep it under 200 words.
+${liveEnrichment ? `Live threat intelligence gathered: ${liveEnrichment}` : ''}`,
+    },
+    {
+      role: 'user',
+      content: `User asked: "${userPrompt}"
+Tool used: ${toolName}
+Tool result: ${JSON.stringify(resultSummary)}
+Raw response: ${toolResult.response}
+
+Explain this to the user conversationally.`,
+    },
+  ], 512);
+
+  return {
+    tool_called: toolName,
+    parameters: toolParams,
+    result: toolResult.result,
+    response: explanation || toolResult.response,
+  };
+}
+
+function isPrivateIP(ip) {
+  if (!ip) return true;
+  return ip.startsWith('10.') || ip.startsWith('192.168.') || ip.startsWith('172.') || ip.startsWith('127.') || ip.startsWith('169.254.');
+}
 
 // ── PCAP Parser ────────────────────────────────────────────────
 function parsePcap(buffer) {
@@ -167,11 +353,9 @@ function parsePcap(buffer) {
   if (!isLE && magicNumber !== 0xd4c3b2a1 && magicNumber !== 0x4d3cb2a1) return packets;
 
   const read32 = (off) => isLE ? buffer.readUInt32LE(off) : buffer.readUInt32BE(off);
-  const read16 = (off) => isLE ? buffer.readUInt16LE(off) : buffer.readUInt16BE(off);
 
   const linkType = read32(20);
   offset = 24;
-
   let packetId = 0;
 
   while (offset + 16 <= buffer.length && packetId < 10000) {
@@ -231,10 +415,9 @@ function parsePcap(buffer) {
 
           if (packetData.length > payloadStart) {
             packet.payload_preview = packetData
-              .slice(payloadStart, payloadStart + 64)
-              .toString('utf8', 0, 64)
+              .slice(payloadStart, payloadStart + 128)
+              .toString('utf8', 0, 128)
               .replace(/[^\x20-\x7E]/g, '.');
-
             packet.raw_payload = packetData.slice(payloadStart);
           }
 
@@ -248,7 +431,6 @@ function parsePcap(buffer) {
         } else if (ipProto === 1) {
           packet.protocol = 'ICMP';
         }
-
       } else if (etherType === 0x86DD) {
         packet.protocol = 'IPv6';
       } else if (etherType === 0x0806) {
@@ -308,86 +490,6 @@ function detectVulnerabilities(packets) {
   }
 
   return { alerts, publicIps: [...publicIps].slice(0, 10) };
-}
-
-function isPrivateIP(ip) {
-  if (!ip) return true;
-  return ip.startsWith('10.') || ip.startsWith('192.168.') || ip.startsWith('172.') || ip.startsWith('127.') || ip.startsWith('169.254.');
-}
-
-// ── Agent keyword parser ───────────────────────────────────────
-function agentQuery(prompt, packets) {
-  const p = prompt.toLowerCase();
-
-  if (p.includes('port') && (p.includes('21') || p.includes('ftp'))) {
-    const result = packets.filter(pk => pk.dst_port === 21 || pk.src_port === 21);
-    return { tool_called: 'filter_by_port', parameters: { port: 21 }, result, response: `Found ${result.length} FTP packets on port 21.` };
-  }
-  if (p.includes('telnet') || p.includes('port 23')) {
-    const result = packets.filter(pk => pk.dst_port === 23 || pk.src_port === 23);
-    return { tool_called: 'filter_by_port', parameters: { port: 23 }, result, response: `Found ${result.length} Telnet packets. Telnet is unencrypted — critical risk!` };
-  }
-  if (p.includes('credential') || p.includes('password') || p.includes('login')) {
-    const result = packets.filter(pk => pk.payload_preview && /USER |PASS |PASSWORD=/i.test(pk.payload_preview));
-    return { tool_called: 'find_credentials', parameters: {}, result, response: `Found ${result.length} packets with potential plaintext credentials!` };
-  }
-  if (p.includes('dns')) {
-    const result = packets.filter(pk => pk.protocol === 'DNS');
-    return { tool_called: 'get_dns_queries', parameters: {}, result, response: `Found ${result.length} DNS packets.` };
-  }
-  if (p.includes('http') && !p.includes('https')) {
-    const result = packets.filter(pk => pk.protocol === 'HTTP');
-    return { tool_called: 'filter_by_port', parameters: { port: 80 }, result, response: `Found ${result.length} unencrypted HTTP packets.` };
-  }
-  if (p.includes('large') || p.includes('biggest')) {
-    const sorted = [...packets].sort((a, b) => b.length - a.length).slice(0, 20);
-    return { tool_called: 'filter_large_packets', parameters: { threshold: 1000 }, result: sorted, response: `Top ${sorted.length} largest packets shown.` };
-  }
-  if (p.includes('top talker') || p.includes('most traffic') || p.includes('busiest')) {
-    const ipCount = {};
-    for (const pk of packets) {
-      if (pk.src_ip) ipCount[pk.src_ip] = (ipCount[pk.src_ip] || 0) + pk.length;
-    }
-    const sorted = Object.entries(ipCount).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([ip, bytes]) => ({ ip, bytes }));
-    return { tool_called: 'get_top_talkers', parameters: {}, result: sorted, response: `Top ${sorted.length} IPs by traffic volume shown.` };
-  }
-  if (p.includes('scan') || p.includes('port scan')) {
-    const ipPorts = {};
-    for (const pk of packets) {
-      if (pk.src_ip && pk.dst_port) {
-        if (!ipPorts[pk.src_ip]) ipPorts[pk.src_ip] = new Set();
-        ipPorts[pk.src_ip].add(pk.dst_port);
-      }
-    }
-    const scanners = Object.entries(ipPorts).filter(([, ports]) => ports.size > 15).map(([ip, ports]) => ({ ip, ports_scanned: ports.size }));
-    return { tool_called: 'detect_port_scan', parameters: {}, result: scanners, response: scanners.length ? `Detected ${scanners.length} potential port scanners!` : 'No port scans detected.' };
-  }
-
-  const ipMatch = prompt.match(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/);
-  if (ipMatch) {
-    const ip = ipMatch[1];
-    const result = packets.filter(pk => pk.src_ip === ip || pk.dst_ip === ip);
-    return { tool_called: 'filter_by_ip', parameters: { ip }, result, response: `Found ${result.length} packets involving IP ${ip}.` };
-  }
-
-  const portMatch = prompt.match(/port\s+(\d+)/i);
-  if (portMatch) {
-    const port = parseInt(portMatch[1]);
-    const result = packets.filter(pk => pk.src_port === port || pk.dst_port === port);
-    return { tool_called: 'filter_by_port', parameters: { port }, result, response: `Found ${result.length} packets on port ${port}.` };
-  }
-
-  const totalPackets = packets.length;
-  const protocols = {};
-  for (const pk of packets) protocols[pk.protocol] = (protocols[pk.protocol] || 0) + 1;
-  const topProtocol = Object.entries(protocols).sort((a, b) => b[1] - a[1])[0];
-
-  return {
-    tool_called: 'summary',
-    parameters: {},
-    result: { total_packets: totalPackets, protocols },
-    response: `This capture has ${totalPackets} packets. Most common protocol: ${topProtocol ? topProtocol[0] : 'unknown'} (${topProtocol ? topProtocol[1] : 0} packets). Try asking about specific ports, IPs, credentials, DNS, or port scans!`,
-  };
 }
 
 // ── HTTP helpers ───────────────────────────────────────────────
@@ -463,18 +565,16 @@ const server = http.createServer(async (req, res) => {
 
   console.log(`[${method}] ${url}`);
 
-  // ── Ping ──────────────────────────────────────────────────────
   if (url === '/ping' || url === '/pcap/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', ...getCorsHeaders(requestOrigin) });
     return res.end('pong');
   }
 
-  // ── Health ────────────────────────────────────────────────────
   if (url === '/pcap/health' || url === '/health') {
     return json(res, { status: 'ok', service: 'pcap-analyzer', sessions: sessions.size }, 200, requestOrigin);
   }
 
-  // ── Upload PCAP ───────────────────────────────────────────────
+  // ── Upload ────────────────────────────────────────────────────
   if (url === '/pcap/upload' && method === 'POST') {
     try {
       const contentType = req.headers['content-type'] || '';
@@ -498,7 +598,7 @@ const server = http.createServer(async (req, res) => {
       if (!fileData) return json(res, { error: 'No file found in upload' }, 400, requestOrigin);
 
       const packets = parsePcap(fileData);
-      if (packets.length === 0) return json(res, { error: 'Could not parse PCAP file. Make sure it is a valid .pcap file.' }, 400, requestOrigin);
+      if (packets.length === 0) return json(res, { error: 'Could not parse PCAP file.' }, 400, requestOrigin);
 
       const protocols = {};
       let totalBytes = 0;
@@ -513,11 +613,7 @@ const server = http.createServer(async (req, res) => {
       const session_id = `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
       sessions.set(session_id, { session_id, filename, packets, created_at: Date.now() });
-
-      if (sessions.size > 10) {
-        const oldest = [...sessions.keys()][0];
-        sessions.delete(oldest);
-      }
+      if (sessions.size > 10) sessions.delete([...sessions.keys()][0]);
 
       return json(res, {
         session_id,
@@ -536,7 +632,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // ── Get Packets ───────────────────────────────────────────────
+  // ── Packets ───────────────────────────────────────────────────
   if (url.startsWith('/pcap/packets') && method === 'GET') {
     const q = getQuery(url);
     const session = sessions.get(q.session_id);
@@ -561,28 +657,16 @@ const server = http.createServer(async (req, res) => {
 
     for (const ip of publicIps.slice(0, 5)) {
       try {
-        await new Promise((resolve) => {
-          https.get(`https://internetdb.shodan.io/${ip}`, (r) => {
-            let data = '';
-            r.on('data', d => data += d);
-            r.on('end', () => {
-              try {
-                const parsed = JSON.parse(data);
-                if (parsed.cves && parsed.cves.length > 0) {
-                  enrichedAlerts.push({
-                    layer: 3, risk: 'HIGH', ip,
-                    reason: `Shodan reports ${parsed.cves.length} known CVEs for this IP`,
-                    open_ports: parsed.ports || [],
-                    cves: parsed.cves.slice(0, 5),
-                    hostnames: parsed.hostnames || [],
-                  });
-                }
-              } catch (_) { }
-              resolve();
-            });
-          }).on('error', () => resolve());
-          setTimeout(resolve, 3000);
-        });
+        const shodan = await fetchShodanIp(ip);
+        if (shodan?.cves?.length) {
+          enrichedAlerts.push({
+            layer: 3, risk: 'HIGH', ip,
+            reason: `Shodan reports ${shodan.cves.length} known CVEs for this IP`,
+            open_ports: shodan.ports || [],
+            cves: shodan.cves.slice(0, 5),
+            hostnames: shodan.hostnames || [],
+          });
+        }
       } catch (_) { }
     }
 
@@ -595,7 +679,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, { alerts: enrichedAlerts, summary }, 200, requestOrigin);
   }
 
-  // ── Agent Query (keyword-tool + Qwen3 enrichment) ─────────────
+  // ── Agent Query — fully dynamic ────────────────────────────────
   if (url === '/pcap/agent/query' && method === 'POST') {
     try {
       const body = await parseBody(req);
@@ -603,30 +687,16 @@ const server = http.createServer(async (req, res) => {
       const session = sessions.get(session_id);
       if (!session) return json(res, { error: 'Session not found' }, 404, requestOrigin);
 
-      // 1 — keyword-based backend tool (fast, deterministic)
-      const toolResult = agentQuery(prompt, session.packets);
-
-      // ── Agent Query (keyword-tool + Groq enrichment) ──────────────
-      const aiResponse = await askGroq(
-        prompt,
-        toolResult.tool_called,
-        toolResult.response,
-        toolResult.result
-      );
-
-      return json(res, {
-        ...toolResult,
-        response: aiResponse, // overwrite raw response with AI-enriched version
-      }, 200, requestOrigin);
+      const result = await dynamicAgent(prompt, session.packets);
+      return json(res, result, 200, requestOrigin);
 
     } catch (e) {
+      console.error('[Agent Error]', e);
       return json(res, { error: 'Agent error: ' + e.message }, 500, requestOrigin);
     }
   }
 
   // ── Images ────────────────────────────────────────────────────
-  // FIX: strips HTTP response headers before carving so magic-byte scanner
-  //      actually finds JPEG/PNG bytes instead of searching through header text.
   if (url.startsWith('/pcap/images') && method === 'GET') {
     const q = getQuery(url);
     const session = sessions.get(q.session_id);
@@ -638,40 +708,58 @@ const server = http.createServer(async (req, res) => {
       { sig: [0x47, 0x49, 0x46, 0x38, 0x37], ext: 'gif', mime: 'image/gif' },
       { sig: [0x47, 0x49, 0x46, 0x38, 0x39], ext: 'gif', mime: 'image/gif' },
       { sig: [0x42, 0x4D], ext: 'bmp', mime: 'image/bmp' },
+      { sig: [0x52, 0x49, 0x46, 0x46], ext: 'webp', mime: 'image/webp' },
     ];
 
-    // Group server→client TCP payloads by HTTP response stream.
-    // Stream key is always "serverIP:80-clientIP:clientPort" regardless of
-    // packet direction so every fragment of one response lands in one bucket.
+    // Collect ALL TCP streams (any port, not just 80)
     const streams = {};
-
     for (const pkt of session.packets) {
-      const isHttp = pkt.dst_port === 80 || pkt.src_port === 80;
-      if (!isHttp || !pkt.raw_payload || pkt.raw_payload.length === 0) continue;
-      if (pkt.src_port !== 80) continue; // only server→client (response) packets
+      if (!pkt.raw_payload || pkt.raw_payload.length === 0) continue;
+      if (!pkt.src_ip || !pkt.dst_ip || !pkt.src_port || !pkt.dst_port) continue;
 
-      const streamKey = `${pkt.src_ip}:80-${pkt.dst_ip}:${pkt.dst_port}`;
-      if (!streams[streamKey]) {
-        streams[streamKey] = { chunks: [], src_ip: pkt.src_ip, dst_ip: pkt.dst_ip };
-      }
+      // Server→client only: server has lower port OR src_port is 80/8080/8443
+      const isServerResponse = pkt.src_port === 80 || pkt.src_port === 8080 || pkt.src_port === 8443 || pkt.src_port < pkt.dst_port;
+      if (!isServerResponse) continue;
+
+      const streamKey = `${pkt.src_ip}:${pkt.src_port}-${pkt.dst_ip}:${pkt.dst_port}`;
+      if (!streams[streamKey]) streams[streamKey] = { chunks: [], src_ip: pkt.src_ip, dst_ip: pkt.dst_ip };
       streams[streamKey].chunks.push(pkt.raw_payload);
     }
 
-    // Reassemble and strip HTTP response headers.
-    // The raw stream starts with "HTTP/1.1 200 OK\r\n...\r\n\r\n<body>".
-    // Searching for magic bytes inside the headers never works — we skip them.
+    // Reassemble streams and strip HTTP headers
     const httpBodies = [];
     for (const stream of Object.values(streams)) {
       if (!stream.chunks.length) continue;
       const combined = Buffer.concat(stream.chunks);
+
+      // Strip HTTP response headers
       const headerEnd = combined.indexOf(Buffer.from('\r\n\r\n'));
-      const body = headerEnd !== -1 ? combined.slice(headerEnd + 4) : combined;
-      if (body.length > 10) {
-        httpBodies.push({ data: body, src_ip: stream.src_ip, dst_ip: stream.dst_ip });
+      let body = headerEnd !== -1 ? combined.slice(headerEnd + 4) : combined;
+
+      // Handle chunked transfer encoding — strip chunk size lines
+      const headerStr = headerEnd !== -1 ? combined.slice(0, headerEnd).toString() : '';
+      if (headerStr.toLowerCase().includes('transfer-encoding: chunked')) {
+        try {
+          const dechunked = [];
+          let pos = 0;
+          while (pos < body.length) {
+            const lineEnd = body.indexOf(Buffer.from('\r\n'), pos);
+            if (lineEnd === -1) break;
+            const chunkSizeHex = body.slice(pos, lineEnd).toString().trim();
+            const chunkSize = parseInt(chunkSizeHex, 16);
+            if (isNaN(chunkSize) || chunkSize === 0) break;
+            const chunkStart = lineEnd + 2;
+            dechunked.push(body.slice(chunkStart, chunkStart + chunkSize));
+            pos = chunkStart + chunkSize + 2;
+          }
+          if (dechunked.length > 0) body = Buffer.concat(dechunked);
+        } catch (_) { }
       }
+
+      if (body.length > 50) httpBodies.push({ data: body, src_ip: stream.src_ip, dst_ip: stream.dst_ip });
     }
 
-    // Carve images
+    // Carve images by magic bytes
     const images = [];
     const seen = new Set();
 
@@ -680,7 +768,6 @@ const server = http.createServer(async (req, res) => {
 
       for (const magic of MAGIC) {
         let searchFrom = 0;
-
         while (searchFrom < buf.length) {
           let found = -1;
           outer: for (let i = searchFrom; i <= buf.length - magic.sig.length; i++) {
@@ -692,7 +779,7 @@ const server = http.createServer(async (req, res) => {
           }
           if (found === -1) break;
 
-          const chunk = buf.slice(found, Math.min(found + 2 * 1024 * 1024, buf.length));
+          const chunk = buf.slice(found, Math.min(found + 3 * 1024 * 1024, buf.length));
           if (chunk.length < 50) { searchFrom = found + 1; continue; }
 
           const fingerprint = chunk.slice(0, 32).toString('hex');
@@ -709,7 +796,7 @@ const server = http.createServer(async (req, res) => {
               dst_ip: payload.dst_ip || 'unknown',
             });
           }
-          searchFrom = found + 1;
+          searchFrom = found + magic.sig.length;
         }
       }
     }
@@ -718,32 +805,36 @@ const server = http.createServer(async (req, res) => {
       images,
       total: images.length,
       message: images.length === 0
-        ? 'No images found. Images can only be extracted from unencrypted HTTP (port 80) traffic.'
+        ? 'No images found. Images can only be extracted from unencrypted HTTP traffic.'
         : `Extracted ${images.length} image(s) from HTTP traffic.`,
     }, 200, requestOrigin);
   }
 
-  // ── Port Intelligence ─────────────────────────────────────────
+  // ── Port Intelligence — live CVE enrichment ───────────────────
   if (url.startsWith('/pcap/port-intel') && method === 'GET') {
     const q = getQuery(url);
     const query = q.query || '';
-    const portNum = parseInt(query);
 
-    if (!isNaN(portNum) && PORT_KNOWLEDGE[portNum]) {
-      return json(res, { ...PORT_KNOWLEDGE[portNum], port: portNum }, 200, requestOrigin);
+    // Ask Groq for dynamic port info instead of hardcoded knowledge base
+    if (GROQ_API_KEY) {
+      const portInfo = await groqRequest([
+        {
+          role: 'system',
+          content: `You are a network security expert. When given a port number or protocol name, provide accurate security information about it. Respond in plain JSON only with these fields: name, description, risk (CRITICAL/HIGH/MEDIUM/LOW/SECURE), secure_alternative, common_uses (array), vulnerabilities (array), recommendations (array). No markdown.`,
+        },
+        { role: 'user', content: `Tell me about port/protocol: ${query}` },
+      ], 400);
+
+      if (portInfo) {
+        try {
+          const clean = portInfo.replace(/```json|```/g, '').trim();
+          const parsed = JSON.parse(clean);
+          return json(res, { ...parsed, port: parseInt(query) || query, source: 'groq' }, 200, requestOrigin);
+        } catch (_) { }
+      }
     }
 
-    const match = Object.entries(PORT_KNOWLEDGE).find(([, v]) =>
-      v.name.toLowerCase().includes(query.toLowerCase()) ||
-      v.description.toLowerCase().includes(query.toLowerCase())
-    );
-    if (match) return json(res, { ...match[1], port: parseInt(match[0]) }, 200, requestOrigin);
-
-    if (!query) {
-      return json(res, Object.entries(PORT_KNOWLEDGE).map(([port, info]) => ({ port: parseInt(port), ...info })), 200, requestOrigin);
-    }
-
-    return json(res, { error: 'Port not found in knowledge base' }, 404, requestOrigin);
+    return json(res, { error: 'Port not found' }, 404, requestOrigin);
   }
 
   // ── 404 ───────────────────────────────────────────────────────
@@ -751,7 +842,6 @@ const server = http.createServer(async (req, res) => {
     error: 'Not found',
     available_endpoints: [
       'GET  /pcap/health',
-      'GET  /ping',
       'POST /pcap/upload',
       'GET  /pcap/packets?session_id=X',
       'GET  /pcap/vulnerabilities?session_id=X',
@@ -766,6 +856,5 @@ const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
   console.log(`✅ PCAP Analyzer Backend running on port ${PORT}`);
   console.log(`🌐 CORS allowed origin: ${ALLOWED_ORIGIN}`);
-  console.log(`🤖 Groq AI: ${GROQ_API_KEY ? 'enabled ✅' : 'disabled — set GROQ_API_KEY to enable'}`);
-  console.log(`📡 Endpoints available at /pcap/*`);
+  console.log(`🤖 Groq AI: ${GROQ_API_KEY ? 'enabled ✅' : 'MISSING ❌ — set GROQ_API_KEY'}`);
 });
