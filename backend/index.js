@@ -129,6 +129,7 @@ function parsePcap(buffer) {
     offset += inclLen;
 
     const timestamp = tsSec + tsUsec / (isNano ? 1e9 : 1e6);
+    // ✅ AFTER
     let packet = {
       id: packetId++,
       timestamp,
@@ -138,6 +139,7 @@ function parsePcap(buffer) {
       length: origLen,
       ttl: null, flags: null,
       payload_preview: '',
+      raw_payload: null,   // ← add this
     };
 
     if (linkType === 1 && packetData.length >= 14) {
@@ -168,8 +170,15 @@ function parsePcap(buffer) {
           const dataOffset = (packetData[transportStart + 12] >> 4) * 4;
           const payloadStart = transportStart + dataOffset;
           if (packetData.length > payloadStart) {
-            packet.payload_preview = packetData.slice(payloadStart, payloadStart + 64).toString('utf8', 0, 64).replace(/[^\x20-\x7E]/g, '.');
+            packet.payload_preview = packetData
+              .slice(payloadStart, payloadStart + 64)
+              .toString('utf8', 0, 64)
+              .replace(/[^\x20-\x7E]/g, '.');
           }
+
+          // Store raw payload bytes for image carving (keep as Buffer)
+          packet.raw_payload = packetData.slice(payloadStart);
+
 
           packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'TCP';
 
@@ -568,28 +577,40 @@ const server = http.createServer(async (req, res) => {
       { sig: [0x42, 0x4D], ext: 'bmp', mime: 'image/bmp' },
     ];
 
-    // ── Build a raw buffer from all TCP payloads on port 80 ──
-    // We reconstruct what Wireshark's "Export Objects → HTTP" does:
-    // collect raw payload bytes from HTTP traffic and carve images out
-    const httpPayloads = [];
+    // ✅ AFTER — group packets by TCP stream, concatenate raw bytes
+    const streams = {};
 
     for (const pkt of session.packets) {
-      // Only look at HTTP traffic (port 80 src or dst)
+      // Only HTTP traffic (port 80)
       const isHttp = pkt.dst_port === 80 || pkt.src_port === 80;
-      if (!isHttp) continue;
+      if (!isHttp || !pkt.raw_payload || pkt.raw_payload.length === 0) continue;
 
-      // payload_preview is a string — convert back to bytes
-      // Note: payload_preview is already stored as utf8 string in our parser
-      // For carving we need the raw bytes, so we re-parse from the stored preview
-      if (pkt.payload_preview && pkt.payload_preview.length > 0) {
-        httpPayloads.push({
-          data: Buffer.from(pkt.payload_preview, 'utf8'),
+      // Stream key = src:port → dst:port (group related packets)
+      // Responses come FROM port 80, so flip for response packets
+      const streamKey = pkt.src_port === 80
+        ? `${pkt.src_ip}:${pkt.src_port}-${pkt.dst_ip}:${pkt.dst_port}`
+        : `${pkt.dst_ip}:80-${pkt.src_ip}:${pkt.src_port}`;
+
+      if (!streams[streamKey]) {
+        streams[streamKey] = {
+          chunks: [],
           src_ip: pkt.src_ip,
           dst_ip: pkt.dst_ip,
-          timestamp: pkt.timestamp,
-        });
+        };
+      }
+
+      // Only collect server→client packets (responses FROM port 80)
+      if (pkt.src_port === 80) {
+        streams[streamKey].chunks.push(pkt.raw_payload);
       }
     }
+
+    // Reassemble each stream into one big buffer
+    const httpPayloads = Object.values(streams).map((stream) => ({
+      data: Buffer.concat(stream.chunks),
+      src_ip: stream.src_ip,
+      dst_ip: stream.dst_ip,
+    })).filter(s => s.data.length > 0);
 
     // ── Carve images using magic byte signatures ──────────────
     const images = [];
@@ -618,7 +639,7 @@ const server = http.createServer(async (req, res) => {
           const chunk = buf.slice(found, Math.min(found + 2 * 1024 * 1024, buf.length));
 
           // Skip tiny chunks — not real images
-          if (chunk.length < 100) {
+          if (chunk.length < 10) {
             searchFrom = found + 1;
             continue;
           }
