@@ -25,6 +25,8 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 async function askGroq(userPrompt, toolName, toolResponse, toolResult) {
+  console.log('[Groq] KEY:', GROQ_API_KEY ? 'FOUND ✅' : 'MISSING ❌');
+
   if (!GROQ_API_KEY) return toolResponse;
 
   return new Promise((resolve) => {
