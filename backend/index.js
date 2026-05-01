@@ -233,49 +233,114 @@ function runTool(toolName, params, packets) {
     case 'get_dns_queries': {
       const result = packets.filter(pk => pk.protocol === 'DNS');
       const domains = {};
+      const DOMAIN_RE = /\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,6}\b/g;
+
       for (const pk of result) {
-        let parsed = false;
-        if (pk.raw_payload && pk.raw_payload.length > 12) {
-          try {
-            let pos = 12;
-            const labels = [];
-            let safety = 0;
-            while (pos < pk.raw_payload.length && safety++ < 128) {
-              const len = pk.raw_payload[pos];
-              if (len === 0) break;
-              if ((len & 0xc0) === 0xc0) { pos += 2; break; }
-              pos++;
-              if (pos + len > pk.raw_payload.length) break;
-              labels.push(pk.raw_payload.slice(pos, pos + len).toString('ascii'));
-              pos += len;
-            }
-            if (labels.length > 0) {
-              const domain = labels.join('.').toLowerCase();
-              domains[domain] = (domains[domain] || 0) + 1;
-              parsed = true;
-            }
-          } catch (_) { }
-        }
-        if (!parsed && pk.payload_preview) {
-          // Tighter regex: require at least 2 labels, each 1-63 chars (RFC 1035),
-          // with a recognised TLD of 2-6 chars. Avoids matching binary-encoded
-          // garbage like "SQ.." or single-dot fragments from non-DNS UDP traffic.
-          const match = pk.payload_preview.match(/\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.){1,}[a-zA-Z]{2,6}\b/g);
-          if (match) {
-            for (const d of match) {
-              // Additional guard: skip single-char labels or obviously wrong entries
-              const parts = d.split('.');
-              if (parts.every(p => p.length >= 1) && parts.length >= 2) {
-                const key = d.toLowerCase();
-                domains[key] = (domains[key] || 0) + 1;
-              }
-            }
-          }
+        if (!pk.payload_preview) continue;
+        const matches = pk.payload_preview.match(DOMAIN_RE);
+        if (!matches) continue;
+        for (const d of matches) {
+          const parts = d.split('.');
+          if (parts.length < 2) continue;
+          if (parts.every(p => /^\d+$/.test(p))) continue; // skip IPv4-looking strings
+          if (parts[parts.length - 1].length < 2) continue;
+          const key = d.toLowerCase();
+          domains[key] = (domains[key] || 0) + 1;
         }
       }
+
+      // Attach the first matched domain to each packet so the UI table can show it
+      const enrichedPackets = result.slice(0, 50).map(pk => {
+        const m = pk.payload_preview?.match(DOMAIN_RE);
+        const queried_domain = m
+          ? m.find(d => {
+            const p = d.split('.');
+            return p.length >= 2 && !p.every(x => /^\d+$/.test(x));
+          }) ?? null
+          : null;
+        return { ...pk, queried_domain: queried_domain?.toLowerCase() ?? null };
+      });
+
       return {
-        result: { packets: result.slice(0, 50), top_domains: Object.entries(domains).sort((a, b) => b[1] - a[1]).slice(0, 10) },
+        result: {
+          packets: enrichedPackets,
+          top_domains: Object.entries(domains).sort((a, b) => b[1] - a[1]).slice(0, 15),
+        },
         response: `Found ${result.length} DNS packets.`,
+      };
+    }
+
+    case 'get_tls_sni': {
+      // SNI hostnames live in the TLS ClientHello plaintext even though the
+      // session is encrypted. They appear in payload_preview because the parser
+      // stores the first 512 bytes of every TCP payload as UTF-8.
+      const DOMAIN_RE = /\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,6}\b/g;
+      const sniMap = {};
+
+      for (const pk of packets) {
+        if (!pk.payload_preview) continue;
+        // Only look at outbound port-443 TCP packets that carry a TLS handshake
+        // byte (0x16 == 22 decimal shows as a non-printable char replaced by '.'
+        // by the parser, so we check dst_port instead).
+        if (pk.dst_port !== 443) continue;
+        const matches = pk.payload_preview.match(DOMAIN_RE);
+        if (!matches) continue;
+        for (const d of matches) {
+          const parts = d.split('.');
+          if (parts.length < 2) continue;
+          if (parts.every(p => /^\d+$/.test(p))) continue;
+          if (parts[parts.length - 1].length < 2) continue;
+          const key = d.toLowerCase();
+          sniMap[key] = (sniMap[key] || 0) + 1;
+        }
+      }
+
+      const sorted = Object.entries(sniMap).sort((a, b) => b[1] - a[1]);
+
+      // Categorise into buckets for nicer display
+      const categories = { browsing: [], microsoft: [], advertising: [], other: [] };
+      const MS_RE = /microsoft|windows|msft|bing|skype|azure|office|live\.com/i;
+      const AD_RE = /doubleclick|adnxs|adsrvr|linkedin|bluekai|krxd|mediavine|fiftyt|moatads|scorecardresearch|quantserve|taboola|outbrain|pubmatic|rubiconproject|openx|casalemedia|contextweb/i;
+      const BROWSE_RE = /touropia|google\.|flickr|wikipedia|reddit|youtube|twitter|facebook/i;
+
+      for (const [domain] of sorted) {
+        if (MS_RE.test(domain)) categories.microsoft.push(domain);
+        else if (AD_RE.test(domain)) categories.advertising.push(domain);
+        else if (BROWSE_RE.test(domain)) categories.browsing.push(domain);
+        else categories.other.push(domain);
+      }
+
+      return {
+        result: { sni_list: sorted, categories, total: sorted.length },
+        response: `Found ${sorted.length} unique HTTPS destinations via TLS SNI.`,
+      };
+    }
+
+    case 'get_quic_traffic': {
+      // QUIC runs over UDP. The parser tags these as 'UDP' (not 'QUIC') because
+      // the protocol map only covers well-known ports. QUIC uses UDP/443 (HTTPS)
+      // and UDP/80, but also ephemeral ports. We detect it by:
+      //  1. UDP packets on port 443 (most common — Google, Cloudflare, Microsoft)
+      //  2. UDP packets whose payload starts with a QUIC Initial byte (0xc0 range)
+      //     which shows as a non-printable '.' in payload_preview — so we rely on port.
+      const quicPackets = packets.filter(pk => {
+        if (pk.protocol !== 'UDP' && pk.protocol !== 'HTTPS') return false;
+        if (pk.dst_port === 443 || pk.src_port === 443) return true;
+        if (pk.dst_port === 80 || pk.src_port === 80) return true;
+        return false;
+      });
+
+      const ipv4 = quicPackets.filter(pk => pk.src_ip && !pk.src_ip.includes(':'));
+      const ipv6 = quicPackets.filter(pk => pk.src_ip && pk.src_ip.includes(':'));
+
+      return {
+        result: {
+          total: quicPackets.length,
+          ipv4_count: ipv4.length,
+          ipv6_count: ipv6.length,
+          sample: quicPackets.slice(0, 20),
+        },
+        response: `Found ${quicPackets.length} QUIC packets (${ipv6.length} over IPv6, ${ipv4.length} over IPv4).`,
       };
     }
 
@@ -394,7 +459,7 @@ const VALID_TOOLS = new Set([
   'get_summary', 'filter_by_port', 'filter_by_ip', 'filter_by_protocol',
   'find_credentials', 'detect_port_scan', 'get_dns_queries', 'get_top_talkers',
   'filter_large_packets', 'get_vulnerability_report', 'domain_lookup',
-  'search_http_objects', 'none',
+  'search_http_objects', 'get_tls_sni', 'get_quic_traffic', 'none',
 ]);
 
 // ── Dynamic agent ──────────────────────────────────────────────
@@ -414,6 +479,8 @@ async function dynamicAgent(userPrompt, packets, session) {
 - get_vulnerability_report → {}
 - domain_lookup → {"domain": "example.com"}
 - search_http_objects → {"query": "<filename or url fragment>"}
+- get_tls_sni → {} (use when user asks about HTTPS sites visited, TLS connections, SNI names, encrypted traffic destinations)
+- get_quic_traffic → {} (use when user asks about QUIC, HTTP/3, or UDP-based encrypted traffic)
 - none → {} (use for greetings, reactions like "wow"/"ok"/"thanks", or follow-up comments that need no data lookup)
 
 Capture: ${packets.length} packets. Protocols: ${JSON.stringify(protocols)}.
