@@ -1609,7 +1609,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── Image-data route (raw buffer, streamed) ────────────────
-  if (url === '/pcap/image-data' && method === 'GET') {
+  if (url.startsWith('/pcap/image-data') && method === 'GET') {
     const q = getQuery(url);
     if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
     const artifactKey = q.key || '';
