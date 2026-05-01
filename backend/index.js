@@ -452,9 +452,10 @@ function runTool(toolName, params, packets) {
       const ipCount = {};
       for (const pk of packets) {
         if (pk.src_ip) ipCount[pk.src_ip] = (ipCount[pk.src_ip] || 0) + pk.length;
+        if (pk.dst_ip) ipCount[pk.dst_ip] = (ipCount[pk.dst_ip] || 0) + pk.length;
       }
       const result = Object.entries(ipCount).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([ip, bytes]) => ({ ip, bytes }));
-      return { result, response: `Top ${result.length} IPs by traffic volume.` };
+      return { result, response: `Top ${result.length} IPs by traffic volume (src + dst combined).` };
     }
     case 'filter_large_packets': {
       const result = [...packets].sort((a, b) => b.length - a.length).slice(0, 20);
@@ -768,24 +769,24 @@ CAPTURE CONTEXT (always consider this before answering):
 ${captureContext}
 
 Available tools (respond ONLY with valid JSON, no markdown):
-- get_timeline → {} (use when user asks about timeline, sequence of events, browsing behavior, or time-based analysis)
-- get_summary → {} (use when user asks about overview, total packets, duration, etc.)
-- filter_by_port → {"port": number}
-- filter_by_ip → {"ip": "x.x.x.x"}
-- filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"FTP"|"SSH"...}
-- find_credentials → {}
-- detect_port_scan → {}
-- get_dns_queries → {}
-- get_top_talkers → {}
-- filter_large_packets → {}
-- get_vulnerability_report → {}
-- domain_lookup → {"domain": "example.com"}
-- search_http_objects → {"query": "<filename or url fragment>"}
-- get_tls_sni → {} (use when user asks about HTTPS sites visited, TLS connections, SNI names, encrypted traffic destinations)
-- get_capture_info → {} (use when user asks about file format, link layer type, pcap version, capture metadata)
-- fingerprint_os → {} (use when user asks about operating system, device type, what OS is running, identify the host)
-- get_quic_traffic → {} (use when user asks about QUIC, HTTP/3, or UDP-based encrypted traffic)
-- none → {}
+- get_summary → {} (ONLY use for: "overview", "summary", "total packets", "what is in this file", "capture stats", "how many packets". Do NOT use for IP, DNS, port, OS, security, or timeline questions)
+- get_top_talkers → {} (use when user asks about "top IPs", "who is talking", "source IPs", "destination IPs", "primary hosts", "communicating hosts", "most traffic", "top talkers", "IP roles", "who sent the most")
+- get_dns_queries → {} (use when user asks about "DNS", "domains", "what sites", "domain names", "DNS queries", "resolved", "lookups", "what was queried")
+- get_tls_sni → {} (use when user asks about "HTTPS sites visited", "TLS connections", "SNI names", "encrypted traffic destinations", "SSL", "what websites", "certificates", "secure connections")
+- get_timeline → {} (use when user asks about "timeline", "sequence of events", "browsing behavior", "time-based analysis", "what happened when", "activity over time", "what happened first")
+- get_capture_info → {} (use when user asks about "file format", "link layer type", "pcap version", "capture metadata", "file info", "capture file details")
+- fingerprint_os → {} (use when user asks about "operating system", "device type", "what OS is running", "identify the host", "Windows or Linux", "OS fingerprint", "what machine")
+- get_vulnerability_report → {} (use when user asks about "vulnerabilities", "security", "risky ports", "dangerous ports", "exploits", "attack surface", "risks", "what is vulnerable", "security issues")
+- detect_port_scan → {} (use when user asks about "port scan", "scanning", "nmap", "reconnaissance", "SYN scan", "probing", "who is scanning")
+- get_quic_traffic → {} (use when user asks about "QUIC", "HTTP/3", "UDP-based encrypted traffic", "QUIC packets")
+- filter_by_port → {"port": number} (use when user asks about a specific port number like "port 443", "port 80", "port 53")
+- filter_by_ip → {"ip": "x.x.x.x"} (use when user asks about a specific IP address)
+- filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"FTP"|"SSH"...} (use when user asks to filter or show only a specific protocol)
+- find_credentials → {} (use when user asks about "credentials", "passwords", "plaintext login", "usernames", "auth")
+- filter_large_packets → {} (use when user asks about "large packets", "biggest packets", "jumbo frames", "packet size")
+- domain_lookup → {"domain": "example.com"} (use when user asks about a specific domain name)
+- search_http_objects → {"query": "<filename or url fragment>"} (use when user asks about HTTP objects, files, images, downloads)
+- none → {} (use for greetings, thanks, or off-topic messages only)
 
 IMPORTANT CONTEXT-AWARENESS RULES:
 - If the user refers to something mentioned earlier (e.g. "that IP", "those packets", "tell me more"), use conversation history to resolve what they mean.
@@ -820,6 +821,7 @@ Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
           // name can never bypass runTool's switch default.
           if (parsed && typeof parsed.tool === 'string' && VALID_TOOLS.has(parsed.tool)) {
             toolName = parsed.tool;
+            console.log(`[Agent] Tool selected: ${toolName} for prompt: "${userPrompt.slice(0, 60)}"`);
             // Params must be a plain object; coerce to {} on anything else
             toolParams = (parsed.params && typeof parsed.params === 'object' && !Array.isArray(parsed.params))
               ? parsed.params
