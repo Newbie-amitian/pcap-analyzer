@@ -303,6 +303,9 @@ function runTool(toolName, params, packets) {
       }
       return { result: Object.values(byPort), response: `Found traffic on ${Object.keys(byPort).length} vulnerable port(s) across ${result.length} packets.` };
     }
+    case 'none': {
+      return { result: null, response: '' };
+    }
     case 'search_http_objects': {
       const query = (params.query || '').toLowerCase().trim();
       if (!params._fileIndex) return { result: [], response: 'No HTTP object index available.' };
@@ -391,7 +394,7 @@ const VALID_TOOLS = new Set([
   'get_summary', 'filter_by_port', 'filter_by_ip', 'filter_by_protocol',
   'find_credentials', 'detect_port_scan', 'get_dns_queries', 'get_top_talkers',
   'filter_large_packets', 'get_vulnerability_report', 'domain_lookup',
-  'search_http_objects',
+  'search_http_objects', 'none',
 ]);
 
 // ── Dynamic agent ──────────────────────────────────────────────
@@ -411,6 +414,7 @@ async function dynamicAgent(userPrompt, packets, session) {
 - get_vulnerability_report → {}
 - domain_lookup → {"domain": "example.com"}
 - search_http_objects → {"query": "<filename or url fragment>"}
+- none → {} (use for greetings, reactions like "wow"/"ok"/"thanks", or follow-up comments that need no data lookup)
 
 Capture: ${packets.length} packets. Protocols: ${JSON.stringify(protocols)}.
 Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
@@ -472,6 +476,23 @@ Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
         }
       }
     }
+  }
+
+  // For casual messages, skip the data explanation and just respond naturally
+  if (toolName === 'none') {
+    const chitchat = await groqRequest([
+      {
+        role: 'system',
+        content: 'You are a helpful network analysis assistant. Reply naturally and briefly to the user\'s message. No markdown, no bullet points.',
+      },
+      { role: 'user', content: userPrompt },
+    ], 80);
+    return {
+      tool_called: 'none',
+      parameters: {},
+      result: null,
+      response: chitchat || 'Glad that helped!',
+    };
   }
 
   const explanation = await groqRequest([
@@ -1610,7 +1631,13 @@ const server = http.createServer(async (req, res) => {
     return res.end(artifact.buffer);
   }
 
-  // ── Final 404 fallback ─────────────────────────────────────
+  // ── Session liveness check ─────────────────────────────────
+  if (url.startsWith('/pcap/ping-session') && method === 'GET') {
+    const q = getQuery(url);
+    if (!isValidSessionId(q.session_id)) return respond({ alive: false }, 200);
+    return respond({ alive: sessions.has(q.session_id) }, 200);
+  }
+
   // ── Final 404 fallback ─────────────────────────────────────
   respond({
     error: 'Not found',
