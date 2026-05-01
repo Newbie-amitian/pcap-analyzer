@@ -452,10 +452,9 @@ function runTool(toolName, params, packets) {
       const ipCount = {};
       for (const pk of packets) {
         if (pk.src_ip) ipCount[pk.src_ip] = (ipCount[pk.src_ip] || 0) + pk.length;
-        if (pk.dst_ip) ipCount[pk.dst_ip] = (ipCount[pk.dst_ip] || 0) + pk.length;
       }
       const result = Object.entries(ipCount).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([ip, bytes]) => ({ ip, bytes }));
-      return { result, response: `Top ${result.length} IPs by traffic volume (src + dst combined).` };
+      return { result, response: `Top ${result.length} IPs by traffic volume.` };
     }
     case 'filter_large_packets': {
       const result = [...packets].sort((a, b) => b.length - a.length).slice(0, 20);
@@ -763,56 +762,54 @@ async function dynamicAgent(userPrompt, packets, session, conversationHistory = 
   // Build a rich capture context snapshot so the AI always knows what's in the file
   const captureContext = buildCaptureContext(packets, protocols, session);
 
-  const toolSchema = `You are a tool router. Output ONLY a single JSON object. No explanation, no markdown, no extra text before or after.
+  const toolSchema = `You are an expert network security analyst AI with deep knowledge of TCP/IP, Wireshark, intrusion detection, and malware analysis. You are analysing a live packet capture.
 
-TOOL LIST — pick exactly one based on the user prompt:
-- get_summary → {} (ONLY for: overview, summary, total packets, what is in this file, capture stats, how many packets. Do NOT pick this for IP/DNS/port/OS/security/timeline questions)
-- get_top_talkers → {} (for: top IPs, who is talking, source IPs, destination IPs, primary hosts, communicating hosts, most traffic, top talkers, IP roles, who sent the most)
-- get_dns_queries → {} (for: DNS, domains, what sites, domain names, DNS queries, resolved, lookups, what was queried)
-- get_tls_sni → {} (for: HTTPS sites visited, TLS, SNI, encrypted destinations, SSL, what websites, certificates, secure connections)
-- get_timeline → {} (for: timeline, sequence of events, browsing behavior, time-based, what happened when, activity over time, what happened first)
-- get_capture_info → {} (for: file format, link layer, pcap version, capture metadata, file info, capture file details)
-- fingerprint_os → {} (for: operating system, device type, what OS, identify the host, Windows or Linux, OS fingerprint, what machine)
-- get_vulnerability_report → {} (for: vulnerabilities, security, risky ports, dangerous ports, exploits, attack surface, risks, what is vulnerable, security issues)
-- detect_port_scan → {} (for: port scan, scanning, nmap, reconnaissance, SYN scan, probing, who is scanning)
-- get_quic_traffic → {} (for: QUIC, HTTP/3, UDP encrypted traffic, QUIC packets)
-- filter_by_port → {"port": number} (for: any specific port number like port 443, port 80, port 53)
-- filter_by_ip → {"ip": "x.x.x.x"} (for: any specific IP address)
-- filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"FTP"|"SSH"} (for: filter by a specific protocol name)
-- find_credentials → {} (for: credentials, passwords, plaintext login, usernames, auth)
-- filter_large_packets → {} (for: large packets, biggest packets, jumbo frames, packet size)
-- domain_lookup → {"domain": "example.com"} (for: a specific domain name lookup)
-- search_http_objects → {"query": "filename"} (for: HTTP objects, files, images, downloads)
-- none → {} (for: greetings, thanks, chitchat only)
+CAPTURE CONTEXT (always consider this before answering):
+${captureContext}
 
-USER PROMPT: "${userPrompt}"
+Available tools (respond ONLY with valid JSON, no markdown):
+- get_timeline → {} (use when user asks about timeline, sequence of events, browsing behavior, or time-based analysis)
+- get_summary → {} (ONLY use for: "overview", "summary", "total packets", "what's in this file", "capture stats". Do NOT use for IP, DNS, port, security, or timeline questions)
+- filter_by_port → {"port": number}
+- filter_by_ip → {"ip": "x.x.x.x"}
+- filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"FTP"|"SSH"...}
+- find_credentials → {}
+- detect_port_scan → {}
+- get_dns_queries → {}
+- get_top_talkers → {}
+- filter_large_packets → {}
+- get_vulnerability_report → {}
+- domain_lookup → {"domain": "example.com"}
+- search_http_objects → {"query": "<filename or url fragment>"}
+- get_tls_sni → {} (use when user asks about HTTPS sites visited, TLS connections, SNI names, encrypted traffic destinations)
+- get_capture_info → {} (use when user asks about file format, link layer type, pcap version, capture metadata)
+- fingerprint_os → {} (use when user asks about operating system, device type, what OS is running, identify the host)
+- get_quic_traffic → {} (use when user asks about QUIC, HTTP/3, or UDP-based encrypted traffic)
+- none → {}
 
-Output ONLY: {"tool": "tool_name", "params": {}}`;
+IMPORTANT CONTEXT-AWARENESS RULES:
+- If the user refers to something mentioned earlier (e.g. "that IP", "those packets", "tell me more"), use conversation history to resolve what they mean.
+- If the user asks a follow-up like "why?" or "is that dangerous?", pick the same tool as before but enrich the explanation — or use "none" with a deep explanation.
+- If the user asks something that combines two tools (e.g. "show DNS and also check for scans"), pick the most relevant single tool and mention you can do the other too.
+- Never ignore prior conversation context.
+
+Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
 
   let toolName = 'get_summary';
   let toolParams = {};
 
   if (GROQ_API_KEY) {
-    const decision = await groqRequest([
-      {
-        role: 'system',
-        content: `You are a strict JSON tool selector.
-Return ONLY valid JSON like:
-{"tool": "tool_name", "params": {}}
+    // Build messages: system prompt + last 6 turns of history + current user message
+    const historyMessages = (conversationHistory || []).slice(-6).map(turn => ({
+      role: turn.role,
+      content: turn.content,
+    }));
 
-Do NOT add explanations.
-Do NOT add markdown.
-Do NOT return anything except JSON.`,
-      },
-      {
-        role: 'system',
-        content: toolSchema,
-      },
-      {
-        role: 'user',
-        content: userPrompt,
-      },
-    ], 120); if (decision) {
+    const decision = await groqRequest([
+      { role: 'system', content: toolSchema },
+      ...historyMessages,
+      { role: 'user', content: userPrompt },
+    ], 150); if (decision) {
       try {
         // Strip any markdown fences the model may have added despite instructions
         const cleaned = decision.replace(/```(?:json)?|```/g, '').trim();
@@ -823,7 +820,6 @@ Do NOT return anything except JSON.`,
           // name can never bypass runTool's switch default.
           if (parsed && typeof parsed.tool === 'string' && VALID_TOOLS.has(parsed.tool)) {
             toolName = parsed.tool;
-            console.log(`[Agent] Tool selected: ${toolName} for prompt: "${userPrompt.slice(0, 60)}"`);
             // Params must be a plain object; coerce to {} on anything else
             toolParams = (parsed.params && typeof parsed.params === 'object' && !Array.isArray(parsed.params))
               ? parsed.params
