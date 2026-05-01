@@ -606,8 +606,95 @@ function parsePcap(buffer) {
         } else if (ipProto === 1) {
           packet.protocol = 'ICMP';
         }
-      } else if (etherType === 0x86DD) {
-        packet.protocol = 'IPv6';
+      } else if (etherType === 0x86DD && packetData.length >= 54) {
+        // IPv6: fixed 40-byte header, no IHL field
+        const ip6Start = 14;
+        const nextHeader = packetData[ip6Start + 6];
+        // Extract 16-byte src/dst as compressed hex strings
+        const ip6SrcBytes = packetData.slice(ip6Start + 8, ip6Start + 24);
+        const ip6DstBytes = packetData.slice(ip6Start + 24, ip6Start + 40);
+        const formatIPv6 = (bytes) => {
+          const groups = [];
+          for (let g = 0; g < 16; g += 2) {
+            groups.push(((bytes[g] << 8) | bytes[g + 1]).toString(16));
+          }
+          // Compress longest run of zero groups with ::
+          let bestStart = -1, bestLen = 0, curStart = -1, curLen = 0;
+          for (let g = 0; g < 8; g++) {
+            if (groups[g] === '0') {
+              if (curStart === -1) { curStart = g; curLen = 1; }
+              else curLen++;
+              if (curLen > bestLen) { bestLen = curLen; bestStart = curStart; }
+            } else { curStart = -1; curLen = 0; }
+          }
+          if (bestLen > 1) {
+            const left = groups.slice(0, bestStart).join(':');
+            const right = groups.slice(bestStart + bestLen).join(':');
+            return (left ? left + '::' : '::') + right;
+          }
+          return groups.join(':');
+        };
+        packet.src_ip = formatIPv6(ip6SrcBytes);
+        packet.dst_ip = formatIPv6(ip6DstBytes);
+        const ip6TransportStart = ip6Start + 40;
+
+        if (nextHeader === 6 && packetData.length >= ip6TransportStart + 20) {
+          // TCP over IPv6
+          packet.src_port = packetData.readUInt16BE(ip6TransportStart);
+          packet.dst_port = packetData.readUInt16BE(ip6TransportStart + 2);
+          packet.seq_num = packetData.readUInt32BE(ip6TransportStart + 4);
+
+          const tcpFlags = packetData[ip6TransportStart + 13];
+          packet.tcp_flags_raw = tcpFlags;
+          const synBit = (tcpFlags & 0x02) !== 0;
+          const ackBit = (tcpFlags & 0x10) !== 0;
+          packet.is_syn = synBit && !ackBit;
+          packet.is_syn_ack = synBit && ackBit;
+
+          const flagStr = [];
+          if (tcpFlags & 0x02) flagStr.push('S');
+          if (tcpFlags & 0x10) flagStr.push('A');
+          if (tcpFlags & 0x08) flagStr.push('P');
+          if (tcpFlags & 0x01) flagStr.push('F');
+          if (tcpFlags & 0x04) flagStr.push('R');
+          packet.flags = flagStr.join('') || null;
+
+          const dataOffset = (packetData[ip6TransportStart + 12] >> 4) * 4;
+          const payloadStart = ip6TransportStart + dataOffset;
+          if (packetData.length > payloadStart) {
+            const rawSlice = packetData.slice(payloadStart);
+            packet.payload_preview = rawSlice.slice(0, 128).toString('utf8', 0, 128).replace(/[^\x20-\x7E]/g, '.');
+            packet.raw_payload = rawSlice;
+          }
+
+          packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'TCP';
+
+          if (
+            KNOWN_HTTP_PORTS.has(packet.src_port) ||
+            KNOWN_HTTP_PORTS.has(packet.dst_port) ||
+            (packet.payload_preview && /^(HTTP\/|GET |POST |PUT |HEAD )/.test(packet.payload_preview))
+          ) {
+            packet.is_http_candidate = true;
+          }
+
+        } else if (nextHeader === 17 && packetData.length >= ip6TransportStart + 8) {
+          // UDP over IPv6
+          packet.src_port = packetData.readUInt16BE(ip6TransportStart);
+          packet.dst_port = packetData.readUInt16BE(ip6TransportStart + 2);
+          packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'UDP';
+
+          const rawSlice = packetData.slice(ip6TransportStart + 8);
+          if (rawSlice.length > 0) {
+            packet.payload_preview = rawSlice.slice(0, 128).toString('utf8', 0, 128).replace(/[^\x20-\x7E]/g, '.');
+            packet.raw_payload = rawSlice;
+          }
+
+        } else if (nextHeader === 58) {
+          packet.protocol = 'ICMPv6';
+        } else {
+          packet.protocol = 'IPv6';
+        }
+
       } else if (etherType === 0x0806) {
         packet.protocol = 'ARP';
       }
