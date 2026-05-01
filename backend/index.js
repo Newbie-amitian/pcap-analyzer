@@ -763,54 +763,39 @@ async function dynamicAgent(userPrompt, packets, session, conversationHistory = 
   // Build a rich capture context snapshot so the AI always knows what's in the file
   const captureContext = buildCaptureContext(packets, protocols, session);
 
-  const toolSchema = `You are an expert network security analyst AI with deep knowledge of TCP/IP, Wireshark, intrusion detection, and malware analysis. You are analysing a live packet capture.
+  const toolSchema = `You are a tool router. Output ONLY a single JSON object. No explanation, no markdown, no extra text before or after.
 
-CAPTURE CONTEXT (always consider this before answering):
-${captureContext}
+TOOL LIST — pick exactly one based on the user prompt:
+- get_summary → {} (ONLY for: overview, summary, total packets, what is in this file, capture stats, how many packets. Do NOT pick this for IP/DNS/port/OS/security/timeline questions)
+- get_top_talkers → {} (for: top IPs, who is talking, source IPs, destination IPs, primary hosts, communicating hosts, most traffic, top talkers, IP roles, who sent the most)
+- get_dns_queries → {} (for: DNS, domains, what sites, domain names, DNS queries, resolved, lookups, what was queried)
+- get_tls_sni → {} (for: HTTPS sites visited, TLS, SNI, encrypted destinations, SSL, what websites, certificates, secure connections)
+- get_timeline → {} (for: timeline, sequence of events, browsing behavior, time-based, what happened when, activity over time, what happened first)
+- get_capture_info → {} (for: file format, link layer, pcap version, capture metadata, file info, capture file details)
+- fingerprint_os → {} (for: operating system, device type, what OS, identify the host, Windows or Linux, OS fingerprint, what machine)
+- get_vulnerability_report → {} (for: vulnerabilities, security, risky ports, dangerous ports, exploits, attack surface, risks, what is vulnerable, security issues)
+- detect_port_scan → {} (for: port scan, scanning, nmap, reconnaissance, SYN scan, probing, who is scanning)
+- get_quic_traffic → {} (for: QUIC, HTTP/3, UDP encrypted traffic, QUIC packets)
+- filter_by_port → {"port": number} (for: any specific port number like port 443, port 80, port 53)
+- filter_by_ip → {"ip": "x.x.x.x"} (for: any specific IP address)
+- filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"FTP"|"SSH"} (for: filter by a specific protocol name)
+- find_credentials → {} (for: credentials, passwords, plaintext login, usernames, auth)
+- filter_large_packets → {} (for: large packets, biggest packets, jumbo frames, packet size)
+- domain_lookup → {"domain": "example.com"} (for: a specific domain name lookup)
+- search_http_objects → {"query": "filename"} (for: HTTP objects, files, images, downloads)
+- none → {} (for: greetings, thanks, chitchat only)
 
-Available tools (respond ONLY with valid JSON, no markdown):
-- get_summary → {} (ONLY use for: "overview", "summary", "total packets", "what is in this file", "capture stats", "how many packets". Do NOT use for IP, DNS, port, OS, security, or timeline questions)
-- get_top_talkers → {} (use when user asks about "top IPs", "who is talking", "source IPs", "destination IPs", "primary hosts", "communicating hosts", "most traffic", "top talkers", "IP roles", "who sent the most")
-- get_dns_queries → {} (use when user asks about "DNS", "domains", "what sites", "domain names", "DNS queries", "resolved", "lookups", "what was queried")
-- get_tls_sni → {} (use when user asks about "HTTPS sites visited", "TLS connections", "SNI names", "encrypted traffic destinations", "SSL", "what websites", "certificates", "secure connections")
-- get_timeline → {} (use when user asks about "timeline", "sequence of events", "browsing behavior", "time-based analysis", "what happened when", "activity over time", "what happened first")
-- get_capture_info → {} (use when user asks about "file format", "link layer type", "pcap version", "capture metadata", "file info", "capture file details")
-- fingerprint_os → {} (use when user asks about "operating system", "device type", "what OS is running", "identify the host", "Windows or Linux", "OS fingerprint", "what machine")
-- get_vulnerability_report → {} (use when user asks about "vulnerabilities", "security", "risky ports", "dangerous ports", "exploits", "attack surface", "risks", "what is vulnerable", "security issues")
-- detect_port_scan → {} (use when user asks about "port scan", "scanning", "nmap", "reconnaissance", "SYN scan", "probing", "who is scanning")
-- get_quic_traffic → {} (use when user asks about "QUIC", "HTTP/3", "UDP-based encrypted traffic", "QUIC packets")
-- filter_by_port → {"port": number} (use when user asks about a specific port number like "port 443", "port 80", "port 53")
-- filter_by_ip → {"ip": "x.x.x.x"} (use when user asks about a specific IP address)
-- filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"FTP"|"SSH"...} (use when user asks to filter or show only a specific protocol)
-- find_credentials → {} (use when user asks about "credentials", "passwords", "plaintext login", "usernames", "auth")
-- filter_large_packets → {} (use when user asks about "large packets", "biggest packets", "jumbo frames", "packet size")
-- domain_lookup → {"domain": "example.com"} (use when user asks about a specific domain name)
-- search_http_objects → {"query": "<filename or url fragment>"} (use when user asks about HTTP objects, files, images, downloads)
-- none → {} (use for greetings, thanks, or off-topic messages only)
+USER PROMPT: "${userPrompt}"
 
-IMPORTANT CONTEXT-AWARENESS RULES:
-- If the user refers to something mentioned earlier (e.g. "that IP", "those packets", "tell me more"), use conversation history to resolve what they mean.
-- If the user asks a follow-up like "why?" or "is that dangerous?", pick the same tool as before but enrich the explanation — or use "none" with a deep explanation.
-- If the user asks something that combines two tools (e.g. "show DNS and also check for scans"), pick the most relevant single tool and mention you can do the other too.
-- Never ignore prior conversation context.
-
-Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
+Output ONLY: {"tool": "tool_name", "params": {}}`;
 
   let toolName = 'get_summary';
   let toolParams = {};
 
   if (GROQ_API_KEY) {
-    // Build messages: system prompt + last 6 turns of history + current user message
-    const historyMessages = (conversationHistory || []).slice(-6).map(turn => ({
-      role: turn.role,
-      content: turn.content,
-    }));
-
     const decision = await groqRequest([
-      { role: 'system', content: toolSchema },
-      ...historyMessages,
-      { role: 'user', content: userPrompt },
-    ], 150); if (decision) {
+      { role: 'user', content: toolSchema },
+    ], 80); if (decision) {
       try {
         // Strip any markdown fences the model may have added despite instructions
         const cleaned = decision.replace(/```(?:json)?|```/g, '').trim();
