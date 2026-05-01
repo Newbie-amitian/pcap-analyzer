@@ -303,6 +303,24 @@ function runTool(toolName, params, packets) {
       }
       return { result: Object.values(byPort), response: `Found traffic on ${Object.keys(byPort).length} vulnerable port(s) across ${result.length} packets.` };
     }
+    case 'search_http_objects': {
+      const query = (params.query || '').toLowerCase().trim();
+      if (!params._fileIndex) return { result: [], response: 'No HTTP object index available.' };
+      const direct = params._fileIndex.get(query) || [];
+      const fuzzy = [];
+      if (direct.length === 0) {
+        for (const [key, objs] of params._fileIndex) {
+          if (key.includes(query)) fuzzy.push(...objs);
+        }
+      }
+      const result = direct.length ? direct : fuzzy;
+      return {
+        result,
+        response: result.length
+          ? `Found ${result.length} HTTP object(s) matching "${query}".`
+          : `No HTTP objects found matching "${query}".`,
+      };
+    }
     case 'domain_lookup': {
       const domain = (params.domain || '').toLowerCase();
       const result = packets.filter(pk => pk.payload_preview?.toLowerCase().includes(domain));
@@ -373,10 +391,11 @@ const VALID_TOOLS = new Set([
   'get_summary', 'filter_by_port', 'filter_by_ip', 'filter_by_protocol',
   'find_credentials', 'detect_port_scan', 'get_dns_queries', 'get_top_talkers',
   'filter_large_packets', 'get_vulnerability_report', 'domain_lookup',
+  'search_http_objects',
 ]);
 
 // ── Dynamic agent ──────────────────────────────────────────────
-async function dynamicAgent(userPrompt, packets) {
+async function dynamicAgent(userPrompt, packets, session) {
   const protocols = buildProtocolMap(packets);
 
   const toolSchema = `Available tools (respond ONLY with valid JSON, no markdown):
@@ -391,6 +410,7 @@ async function dynamicAgent(userPrompt, packets) {
 - filter_large_packets → {}
 - get_vulnerability_report → {}
 - domain_lookup → {"domain": "example.com"}
+- search_http_objects → {"query": "<filename or url fragment>"}
 
 Capture: ${packets.length} packets. Protocols: ${JSON.stringify(protocols)}.
 Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
@@ -434,8 +454,7 @@ Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
     }
   }
 
-  const toolResult = runTool(toolName, toolParams, packets);
-
+  const toolResult = runTool(toolName, { ...toolParams, _fileIndex: session?.fileIndex }, packets);
   const resultSummary = Array.isArray(toolResult.result) && toolResult.result.length > 30
     ? { sample: toolResult.result.slice(0, 30), total_count: toolResult.result.length }
     : toolResult.result;
@@ -584,8 +603,7 @@ function parsePcap(buffer) {
           const payloadStart = transportStart + dataOffset;
           if (packetData.length > payloadStart) {
             const rawSlice = packetData.slice(payloadStart);
-            packet.payload_preview = rawSlice.slice(0, 128).toString('utf8', 0, 128).replace(/[^\x20-\x7E]/g, '.');
-            packet.raw_payload = rawSlice;
+            packet.payload_preview = rawSlice.slice(0, 512).toString('utf8', 0, 512).replace(/[^\x20-\x7E]/g, '.'); packet.raw_payload = rawSlice;
           }
 
           packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'TCP';
@@ -663,7 +681,7 @@ function parsePcap(buffer) {
           const payloadStart = ip6TransportStart + dataOffset;
           if (packetData.length > payloadStart) {
             const rawSlice = packetData.slice(payloadStart);
-            packet.payload_preview = rawSlice.slice(0, 128).toString('utf8', 0, 128).replace(/[^\x20-\x7E]/g, '.');
+            packet.payload_preview = rawSlice.slice(0, 512).toString('utf8', 0, 512).replace(/[^\x20-\x7E]/g, '.');
             packet.raw_payload = rawSlice;
           }
 
@@ -685,8 +703,7 @@ function parsePcap(buffer) {
 
           const rawSlice = packetData.slice(ip6TransportStart + 8);
           if (rawSlice.length > 0) {
-            packet.payload_preview = rawSlice.slice(0, 128).toString('utf8', 0, 128).replace(/[^\x20-\x7E]/g, '.');
-            packet.raw_payload = rawSlice;
+            packet.payload_preview = rawSlice.slice(0, 512).toString('utf8', 0, 512).replace(/[^\x20-\x7E]/g, '.'); packet.raw_payload = rawSlice;
           }
 
         } else if (nextHeader === 58) {
@@ -1366,6 +1383,18 @@ const server = http.createServer(async (req, res) => {
       // session object — so session memory holds only lightweight metadata.
       const httpObjects = await extractHttpObjects(packets, session_id);
 
+      // Build a filename/URI index for fast agent lookups.
+      const fileIndex = new Map();
+      for (const obj of httpObjects) {
+        const fname = obj.filename.toLowerCase();
+        const seg = obj.request_uri.toLowerCase().split('/').pop().split('?')[0];
+        for (const key of new Set([fname, seg])) {
+          if (!key) continue;
+          if (!fileIndex.has(key)) fileIndex.set(key, []);
+          fileIndex.get(key).push(obj);
+        }
+      }
+
       // Strip raw_payload from every packet now that extraction is done.
       stripRawPayloads(packets);
 
@@ -1403,8 +1432,7 @@ const server = http.createServer(async (req, res) => {
 
       // Session stores only lightweight metadata + stripped packets.
       // httpObjects holds metadata only (no buffers — those are in imageStore).
-      sessions.set(session_id, { session_id, filename, packets, httpObjects, created_at: Date.now() });
-
+      sessions.set(session_id, { session_id, filename, packets, httpObjects, fileIndex, created_at: Date.now() });
       const duration_seconds = (isFinite(minT) && isFinite(maxT)) ? Math.max(0, Math.round(Math.abs(maxT - minT))) : 0;
 
       return respond({
@@ -1500,7 +1528,8 @@ const server = http.createServer(async (req, res) => {
       // strings containing system-prompt override attempts.
       const safePrompt = sanitizePrompt(prompt);
       if (!safePrompt) return respond({ error: 'Invalid or empty prompt' }, 400);
-      const result = await dynamicAgent(safePrompt, session.packets);
+      const result = await dynamicAgent(safePrompt, session.packets, session);
+
       return respond(result, 200);
     } catch (e) {
       console.error('[Agent Error]', e);
