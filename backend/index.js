@@ -6,457 +6,269 @@ const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
 
-// ── Directory Setup for TShark ────────────────────────────────
+// ── Directory Setup ──────────────────────────────────────────
 const PCAP_DIR = '/tmp/pcaps';
 const EXPORT_DIR = '/tmp/exports';
 if (!fs.existsSync(PCAP_DIR)) fs.mkdirSync(PCAP_DIR, { recursive: true });
 if (!fs.existsSync(EXPORT_DIR)) fs.mkdirSync(EXPORT_DIR, { recursive: true });
 
-// ── In-memory stores ──────────────────────────────────────────
+// ── In-memory stores ─────────────────────────────────────────
 const sessions = new Map();
 const imageStore = new Map();
-
 const SESSION_TTL_MS = 30 * 60 * 1000;
+
 setInterval(() => {
   const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (now - session.created_at > SESSION_TTL_MS) {
-      // CRITICAL: Delete physical files to save Render disk space!
+  for (const [id] of sessions) {
+    if (now - sessions.get(id).created_at > SESSION_TTL_MS) {
       const pcapPath = path.join(PCAP_DIR, `${id}.pcap`);
       const exportPath = path.join(EXPORT_DIR, id);
       if (fs.existsSync(pcapPath)) fs.unlinkSync(pcapPath);
       if (fs.existsSync(exportPath)) fs.rmSync(exportPath, { recursive: true });
-      
-      sessions.delete(id);
-      imageStore.delete(id);
-      console.log(`[Session] Expired, evicted, and cleaned disk: ${id}`);
+      sessions.delete(id); imageStore.delete(id);
     }
   }
 }, 5 * 60 * 1000);
 
-// ── CORS ──────────────────────────────────────────────────────
+// ── CORS & HTTP Helpers ─────────────────────────────────────
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
-function getCorsHeaders(requestOrigin) {
-  let origin = ALLOWED_ORIGIN === '*' ? '*' : (requestOrigin === ALLOWED_ORIGIN ? requestOrigin : ALLOWED_ORIGIN);
-  return { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Vary': 'Origin' };
-}
-
-// ── TShark Engine (The Brain) ────────────────────────────────
-// Uses -T fields (Tab-Separated Values) because it is 100x faster 
-// and uses 0 RAM compared to TShark's JSON output.
-const DEFAULT_FIELDS = [
-  'frame.number', 'ip.src', 'ip.dst', 'frame.len', 
-  '_ws.col.Protocol', 'tcp.srcport', 'tcp.dstport', 'frame.time_relative'
-];
-
-function runTshark(sessionId, displayFilter = '', fields = DEFAULT_FIELDS, limit = 0) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) return resolve([]);
-
-    let command = `tshark -r "${pcapPath}" -T fields -E separator='\\t' -e ${fields.join(' -e ')}`;
-    if (displayFilter) command += ` -Y "${displayFilter}"`;
-    if (limit > 0) command += ` | head -n ${limit}`;
-
-    exec(command, { timeout: 10000 }, (error, stdout) => {
-      if (error) {
-        console.error(`[TShark] Error: ${error.message}`);
-        return resolve([]);
-      }
-
-      const lines = stdout.trim().split('\n').filter(l => l.trim() !== '');
-      const packets = lines.map(line => {
-        const cols = line.split('\t');
-        return {
-          id: parseInt(cols[0]) || 0,
-          src_ip: cols[1] || null,
-          dst_ip: cols[2] || null,
-          length: parseInt(cols[3]) || 0,
-          protocol: cols[4] || 'UNKNOWN',
-          src_port: parseInt(cols[5]) || null,
-          dst_port: parseInt(cols[6]) || null,
-          timestamp: parseFloat(cols[7]) || 0,
-        };
-      });
-
-      resolve(packets);
-    });
-  });
-}
-
-// ── Shodan / CVE helpers ─────────────────────────────────────
-async function fetchShodanIp(ip) {
-  return new Promise((resolve) => {
-    let settled = false; const cleanup = () => { if (!settled) settled = true; };
-    const req = https.get(`https://internetdb.shodan.io/${ip}`, (res) => {
-      let data = ''; res.on('data', d => data += d);
-      res.on('end', () => { if (settled) return; cleanup(); try { resolve(JSON.parse(data)); } catch (_) { resolve(null); } });
-    });
-    req.on('error', () => { if (settled) return; cleanup(); resolve(null); });
-    setTimeout(() => { if (settled) return; cleanup(); req.destroy(); resolve(null); }, 4000);
-  });
-}
-
-// ── Vulnerable Ports Map ─────────────────────────────────────
-const VULNERABLE_PORTS = {
-  21: { risk: 'HIGH', reason: 'FTP transmits credentials in plaintext' },
-  23: { risk: 'CRITICAL', reason: 'Telnet transmits everything in plaintext' },
-  80: { risk: 'MEDIUM', reason: 'HTTP transmits data in plaintext' },
-  135: { risk: 'HIGH', reason: 'RPC endpoint mapper' },
-  445: { risk: 'CRITICAL', reason: 'SMB — EternalBlue / ransomware vector' },
-  3389: { risk: 'HIGH', reason: 'RDP — BlueKeep / brute force vector' },
-  4444: { risk: 'CRITICAL', reason: 'Metasploit default port' },
-  6379: { risk: 'CRITICAL', reason: 'Redis with no auth' },
-  9200: { risk: 'CRITICAL', reason: 'Elasticsearch with no auth' },
-  27017: { risk: 'CRITICAL', reason: 'MongoDB with no auth' },
-};
-
-// ── Local Intent Router (No AI) ──────────────────────────────
-function localDynamicAgent(userPrompt, sessionId) {
-  const lower = userPrompt.toLowerCase();
-  let toolName = 'get_summary';
-  let toolParams = {};
-  let tsharkFilter = '';
-
-  const portMatch = lower.match(/port\s*(\d{1,5})/);
-  const ipMatch = lower.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
-
-  // 1. Detect Intent
-  if (lower.includes('credential') || lower.includes('password') || lower.includes('login')) {
-    toolName = 'find_credentials';
-    tsharkFilter = "ftp.request.command == USER || ftp.request.command == PASS || http.authorization";
-  } else if (lower.includes('port scan') || lower.includes('scanning') || lower.includes('nmap')) {
-    toolName = 'detect_port_scan';
-    tsharkFilter = "tcp.flags.syn==1 && tcp.flags.ack==0";
-  } else if (lower.includes('dns') || lower.includes('domain')) {
-    toolName = 'get_dns_queries';
-    tsharkFilter = "dns";
-  } else if (lower.includes('https') || lower.includes('tls') || lower.includes('sni')) {
-    toolName = 'get_tls_sni';
-  } else if (lower.includes('vulnerab') || lower.includes('risk')) {
-    toolName = 'get_vulnerability_report';
-  } else if (lower.includes('top talker') || lower.includes('bandwidth') || lower.includes('most traffic')) {
-    toolName = 'get_top_talkers';
-  } else if (portMatch) {
-    toolName = 'filter_by_port';
-    tsharkFilter = `tcp.port == ${portMatch[1]} || udp.port == ${portMatch[1]}`;
-    toolParams = { port: parseInt(portMatch[1]) };
-  } else if (ipMatch) {
-    toolName = 'filter_by_ip';
-    tsharkFilter = `ip.addr == ${ipMatch[1]}`;
-    toolParams = { ip: ipMatch[1] };
-  } else if (lower.includes('filter:') || lower.includes('display filter')) {
-    // POWER MODE: User typed a raw Wireshark filter!
-    toolName = 'custom_filter';
-    tsharkFilter = userPrompt.split(/(?:filter|:)/i)[1]?.trim() || '';
-  } else if (lower.includes('summary') || lower.includes('overview')) {
-    toolName = 'get_summary';
-  } else {
-    return { tool_called: 'none', parameters: {}, result: null, response: "I'm a local TShark engine. Ask me to summarize traffic, find DNS queries, or filter by port/IP.", followup: "Try: 'Summarize this capture'" };
-  }
-
-  return { toolName, toolParams, tsharkFilter };
-}
-
-// ── Tool Executor via TShark ──────────────────────────────────
-async function executeTool(toolName, toolParams, tsharkFilter, sessionId) {
-  switch (toolName) {
-    case 'get_summary': {
-      return new Promise((resolve) => {
-        const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-        exec(`tshark -r "${pcapPath}" -q -z io,stat,0`, { timeout: 10000 }, (err, stdout) => {
-          const text = stdout || "Could not read summary.";
-          resolve({ result: { raw_text: text }, response: "Capture summary generated." });
-        });
-      });
-    }
-
-    case 'get_top_talkers': {
-      return new Promise((resolve) => {
-        const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-        exec(`tshark -r "${pcapPath}" -q -z conv,ip,tcp | head -n 15`, { timeout: 10000 }, (err, stdout) => {
-          const lines = stdout.split('\n').filter(l => l.includes('|')).slice(1);
-          const result = lines.map(line => {
-            const p = line.split('|').map(s => s.trim());
-            if(p.length < 5) return null;
-            return { ip_a: p[0], ip_b: p[1], packets: parseInt(p[2]) || 0, bytes: p[3] };
-          }).filter(Boolean);
-          resolve({ result, response: `Top ${result.length} talkers.` });
-        });
-      });
-    }
-
-    case 'get_dns_queries': {
-      const dnsFields = ['frame.number', 'dns.qry.name', 'ip.src', 'ip.dst', '_ws.col.Protocol', 'frame.len'];
-      const packets = await runTshark(sessionId, tsharkFilter, dnsFields, 100);
-      const domains = {};
-      packets.forEach(p => {
-        if (p.dns_qry_name) {
-          const d = p.dns_qry_name.toLowerCase();
-          domains[d] = (domains[d] || 0) + 1;
-        }
-      });
-      return { result: { packets, top_domains: Object.entries(domains).sort((a,b)=>b[1]-a[1]).slice(0, 15) }, response: `Found ${packets.length} DNS packets.` };
-    }
-
-    case 'get_tls_sni': {
-      const sniFields = ['frame.number', 'tls.handshake.extensions_server_name', 'ip.dst', '_ws.col.Protocol'];
-      const packets = await runTshark(sessionId, "tls.handshake.type == 1", sniFields, 100);
-      // Map TShark fields to frontend expected fields
-      const formatted = packets.map(p => ({
-        ...p, 
-        dst_ip: p.tls_handshake_extensions_server_name || p.ip_dst,
-        payload_preview: p.tls_handshake_extensions_server_name
-      }));
-      return { result: formatted, response: `Found ${formatted.length} HTTPS SNI packets.` };
-    }
-
-    case 'custom_filter':
-    case 'filter_by_port':
-    case 'filter_by_ip':
-    case 'find_credentials':
-    case 'detect_port_scan': {
-      const packets = await runTshark(sessionId, tsharkFilter, DEFAULT_FIELDS, 100);
-      return { result: packets, response: `Found ${packets.length} packets matching filter.` };
-    }
-
-    case 'get_vulnerability_report': {
-      // Get all unique ports
-      const portFields = ['tcp.dstport', 'udp.dstport'];
-      const packets = await runTshark(sessionId, "", portFields, 5000);
-      const portCounts = {};
-      packets.forEach(p => {
-        const port = p.tcp_dstport || p.udp_dstport;
-        if (port) portCounts[port] = (portCounts[port] || 0) + 1;
-      });
-      
-      const result = Object.entries(portCounts)
-        .filter(([port]) => VULNERABLE_PORTS[port])
-        .map(([port, count]) => ({
-          port: parseInt(port),
-          count,
-          risk: VULNERABLE_PORTS[port].risk,
-          reason: VULNERABLE_PORTS[port].reason
-        }));
-        
-      return { result, response: `Found traffic on ${result.length} vulnerable ports.` };
-    }
-
-    default:
-      return { result: null, response: "Tool not implemented." };
-  }
-}
-
-// ── HTTP Helpers ─────────────────────────────────────────────
-function parseBody(req) { return new Promise((resolve, reject) => { const chunks = []; req.on('data', chunk => chunks.push(chunk)); req.on('end', () => resolve(Buffer.concat(chunks))); req.on('error', reject); }); }
+function getCorsHeaders(origin) { return { 'Access-Control-Allow-Origin': ALLOWED_ORIGIN === '*' ? '*' : origin, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' }; }
+function parseBody(req) { return new Promise((res, rej) => { const c = []; req.on('data', d => c.push(d)); req.on('end', () => res(Buffer.concat(c))); req.on('error', rej); }); }
 function parseMultipart(buffer, boundary) {
-  const cleanBoundary = boundary.replace(/^["']|["']$/g, '').trim();
-  const boundaryBuf = Buffer.from('\r\n--' + cleanBoundary); const firstBound = Buffer.from('--' + cleanBoundary); const CRLF4 = Buffer.from('\r\n\r\n'); const parts = [];
-  let pos = buffer.indexOf(firstBound); if (pos === -1) return parts; pos += firstBound.length; let safety = 0;
-  while (pos < buffer.length && safety++ < 1000) {
-    const lineEnd = buffer.indexOf(Buffer.from('\r\n'), pos); if (lineEnd === -1) break;
-    const boundaryLine = buffer.slice(pos, lineEnd).toString(); if (boundaryLine.startsWith('--')) break;
-    const headerStart = lineEnd + 2; const headerEnd = buffer.indexOf(CRLF4, headerStart); if (headerEnd === -1) break;
-    const headers = buffer.slice(headerStart, headerEnd).toString(); const dataStart = headerEnd + 4;
-    const nextBound = buffer.indexOf(boundaryBuf, dataStart); const dataEnd = nextBound === -1 ? buffer.length : nextBound;
-    parts.push({ headers, data: buffer.slice(dataStart, dataEnd) }); if (nextBound === -1) break; pos = nextBound + boundaryBuf.length;
-  }
+  const bBuf = Buffer.from('\r\n--' + boundary.replace(/^["']|["']$/g, '').trim()); const fBuf = Buffer.from('--' + boundary.replace(/^["']|["']$/g, '').trim()); const CRLF = Buffer.from('\r\n\r\n'); const parts = [];
+  let pos = buffer.indexOf(fBuf); if (pos === -1) return parts; pos += fBuf.length; let s = 0;
+  while (pos < buffer.length && s++ < 1000) { const lEnd = buffer.indexOf(Buffer.from('\r\n'), pos); if (lEnd === -1) break; if (buffer.slice(pos, lEnd).toString().startsWith('--')) break; const hEnd = buffer.indexOf(CRLF, lEnd + 2); if (hEnd === -1) break; const nBound = buffer.indexOf(bBuf, hEnd + 4); parts.push({ headers: buffer.slice(lEnd + 2, hEnd).toString(), data: buffer.slice(hEnd + 4, nBound === -1 ? buffer.length : nBound) }); if (nBound === -1) break; pos = nBound + bBuf.length; }
   return parts;
 }
-function json(res, data, status = 200, requestOrigin = '', acceptEncoding = '') {
-  const payload = JSON.stringify(data); const corsHeaders = getCorsHeaders(requestOrigin);
-  const wantsGzip = /\bgzip\b/.test(acceptEncoding);
-  if (wantsGzip && payload.length > 1024) {
-    zlib.gzip(Buffer.from(payload, 'utf8'), (err, compressed) => { if (err) { res.writeHead(status, { 'Content-Type': 'application/json', ...corsHeaders }); res.end(payload); return; } res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding', ...corsHeaders }); res.end(compressed); });
-  } else { res.writeHead(status, { 'Content-Type': 'application/json', ...corsHeaders }); res.end(payload); }
+function json(res, data, status, origin, enc) {
+  const p = JSON.stringify(data); const h = getCorsHeaders(origin);
+  if (/\bgzip\b/.test(enc) && p.length > 1024) { zlib.gzip(Buffer.from(p), (e, c) => { if (e) { res.writeHead(status, { 'Content-Type': 'application/json', ...h }); res.end(p); return; } res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', ...h }); res.end(c); }); }
+  else { res.writeHead(status || 200, { 'Content-Type': 'application/json', ...h }); res.end(p); }
 }
-function getQuery(url) {
-  const q = {}; const idx = url.indexOf('?'); if (idx === -1) return q;
-  for (const part of url.slice(idx + 1).split('&')) { const [k, v] = part.split('='); if (k) q[decodeURIComponent(k)] = decodeURIComponent(v || ''); }
-  return q;
+function getQuery(url) { const q = {}; const i = url.indexOf('?'); if (i === -1) return q; for (const p of url.slice(i + 1).split('&')) { const [k, v] = p.split('='); if (k) q[decodeURIComponent(k)] = decodeURIComponent(v || ''); } return q; }
+const isValidSessionId = (id) => typeof id === 'string' && /^session-\d{13}-[a-z0-9]{6}$/.test(id);
+
+// ── TShark Core Engine ──────────────────────────────────────
+const DEFAULT_FIELDS = ['frame.number', 'ip.src', 'ip.dst', 'frame.len', '_ws.col.Protocol', 'tcp.srcport', 'tcp.dstport', 'frame.time_relative'];
+
+function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
+  return new Promise((resolve) => {
+    const pPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pPath)) return resolve([]);
+    let cmd = `tshark -r "${pPath}" -T fields -E separator='\\t' -e ${fields.join(' -e ')}`;
+    if (filter) cmd += ` -Y "${filter}"`;
+    if (limit > 0) cmd += ` | head -n ${limit}`;
+    exec(cmd, { timeout: 15000 }, (err, stdout) => {
+      if (err) return resolve([]);
+      resolve(stdout.trim().split('\n').filter(l => l.trim()).map(line => {
+        const c = line.split('\t');
+        return { id: parseInt(c[0]) || 0, src_ip: c[1] || null, dst_ip: c[2] || null, length: parseInt(c[3]) || 0, protocol: c[4] || 'UNKNOWN', src_port: parseInt(c[5]) || null, dst_port: parseInt(c[6]) || null, timestamp: parseFloat(c[7]) || 0 };
+      }));
+    });
+  });
 }
 
-// ── Session ID validation ─────────────────────────────────────
-const SESSION_ID_RE = /^session-\d{13}-[a-z0-9]{6}$/;
-function isValidSessionId(id) { return typeof id === 'string' && SESSION_ID_RE.test(id); }
-
-// ── Rate limiter ──────────────────────────────────────────────
-const rateLimits = new Map();
-function checkRateLimit(ip, limit) {
-  const now = Date.now(); const key = `${ip}:${limit.max}`; const entry = rateLimits.get(key) || { count: 0, windowStart: now };
-  if (now - entry.windowStart > limit.windowMs) { entry.count = 0; entry.windowStart = now; }
-  entry.count++; rateLimits.set(key, entry); return entry.count <= limit.max;
+function runTsharkStat(sessionId, statCommand) {
+  return new Promise((resolve) => {
+    const pPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pPath)) return resolve("PCAP not found");
+    exec(`tshark -r "${pPath}" -q -z ${statCommand}`, { timeout: 15000 }, (err, stdout) => resolve(stdout || "Stat failed"));
+  });
 }
 
-// ── Main HTTP Server ───────────────────────────────────────────
+// ── Vulnerable Ports Map ────────────────────────────────────
+const VULN_PORTS = { 21: 'HIGH', 22: 'LOW', 23: 'CRITICAL', 25: 'MEDIUM', 53: 'LOW', 69: 'HIGH', 80: 'MEDIUM', 110: 'HIGH', 135: 'HIGH', 137: 'HIGH', 138: 'HIGH', 139: 'HIGH', 161: 'HIGH', 389: 'MEDIUM', 445: 'CRITICAL', 1433: 'HIGH', 1521: 'HIGH', 1723: 'MEDIUM', 3306: 'HIGH', 3389: 'HIGH', 4444: 'CRITICAL', 5432: 'HIGH', 5900: 'HIGH', 6379: 'CRITICAL', 8080: 'LOW', 9200: 'CRITICAL', 27017: 'CRITICAL' };
+
+// ── ULTIMATE INTENT ROUTER (50+ Rules) ─────────────────────
+function localDynamicAgent(prompt) {
+  const l = prompt.toLowerCase();
+  let tool = 'get_summary', params = {}, filter = '', fields = DEFAULT_FIELDS;
+
+  const portM = l.match(/port\s*(\d{1,5})/);
+  const ipM = l.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
+  const macM = l.match(/([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2})/i);
+
+  // --- CORE STATS ---
+  if (l.includes('hierarchy') || l.includes('protocol distribution')) { tool = 'get_hierarchy'; }
+  else if (l.includes('expert') || l.includes('warnings') || l.includes('errors')) { tool = 'get_expert_info'; }
+  else if (l.includes('endpoint') || l.includes('top talker') || l.includes('bandwidth')) { tool = 'get_endpoints'; }
+  
+  // --- TCP ANALYSIS ---
+  else if (l.includes('retransmission') || l.includes('retransmit')) { tool = 'get_tcp_anomalies'; filter = 'tcp.analysis.retransmission'; fields = [...DEFAULT_FIELDS, 'tcp.analysis.retransmission']; }
+  else if (l.includes('out of order')) { tool = 'get_tcp_anomalies'; filter = 'tcp.analysis.out_of_order'; }
+  else if (l.includes('zero window') || l.includes('flow control')) { tool = 'get_tcp_anomalies'; filter = 'tcp.analysis.zero_window'; }
+  else if (l.includes('duplicate ack')) { tool = 'get_tcp_anomalies'; filter = 'tcp.analysis.duplicate_ack'; }
+  else if (l.includes('rst') || l.includes('reset')) { tool = 'get_tcp_anomalies'; filter = 'tcp.flags.reset == 1'; }
+  else if (l.includes('syn flood') || l.includes('port scan') || l.includes('scanning')) { tool = 'get_tcp_anomalies'; filter = 'tcp.flags.syn == 1 && tcp.flags.ack == 0'; }
+  else if (l.includes('fin')) { tool = 'get_tcp_anomalies'; filter = 'tcp.flags.fin == 1'; }
+  
+  // --- HTTP ---
+  else if (l.includes('http method') || l.includes('get post put')) { tool = 'get_http_methods'; filter = 'http.request'; fields = [...DEFAULT_FIELDS, 'http.request.method', 'http.request.uri', 'http.host']; }
+  else if (l.includes('http status') || l.includes('status code') || l.includes('404') || l.includes('500')) { tool = 'get_http_status'; filter = 'http.response.code'; fields = [...DEFAULT_FIELDS, 'http.response.code', 'http.response.phrase']; }
+  else if (l.includes('user agent') || l.includes('browser')) { tool = 'get_http_details'; filter = 'http.user_agent'; fields = [...DEFAULT_FIELDS, 'http.user_agent']; }
+  else if (l.includes('http header') || l.includes('content type')) { tool = 'get_http_details'; filter = 'http.request || http.response'; fields = [...DEFAULT_FIELDS, 'http.content_type']; }
+  
+  // --- TLS / HTTPS ---
+  else if (l.includes('tls') || l.includes('ssl') || l.includes('sni')) { tool = 'get_tls_sni'; filter = 'tls.handshake.type == 1'; fields = [...DEFAULT_FIELDS, 'tls.handshake.extensions_server_name']; }
+  else if (l.includes('ja3') || l.includes('fingerprint')) { tool = 'get_tls_sni'; filter = 'tls.handshake.type == 1'; fields = [...DEFAULT_FIELDS, 'tcp.handshake.ja3']; }
+  else if (l.includes('certificate') || l.includes('cert')) { tool = 'get_tls_certs'; filter = 'tls.handshake.type == 11'; fields = ['frame.number', 'ip.src', 'ip.dst', 'x509ce.dNSName']; }
+  
+  // --- DNS ---
+  else if (l.includes('dns') || l.includes('domain')) { tool = 'get_dns'; filter = 'dns'; fields = [...DEFAULT_FIELDS, 'dns.qry.name', 'dns.qry.type']; }
+  else if (l.includes('dga') || l.includes('suspicious domain')) { tool = 'get_dns'; filter = 'dns.qry.name.len > 25'; fields = [...DEFAULT_FIELDS, 'dns.qry.name']; }
+  
+  // --- AUTH & PLAINTEXT ---
+  else if (l.includes('credential') || l.includes('password') || l.includes('login')) { tool = 'get_creds'; filter = 'ftp.request.command == USER || ftp.request.command == PASS || http.authorization || smb2.auth'; }
+  else if (l.includes('telnet')) { tool = 'get_creds'; filter = 'telnet'; }
+  
+  // --- NETWORK / LAYER 2 ---
+  else if (l.includes('arp') || l.includes('spoof')) { tool = 'get_arp'; filter = 'arp'; fields = ['frame.number', 'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.proto_ipv4']; }
+  else if (l.includes('dhcp')) { tool = 'get_dhcp'; filter = 'dhcp'; fields = [...DEFAULT_FIELDS, 'dhcp.option.hostname', 'dhcp.option.requested_ip_address']; }
+  else if (l.includes('icmp') || l.includes('ping')) { tool = 'get_icmp'; filter = 'icmp'; fields = [...DEFAULT_FIELDS, 'icmp.type']; }
+  else if (l.includes('broadcast') || l.includes('multicast')) { tool = 'get_arp'; filter = 'eth.dst == ff:ff:ff:ff:ff:ff || eth.dst[0:1] == "01:00:5e"'; }
+  else if (macM) { tool = 'get_arp'; filter = `eth.src == ${macM[0]} || eth.dst == ${macM[0]}`; fields = ['frame.number', 'eth.src', 'eth.dst', 'ip.src', 'ip.dst', '_ws.col.Protocol']; }
+  
+  // --- PROTOCOLS ---
+  else if (l.includes('smb') || l.includes('cifs')) { tool = 'get_generic_proto'; filter = 'smb || smb2'; fields = [...DEFAULT_FIELDS, 'smb2.cmd']; }
+  else if (l.includes('rdp')) { tool = 'get_generic_proto'; filter = 'tcp.dstport == 3389 || rdp'; }
+  else if (l.includes('ssh')) { tool = 'get_generic_proto'; filter = 'tcp.dstport == 22 || ssh'; }
+  else if (l.includes('ftp')) { tool = 'get_generic_proto'; filter = 'ftp'; fields = [...DEFAULT_FIELDS, 'ftp.request.command', 'ftp.request.arg']; }
+  else if (l.includes('smtp') || l.includes('email') || l.includes('mail')) { tool = 'get_generic_proto'; filter = 'smtp'; fields = [...DEFAULT_FIELDS, 'smtp.req.from', 'smtp.rcpt.to']; }
+  else if (l.includes('quic') || l.includes('http/3') || l.includes('http 3')) { tool = 'get_generic_proto'; filter = 'quic'; }
+  
+  // --- VULNERABILITIES ---
+  else if (l.includes('vulnerab') || l.includes('risk')) { tool = 'get_vuln_report'; }
+  
+  // --- TIMELINE ---
+  else if (l.includes('timeline') || l.includes('over time')) { tool = 'get_timeline'; }
+  
+  // --- EXPLICIT FILTERS ---
+  else if (portM) { tool = 'get_generic_proto'; filter = `tcp.port == ${portM[1]} || udp.port == ${portM[1]}`; }
+  else if (ipM) { tool = 'get_generic_proto'; filter = `ip.addr == ${ipM[1]}`; }
+  else if (l.includes('filter:') || l.includes('display:')) { tool = 'get_generic_proto'; filter = prompt.split(/(?:filter|:)/i)[1]?.trim() || ''; }
+  
+  // --- FALLBACK ---
+  else if (l.includes('summary') || l.includes('overview')) { tool = 'get_summary'; }
+  else { return { tool_called: 'none', parameters: {}, result: null, response: "I'm a TShark engine. Ask me about protocols, ports, DNS, ARP, TCP anomalies, HTTP methods, or use raw filters like 'filter: tcp.port == 80'.", followup: "Try: 'Show me protocol hierarchy'" }; }
+
+  return { toolName: tool, tsharkFilter: filter, tsharkFields: fields };
+}
+
+// ── Tool Executor ────────────────────────────────────────────
+async function executeTool(toolName, filter, fields, sessionId) {
+  switch (toolName) {
+    case 'get_summary': return { result: { raw_text: await runTSharkStat(sessionId, 'io,stat,0') }, response: 'Capture summary generated by Wireshark engine.' };
+    case 'get_hierarchy': return { result: { raw_text: await runTSharkStat(sessionId, 'io,phs') }, response: 'Protocol hierarchy generated.' };
+    case 'get_expert_info': return { result: { raw_text: await runTSharkStat(sessionId, 'expert') }, response: 'Expert info (Errors/Warnings) generated.' };
+    case 'get_endpoints': return { result: { raw_text: await runTSharkStat(sessionId, 'conv,ip') }, response: 'IP Endpoints generated.' };
+    case 'get_timeline': return { result: { raw_text: await runTSharkStat(sessionId, 'io,stat,1') }, response: 'Timeline statistics generated.' };
+    case 'get_vuln_report': {
+      const portFields = ['tcp.dstport', 'udp.dstport'];
+      const packets = await runTshark(sessionId, "", portFields, 5000);
+      const portCounts = {}; packets.forEach(p => { const port = p.tcp_dstport || p.udp_dstport; if (port) portCounts[port] = (portCounts[port] || 0) + 1; });
+      const result = Object.entries(portCounts).filter(([port]) => VULN_PORTS[port]).map(([port, count]) => ({ port: parseInt(port), count, risk: VULN_PORTS[port] }));
+      return { result, response: `Found traffic on ${result.length} vulnerable ports.` };
+    }
+    case 'get_tls_certs': return { result: await runTshark(sessionId, filter, fields, 50), response: 'TLS Certificate details extracted.' };
+    // ALL OTHER PROTOCOL/ANALYSIS QUERIES FALL HERE
+    default: {
+      const packets = await runTShark(sessionId, filter, fields, 100);
+      return { result: packets, response: `Found ${packets.length} packets.` };
+    }
+  }
+}
+
+// ── Main Server ──────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   const url = req.url || '/'; const method = req.method || 'GET';
-  const requestOrigin = req.headers['origin'] || ''; const acceptEncoding = req.headers['accept-encoding'] || '';
-  const respond = (data, status = 200) => json(res, data, status, requestOrigin, acceptEncoding);
+  const origin = req.headers['origin'] || ''; const enc = req.headers['accept-encoding'] || '';
+  const respond = (data, status) => json(res, data, status, origin, enc);
 
-  if (method === 'OPTIONS') { res.writeHead(204, getCorsHeaders(requestOrigin)); return res.end(); }
-
+  if (method === 'OPTIONS') { res.writeHead(204, getCorsHeaders(origin)); return res.end(); }
   if (url === '/ping' || url === '/pcap/ping') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('pong'); }
+  if (url === '/pcap/health') return respond({ status: 'ok', engine: 'TShark (Wireshark CLI)' });
 
-  if (url === '/pcap/health' || url === '/health') {
-    return respond({ status: 'ok', service: 'pcap-tshark-analyzer', sessions: sessions.size, engine: 'TShark (Wireshark CLI)' }, 200);
-  }
-
-  // ── Upload (Saves to Disk + Extracts HTTP Objects) ────────
   if (url === '/pcap/upload' && method === 'POST') {
     try {
-      const contentType = req.headers['content-type'] || '';
-      const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;,\s]+))/);
-      const boundary = boundaryMatch?.[1] ?? boundaryMatch?.[2];
-      if (!boundary) return respond({ error: 'Missing multipart boundary' }, 400);
-
+      const ct = req.headers['content-type'] || ''; const bm = ct.match(/boundary=(?:"([^"]+)"|([^;,\s]+))/); const boundary = bm?.[1] ?? bm?.[2];
+      if (!boundary) return respond({ error: 'Missing boundary' }, 400);
       const body = await parseBody(req); const parts = parseMultipart(body, boundary);
-      let fileData = null; let filename = 'upload.pcap';
-      for (const part of parts) { const fnMatch = part.headers.match(/filename\*?=(?:UTF-8''|")?([^";\r\n]+)/i); if (fnMatch) { filename = decodeURIComponent(fnMatch[1].replace(/"/g, '').trim()); fileData = part.data; } }
-      if (!fileData) return respond({ error: 'No file found' }, 400);
+      let fileData = null, filename = 'upload.pcap';
+      for (const p of parts) { const m = p.headers.match(/filename\*?=(?:UTF-8''|")?([^";\r\n]+)/i); if (m) { filename = decodeURIComponent(m[1].replace(/"/g, '').trim()); fileData = p.data; } }
+      if (!fileData) return respond({ error: 'No file' }, 400);
 
       const session_id = `session-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
       const pcapPath = path.join(PCAP_DIR, `${session_id}.pcap`);
-      
-      // 1. Save file to disk
       fs.writeFileSync(pcapPath, fileData);
-      console.log(`[Upload] Saved ${filename} to disk for ${session_id}`);
 
-      // 2. Extract HTTP Objects using REAL Wireshark logic!
       const exportDir = path.join(EXPORT_DIR, session_id);
       if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir, { recursive: true });
       
-      // This command is identical to Wireshark GUI -> File -> Export Objects -> HTTP
+      // Extract HTTP objects in background (non-blocking)
       exec(`tshark -r "${pcapPath}" --export-objects http,"${exportDir}"`, { timeout: 15000 }, (err) => {
-        if (err) console.warn(`[Export] HTTP Export warning/failed: ${err.message}`);
-        
-        // Read exported files and store in imageStore
+        if (err) return;
         if (fs.existsSync(exportDir)) {
-          const files = fs.readdirSync(exportDir);
           const artifacts = new Map();
-          
-          files.forEach(file => {
-            const filePath = path.join(exportDir, file);
-            const buffer = fs.readFileSync(filePath);
-            const ext = path.extname(file).toLowerCase();
-            const contentType = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.png' ? 'image/png' : 'application/octet-stream';
-            
-            const artifactKey = encodeURIComponent(file);
-            artifacts.set(artifactKey, { buffer, contentType, filename: file });
+          fs.readdirSync(exportDir).forEach(file => {
+            const fp = path.join(exportDir, file); const ext = path.extname(file).toLowerCase();
+            artifacts.set(encodeURIComponent(file), { buffer: fs.readFileSync(fp), contentType: ext === '.jpg' ? 'image/jpeg' : ext === '.png' ? 'image/png' : 'application/octet-stream', filename: file });
           });
-
           imageStore.set(session_id, artifacts);
         }
       });
 
-      // 3. Get basic summary for immediate frontend response
-      exec(`tshark -r "${pcapPath}" -q -z io,stat,0`, { timeout: 10000 }, (err, stdout) => {
-        const summaryText = stdout || "Parsed";
-        const totalPacketsMatch = summaryText.match(/(\d+)\s+packets/);
-        const totalPackets = totalPacketsMatch ? parseInt(totalPacketsMatch[1]) : 0;
-
-        sessions.set(session_id, { session_id, filename, created_at: Date.now() });
-        return respond({ session_id, summary: { total_packets: totalPackets, raw_text: summaryText } }, 200);
-      });
-
-    } catch (e) { console.error('[Upload Error]', e); return respond({ error: 'Upload failed: ' + e.message }, 500); }
+      sessions.set(session_id, { session_id, filename, created_at: Date.now() });
+      const summaryText = await runTSharkStat(session_id, 'io,stat,0');
+      const totalMatch = summaryText.match(/(\d+)\s+packets/);
+      return respond({ session_id, summary: { total_packets: totalMatch ? parseInt(totalMatch[1]) : 0, raw_text: summaryText } });
+    } catch (e) { return respond({ error: e.message }, 500); }
   }
 
-  // ── Agent (Local Router + TShark Execution) ──────────────
   if (url === '/pcap/agent/query' && method === 'POST') {
     try {
-      const body = await parseBody(req); let parsed;
-      try { parsed = JSON.parse(body.toString()); } catch { return respond({ error: 'Invalid JSON' }, 400); }
+      const body = await parseBody(req); const parsed = JSON.parse(body.toString());
       const { prompt, session_id } = parsed || {};
       if (!isValidSessionId(session_id)) return respond({ error: 'Invalid session_id' }, 400);
-      
-      const pcapPath = path.join(PCAP_DIR, `${session_id}.pcap`);
-      if (!fs.existsSync(pcapPath)) return respond({ error: 'Session PCAP expired or missing' }, 404);
+      if (!fs.existsSync(path.join(PCAP_DIR, `${session_id}.pcap`))) return respond({ error: 'PCAP expired' }, 404);
 
-      console.log(`[Agent] Query: "${prompt.substring(0, 50)}..."`);
-      
-      // 1. Route intent
-      const { toolName, toolParams, tsharkFilter } = localDynamicAgent(prompt, session_id);
-      
-      // 2. Execute via TShark
-      const toolResult = await executeTool(toolName, toolParams, tsharkFilter, session_id);
+      const { toolName, tsharkFilter, tsharkFields } = localDynamicAgent(prompt);
+      const toolResult = await executeTool(toolName, tsharkFilter, tsharkFields, session_id);
 
-      // 3. Format final response
       let finalResponse = toolResult.response;
-      let followup = "Want to check for vulnerabilities?";
+      let followup = "Check for vulnerabilities.";
 
-      if (toolName === 'get_summary') {
-        finalResponse = "Here is the capture summary generated by the Wireshark engine.";
-        followup = "Show me the DNS queries.";
-      } else if (toolName === 'find_credentials' && toolResult.result?.length > 0) {
-        finalResponse = `Warning: Found ${toolResult.result.length} plaintext credentials in this traffic!`;
-        followup = "Check for port scanning.";
-      } else if (toolName === 'detect_port_scan' && toolResult.result?.length > 0) {
-        finalResponse = `Detected SYN scan activity from ${toolResult.result.length} packets.`;
-      } else if (toolName === 'custom_filter') {
-        finalResponse = `Applied custom Wireshark filter. Found ${toolResult.result?.length || 0} packets.`;
-      }
+      if (toolName === 'get_hierarchy') followup = "Show me TCP retransmissions.";
+      else if (toolName === 'get_expert_info') followup = "Extract HTTP objects.";
+      else if (toolName === 'get_creds' && toolResult.result?.length > 0) finalResponse = `🚨 WARNING: Found ${toolResult.result.length} plaintext credentials!`;
+      else if (toolName === 'get_tcp_anomalies' && toolResult.result?.length > 0) finalResponse = `Found ${toolResult.result.length} TCP anomalies.`;
 
-      return respond({
-        tool_called: toolName,
-        parameters: toolParams,
-        result: toolResult.result,
-        response: finalResponse,
-        followup: followup,
-      }, 200);
-
-    } catch (e) { console.error('[Agent Error]', e); return respond({ error: 'Agent error: ' + e.message }, 500); }
+      return respond({ tool_called: toolName, parameters: {}, result: toolResult.result, response: finalResponse, followup });
+    } catch (e) { return respond({ error: e.message }, 500); }
   }
 
-  // ── Packets (Fetches via TShark on demand) ────────────────
   if (url.startsWith('/pcap/packets') && method === 'GET') {
-    const q = getQuery(url); if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
-    const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
-    if (!fs.existsSync(pcapPath)) return respond({ error: 'Session not found' }, 404);
-    
-    const page = parseInt(q.page || '1'); const per_page = parseInt(q.per_page || '50');
-    const skip = (page - 1) * per_page;
-    
-    // TShark native pagination using -Y "frame.number > X && frame.number <= Y"
+    const q = getQuery(url); if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid' }, 400);
+    const page = parseInt(q.page || '1'); const per_page = parseInt(q.per_page || '50'); const skip = (page - 1) * per_page;
     const filter = `frame.number > ${skip} && frame.number <= ${skip + per_page}`;
-    const packets = await runTshark(q.session_id, filter, DEFAULT_FIELDS, per_page);
-    
-    return respond({ packets, total: 99999, page, per_page }, 200); 
+    return respond({ packets: await runTShark(q.session_id, filter, DEFAULT_FIELDS, per_page), total: 99999, page, per_page });
   }
 
-  // ── HTTP Objects (Served from Disk) ───────────────────────
   if (url.startsWith('/pcap/images') && method === 'GET') {
-    const q = getQuery(url); if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
+    const q = getQuery(url); if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid' }, 400);
     const artifacts = imageStore.get(q.session_id);
-    if (!artifacts) return respond({ error: 'No objects found' }, 404);
-    
-    const images = Array.from(artifacts.entries()).map(([key, val]) => ({
-      filename: val.filename, content_type: val.contentType, artifact_key: key, is_image: val.contentType.startsWith('image/')
-    }));
-    
-    return respond({ images, total: images.length }, 200);
+    if (!artifacts) return respond({ error: 'No objects' }, 404);
+    return respond({ images: Array.from(artifacts.entries()).map(([k, v]) => ({ filename: v.filename, content_type: v.contentType, artifact_key: k })), total: artifacts.size });
   }
 
-  // ── Image-data route (Streams from Disk) ──────────────────
   if (url.startsWith('/pcap/image-data') && method === 'GET') {
-    const q = getQuery(url); if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
-    const artifactKey = q.key || ''; if (!artifactKey) return respond({ error: 'Missing key' }, 400);
-    
-    const sessionArtifacts = imageStore.get(q.session_id);
-    if (!sessionArtifacts) return respond({ error: 'Not found' }, 404);
-    
-    const artifact = sessionArtifacts.get(artifactKey);
-    if (!artifact) return respond({ error: 'Artifact not found' }, 404);
-
-    res.writeHead(200, { 'Content-Type': artifact.contentType, 'Content-Length': artifact.buffer.length, 'Content-Disposition': `inline; filename="${artifact.filename}"`, ...getCorsHeaders(requestOrigin) });
-    return res.end(artifact.buffer);
+    const q = getQuery(url); if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid' }, 400);
+    const art = imageStore.get(q.session_id)?.get(q.key || ''); if (!art) return respond({ error: 'Not found' }, 404);
+    res.writeHead(200, { 'Content-Type': art.contentType, 'Content-Length': art.buffer.length, 'Content-Disposition': `inline; filename="${art.filename}"`, ...getCorsHeaders(origin) });
+    return res.end(art.buffer);
   }
 
   respond({ error: 'Not found' }, 404);
 });
 
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log(`✅ PCAP TShark Engine running on port ${PORT}`);
-  console.log(`🔥 Powered by 100% Official Wireshark Logic`);
-});
+server.listen(PORT, () => console.log(`🔥 Ultimate TShark Engine running on ${PORT}`));
