@@ -710,15 +710,66 @@ const VALID_TOOLS = new Set([
   'filter_large_packets', 'get_vulnerability_report', 'domain_lookup',
   'search_http_objects', 'get_tls_sni', 'get_quic_traffic', 'get_capture_info', 'fingerprint_os', 'get_timeline', 'none',]);
 
+// ── Capture context builder ────────────────────────────────────
+// Produces a compact but rich text snapshot of the capture so every
+// AI call is fully context-aware without sending raw packet data.
+function buildCaptureContext(packets, protocols, session) {
+  const ipCount = {};
+  let totalBytes = 0;
+  let minTs = Infinity, maxTs = -Infinity;
+  const portsUsed = new Set();
+  const publicIps = new Set();
+
+  for (const pk of packets) {
+    if (pk.src_ip) ipCount[pk.src_ip] = (ipCount[pk.src_ip] || 0) + pk.length;
+    totalBytes += pk.length;
+    if (pk.timestamp < minTs) minTs = pk.timestamp;
+    if (pk.timestamp > maxTs) maxTs = pk.timestamp;
+    if (pk.dst_port) portsUsed.add(pk.dst_port);
+    if (pk.src_port) portsUsed.add(pk.src_port);
+    for (const ip of [pk.src_ip, pk.dst_ip]) {
+      if (ip && !isPrivateIP(ip)) publicIps.add(ip);
+    }
+  }
+
+  const topIps = Object.entries(ipCount)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([ip, bytes]) => `${ip} (${(bytes / 1024).toFixed(1)}KB)`);
+
+  const duration = (isFinite(minTs) && isFinite(maxTs)) ? Math.round(maxTs - minTs) : 0;
+  const vulnPortsPresent = [...portsUsed].filter(p => VULNERABLE_PORTS[p]).map(p => `${p}(${VULNERABLE_PORTS[p].risk})`);
+  const protoList = Object.entries(protocols).sort((a, b) => b[1] - a[1]).map(([p, c]) => `${p}:${c}`).join(', ');
+
+  return [
+    `File: ${session?.filename || 'unknown'} | Packets: ${packets.length} | Duration: ${duration}s | Size: ${(totalBytes / 1024).toFixed(1)}KB`,
+    `Protocols: ${protoList}`,
+    `Top talkers: ${topIps.join(', ')}`,
+    `Public IPs seen: ${[...publicIps].slice(0, 8).join(', ') || 'none'}`,
+    `Vulnerable ports in use: ${vulnPortsPresent.join(', ') || 'none detected'}`,
+    `HTTP objects extracted: ${session?.httpObjects?.length || 0}`,
+    `Has plaintext HTTP: ${(protocols['HTTP'] || 0) > 0 ? 'YES' : 'no'}`,
+    `Has HTTPS/TLS: ${(protocols['HTTPS'] || 0) > 0 || (protocols['TLS'] || 0) > 0 ? 'YES' : 'no'}`,
+    `Has QUIC: ${(protocols['QUIC'] || 0) > 0 ? 'YES' : 'no'}`,
+    `Has DNS: ${(protocols['DNS'] || 0) > 0 ? 'YES' : 'no'}`,
+  ].join('\n');
+}
+
 // ── Dynamic agent ──────────────────────────────────────────────
-async function dynamicAgent(userPrompt, packets, session) {
+async function dynamicAgent(userPrompt, packets, session, conversationHistory = []) {
   const protocols = buildProtocolMap(packets);
 
-  const toolSchema = `Available tools (respond ONLY with valid JSON, no markdown):
-- get_timeline → {} (use when user asks about timeline, sequence of events, browsing behavior, or time-based analysis)
-- get_summary → {}
-  (use when user asks about overview, total packets, duration, etc.)
+  // Build a rich capture context snapshot so the AI always knows what's in the file
+  const captureContext = buildCaptureContext(packets, protocols, session);
 
+  const toolSchema = `You are an expert network security analyst AI with deep knowledge of TCP/IP, Wireshark, intrusion detection, and malware analysis. You are analysing a live packet capture.
+
+CAPTURE CONTEXT (always consider this before answering):
+${captureContext}
+
+Available tools (respond ONLY with valid JSON, no markdown):
+- get_timeline → {} (use when user asks about timeline, sequence of events, browsing behavior, or time-based analysis)
+- get_summary → {} (use when user asks about overview, total packets, duration, etc.)
 - filter_by_port → {"port": number}
 - filter_by_ip → {"ip": "x.x.x.x"}
 - filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"FTP"|"SSH"...}
@@ -736,18 +787,29 @@ async function dynamicAgent(userPrompt, packets, session) {
 - get_quic_traffic → {} (use when user asks about QUIC, HTTP/3, or UDP-based encrypted traffic)
 - none → {}
 
-Capture: ${packets.length} packets. Protocols: ${JSON.stringify(protocols)}.
+IMPORTANT CONTEXT-AWARENESS RULES:
+- If the user refers to something mentioned earlier (e.g. "that IP", "those packets", "tell me more"), use conversation history to resolve what they mean.
+- If the user asks a follow-up like "why?" or "is that dangerous?", pick the same tool as before but enrich the explanation — or use "none" with a deep explanation.
+- If the user asks something that combines two tools (e.g. "show DNS and also check for scans"), pick the most relevant single tool and mention you can do the other too.
+- Never ignore prior conversation context.
+
 Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
 
   let toolName = 'get_summary';
   let toolParams = {};
 
   if (GROQ_API_KEY) {
+    // Build messages: system prompt + last 6 turns of history + current user message
+    const historyMessages = (conversationHistory || []).slice(-6).map(turn => ({
+      role: turn.role,
+      content: turn.content,
+    }));
+
     const decision = await groqRequest([
       { role: 'system', content: toolSchema },
+      ...historyMessages,
       { role: 'user', content: userPrompt },
-    ], 100);
-    if (decision) {
+    ], 150); if (decision) {
       try {
         // Strip any markdown fences the model may have added despite instructions
         const cleaned = decision.replace(/```(?:json)?|```/g, '').trim();
@@ -827,10 +889,19 @@ Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
     return '';
   })();
 
+  // Include last 4 turns so the explanation is aware of prior context
+  const historyForExplanation = (conversationHistory || []).slice(-4).map(turn => ({
+    role: turn.role,
+    content: turn.content,
+  }));
+
   const explanation = await groqRequest([
     {
       role: 'system',
-      content: `You are a network security expert. Explain findings conversationally in plain English. No markdown, no bullet points, no asterisks. Be specific with numbers and IPs. Under 200 words.
+      content: `You are a senior network security analyst. You are mid-conversation with a user analysing a packet capture. Explain findings conversationally in plain English. No markdown, no bullet points, no asterisks. Be specific with numbers and IPs. Under 220 words.
+
+CAPTURE CONTEXT:
+${buildCaptureContext(packets, buildProtocolMap(packets), session)}
 
 CRITICAL NETWORKING RULES — never violate these:
 - Port 80 and 443 are ALWAYS destination ports on servers.
@@ -839,20 +910,35 @@ CRITICAL NETWORKING RULES — never violate these:
 - QUIC is UDP over port 443 and is NOT the same as HTTPS (TCP/TLS).
 - Always distinguish HTTP (plaintext), HTTPS (TLS), and QUIC correctly.
 - Never assume all traffic is encrypted unless explicitly TLS/QUIC.
+- If the user said "that IP" or "those packets", resolve what they mean from conversation history.
+- End your response with one smart follow-up question the user might want to ask next, prefixed exactly with "FOLLOWUP:" on a new line.
 
 ${liveEnrichment ? `\nLive threat intel: ${liveEnrichment}` : ''}${protocolHint}`,
     },
+    ...historyForExplanation,
     {
       role: 'user',
-      content: `User asked: "${userPrompt}"\nTool: ${toolName}\nResult: ${JSON.stringify(resultSummary)}\nRaw: ${toolResult.response}\n\nExplain conversationally.`,
+      content: `User asked: "${userPrompt}"\nTool used: ${toolName}\nTool result: ${JSON.stringify(resultSummary)}\nRaw summary: ${toolResult.response}\n\nExplain conversationally, reference prior conversation if relevant.`,
     },
-  ], 512);
+  ], 600);
+
+  // Extract FOLLOWUP line the model appended, strip it from main response
+  let finalExplanation = explanation || toolResult.response;
+  let followupSuggestion = null;
+  if (finalExplanation) {
+    const followupMatch = finalExplanation.match(/\nFOLLOWUP:\s*(.+)$/);
+    if (followupMatch) {
+      followupSuggestion = followupMatch[1].trim();
+      finalExplanation = finalExplanation.replace(/\nFOLLOWUP:\s*.+$/, '').trim();
+    }
+  }
 
   return {
     tool_called: toolName,
     parameters: toolParams,
     result: toolResult.result,
-    response: explanation || toolResult.response,
+    response: finalExplanation,
+    followup: followupSuggestion,
   };
 }
 
@@ -1947,7 +2033,7 @@ const server = http.createServer(async (req, res) => {
       } catch {
         return respond({ error: 'Invalid JSON body' }, 400);
       }
-      const { prompt, session_id } = parsed || {};
+      const { prompt, session_id, history } = parsed || {};
       if (!isValidSessionId(session_id)) return respond({ error: 'Invalid session_id' }, 400);
       const session = sessions.get(session_id);
       if (!session) return respond({ error: 'Session not found' }, 404);
@@ -1955,7 +2041,19 @@ const server = http.createServer(async (req, res) => {
       // strings containing system-prompt override attempts.
       const safePrompt = sanitizePrompt(prompt);
       if (!safePrompt) return respond({ error: 'Invalid or empty prompt' }, 400);
-      const result = await dynamicAgent(safePrompt, session.packets, session);
+
+      // Sanitize history: only allow role/content strings, max 10 turns, max 300 chars per content
+      const safeHistory = Array.isArray(history)
+        ? history
+          .filter(h => h && typeof h.role === 'string' && typeof h.content === 'string')
+          .slice(-10)
+          .map(h => ({
+            role: h.role === 'assistant' ? 'assistant' : 'user',
+            content: h.content.slice(0, 300),
+          }))
+        : [];
+
+      const result = await dynamicAgent(safePrompt, session.packets, session, safeHistory);
 
       return respond(result, 200);
     } catch (e) {
