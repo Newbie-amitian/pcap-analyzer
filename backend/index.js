@@ -794,8 +794,25 @@ Output ONLY: {"tool": "tool_name", "params": {}}`;
 
   if (GROQ_API_KEY) {
     const decision = await groqRequest([
-      { role: 'user', content: toolSchema },
-    ], 80); if (decision) {
+      {
+        role: 'system',
+        content: `You are a strict JSON tool selector.
+Return ONLY valid JSON like:
+{"tool": "tool_name", "params": {}}
+
+Do NOT add explanations.
+Do NOT add markdown.
+Do NOT return anything except JSON.`,
+      },
+      {
+        role: 'system',
+        content: toolSchema,
+      },
+      {
+        role: 'user',
+        content: userPrompt,
+      },
+    ], 120); if (decision) {
       try {
         // Strip any markdown fences the model may have added despite instructions
         const cleaned = decision.replace(/```(?:json)?|```/g, '').trim();
