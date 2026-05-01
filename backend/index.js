@@ -149,6 +149,29 @@ const VULNERABLE_PORTS = {
   27017: { risk: 'CRITICAL', reason: 'MongoDB with no auth — full DB exposure risk' },
 };
 
+// ── DGA / suspicious domain scorer ────────────────────────────
+function scoreDomainSuspicion(domain) {
+  const parts = domain.split('.');
+  const sld = parts[parts.length - 2] || '';
+  const flags = [];
+
+  if (sld.length <= 3) flags.push('very_short_sld');
+
+  if (sld.length > 3) {
+    const vowels = (sld.match(/[aeiou]/gi) || []).length;
+    if (1 - vowels / sld.length > 0.75) flags.push('high_consonant_ratio');
+  }
+
+  if (parts.length > 4) flags.push('deep_subdomain');
+
+  const digits = (sld.match(/\d/g) || []).length;
+  if (digits / sld.length > 0.4) flags.push('high_digit_ratio');
+
+  const uncommon = (sld.match(/[xzqjkv]/gi) || []).length;
+  if (uncommon / sld.length > 0.4) flags.push('high_uncommon_chars');
+
+  return flags;
+}
 // ── Tool executor ──────────────────────────────────────────────
 function runTool(toolName, params, packets) {
   switch (toolName) {
@@ -189,11 +212,18 @@ function runTool(toolName, params, packets) {
 
         // FIX 1: clamp duration to at least 1 second so pps is stable;
         // skip pps-based detection entirely when the window is too short.
-        const rawDuration = sortedTs.length > 1 ? sortedTs[sortedTs.length - 1] - sortedTs[0] : 0;
-        const duration = Math.max(1, rawDuration);
-        const pps = d.timestamps.length / duration;
-        // Only use pps as a signal when we have enough time to measure it reliably
-        const ppsReliable = rawDuration >= 1;
+        const rawDuration = sortedTs.length > 1
+          ? sortedTs[sortedTs.length - 1] - sortedTs[0]
+          : 0;
+
+        // convert ms → seconds safely
+        const durationSec = Math.max(rawDuration / 1000, 1);
+
+        const pps = d.timestamps.length / durationSec;
+
+        // only trust PPS if window is meaningful (>= 2 sec)
+        const ppsReliable = rawDuration >= 2000;
+
 
         // 5-second sliding window: count max packets seen in any 5s span
         let maxInWindow = 0;
@@ -206,7 +236,7 @@ function runTool(toolName, params, packets) {
         const isSynScan = synOnlyPorts > 10;
         const isWideScan = totalPorts > 15;
         // FIX 1: guard pps check behind ppsReliable flag
-        const isRateScan = ppsReliable && pps > 50 && totalPorts > 5;
+        const isRateScan = ppsReliable && pps > 80 && totalPorts > 8;
         const isWindowScan = maxInWindow > 10;
 
         if (isSynScan || isWideScan || isRateScan || isWindowScan) {
@@ -237,19 +267,26 @@ function runTool(toolName, params, packets) {
 
       for (const pk of result) {
         if (!pk.payload_preview) continue;
-        const matches = pk.payload_preview.match(DOMAIN_RE);
-        if (!matches) continue;
+
+        let matches = [];
+
+        if (pk.dns_query) {
+          matches.push(pk.dns_query);
+        } else if (pk.payload_preview) {
+          matches = pk.payload_preview.match(DOMAIN_RE) || [];
+        } if (!matches) continue;
+
         for (const d of matches) {
           const parts = d.split('.');
-          if (parts.length < 2) continue;
-          if (parts.every(p => /^\d+$/.test(p))) continue; // skip IPv4-looking strings
+          if (parts.length < 2 || parts.some(p => p.length === 0)) continue;
+          if (/^\d+$/.test(parts[parts.length - 1])) continue; if (parts.every(p => /^\d+$/.test(p))) continue;
           if (parts[parts.length - 1].length < 2) continue;
+
           const key = d.toLowerCase();
           domains[key] = (domains[key] || 0) + 1;
         }
       }
 
-      // Attach the first matched domain to each packet so the UI table can show it
       const enrichedPackets = result.slice(0, 50).map(pk => {
         const m = pk.payload_preview?.match(DOMAIN_RE);
         const queried_domain = m
@@ -258,18 +295,23 @@ function runTool(toolName, params, packets) {
             return p.length >= 2 && !p.every(x => /^\d+$/.test(x));
           }) ?? null
           : null;
-        return { ...pk, queried_domain: queried_domain?.toLowerCase() ?? null };
+
+        return {
+          ...pk,
+          queried_domain: queried_domain?.toLowerCase() ?? null,
+        };
       });
 
       return {
         result: {
           packets: enrichedPackets,
-          top_domains: Object.entries(domains).sort((a, b) => b[1] - a[1]).slice(0, 15),
+          top_domains: Object.entries(domains)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 15),
         },
         response: `Found ${result.length} DNS packets.`,
       };
     }
-
     case 'get_tls_sni': {
       // SNI hostnames live in the TLS ClientHello plaintext even though the
       // session is encrypted. They appear in payload_preview because the parser
@@ -283,14 +325,24 @@ function runTool(toolName, params, packets) {
         // byte (0x16 == 22 decimal shows as a non-printable char replaced by '.'
         // by the parser, so we check dst_port instead).
         if (pk.dst_port !== 443) continue;
-        const matches = pk.payload_preview.match(DOMAIN_RE);
+
+        // Only trust actual TLS-marked packets if available
+        if (pk.protocol !== 'TLS' && pk.protocol !== 'TCP') continue;
+
+        const matches = pk.payload_preview?.match(DOMAIN_RE) || [];
         if (!matches) continue;
         for (const d of matches) {
+          if (!d || typeof d !== 'string') continue;
+
           const parts = d.split('.');
           if (parts.length < 2) continue;
-          if (parts.every(p => /^\d+$/.test(p))) continue;
+          if (!/^[a-zA-Z]/.test(parts[0])) continue;
+          if (parts.some(p => p.length === 0)) continue; if (parts.every(p => /^\d+$/.test(p))) continue;
           if (parts[parts.length - 1].length < 2) continue;
-          const key = d.toLowerCase();
+
+          const key = d.toLowerCase().trim();
+          if (!key) continue;
+
           sniMap[key] = (sniMap[key] || 0) + 1;
         }
       }
@@ -310,24 +362,76 @@ function runTool(toolName, params, packets) {
         else categories.other.push(domain);
       }
 
+      // TLS version tally (requires Fix #2: packet.tls_version must exist)
+      const TLS_VERSION_NAMES = {
+        0x0303: 'TLS 1.2',
+        0x0304: 'TLS 1.3',
+        0x0302: 'TLS 1.1',
+        0x0301: 'TLS 1.0'
+      };
+
+      const tlsVersionCounts = {};
+      for (const pk of packets) {
+        if (pk.tls_version) {
+          const label =
+            TLS_VERSION_NAMES[pk.tls_version] ||
+            `Unknown (0x${pk.tls_version.toString(16)})`;
+
+          tlsVersionCounts[label] =
+            (tlsVersionCounts[label] || 0) + 1;
+        }
+      }
+
+      const dominantTlsVersion =
+        Object.entries(tlsVersionCounts)
+          .sort((a, b) => b[1] - a[1])[0]?.[0] || 'Unknown';
+
+      // Score suspicious domains (skip known safe ones)
+      const suspicious = [];
+
+      const KNOWN_SAFE = /google|microsoft|windows|bing|gstatic|cloudflare|akamai|youtube|facebook|twitter|amazon|apple|mozilla/i;
+
+      for (const [domain] of sorted) {
+        if (KNOWN_SAFE.test(domain)) continue;
+
+        const flags = scoreDomainSuspicion(domain);
+        if (flags.length > 0) {
+          suspicious.push({ domain, flags });
+        }
+      }
+
       return {
-        result: { sni_list: sorted, categories, total: sorted.length },
-        response: `Found ${sorted.length} unique HTTPS destinations via TLS SNI.`,
+        result: {
+          sni_list: sorted,
+          categories,
+          total: sorted.length,
+          suspicious,
+          tls_versions: tlsVersionCounts,
+          dominant_tls_version: dominantTlsVersion,
+        },
+        response:
+          `Found ${sorted.length} HTTPS destinations via TLS SNI. ` +
+          `${suspicious.length} look suspicious or DGA-like. ` +
+          `Dominant TLS version: ${dominantTlsVersion}.`,
       };
     }
 
     case 'get_quic_traffic': {
-      // QUIC runs over UDP. The parser tags these as 'UDP' (not 'QUIC') because
-      // the protocol map only covers well-known ports. QUIC uses UDP/443 (HTTPS)
-      // and UDP/80, but also ephemeral ports. We detect it by:
-      //  1. UDP packets on port 443 (most common — Google, Cloudflare, Microsoft)
-      //  2. UDP packets whose payload starts with a QUIC Initial byte (0xc0 range)
-      //     which shows as a non-printable '.' in payload_preview — so we rely on port.
       const quicPackets = packets.filter(pk => {
-        if (pk.protocol !== 'UDP' && pk.protocol !== 'HTTPS') return false;
-        if (pk.dst_port === 443 || pk.src_port === 443) return true;
-        if (pk.dst_port === 80 || pk.src_port === 80) return true;
-        return false;
+        // QUIC is typically UDP/443 (HTTP/3)
+        const isUdp443 =
+          pk.protocol === 'UDP' &&
+          (pk.dst_port === 443 || pk.src_port === 443);
+
+        const protocolTagged = pk.protocol === 'QUIC';
+
+        // heuristic fallback (optional)
+        const largeUdpPacket =
+          pk.protocol === 'UDP' &&
+          pk.length > 1200 &&
+          pk.dst_port === 443;
+
+        return protocolTagged || isUdp443 || largeUdpPacket;
       });
 
       const ipv4 = quicPackets.filter(pk => pk.src_ip && !pk.src_ip.includes(':'));
@@ -340,7 +444,7 @@ function runTool(toolName, params, packets) {
           ipv6_count: ipv6.length,
           sample: quicPackets.slice(0, 20),
         },
-        response: `Found ${quicPackets.length} QUIC packets (${ipv6.length} over IPv6, ${ipv4.length} over IPv4).`,
+        response: `Found ${quicPackets.length} QUIC packets (${ipv6.length} IPv6, ${ipv4.length} IPv4).`,
       };
     }
 
@@ -399,7 +503,7 @@ function runTool(toolName, params, packets) {
 
         // NBNS/NetBIOS carries hostname in plaintext
         if (pk.protocol === 'NetBIOS' && preview.length > 0) {
-          const nb = preview.match(/([A-Z0-9\-]{1,15})\s/);
+          const nb = preview.match(/\b([A-Z0-9\-]{3,15})\b/);
           if (nb) { hostnames.add(nb[1]); windowsScore += 2; }
         }
 
@@ -409,8 +513,8 @@ function runTool(toolName, params, packets) {
           if (WINDOWS_RE.test(preview)) { windowsScore++; evidence.push(`DNS: ${preview}`); }
           if (APPLE_RE.test(preview)) { appleScore++; evidence.push(`DNS: ${preview}`); }
           if (LINUX_RE.test(preview)) { linuxScore++; evidence.push(`DNS: ${preview}`); }
-          if (/DESKTOP-|WIN\d\d/.test(preview.toUpperCase())) {
-            windowsScore += 3;
+          if (/\bDESKTOP-[A-Z0-9]+|\bWIN-[A-Z0-9]+/.test(preview.toUpperCase())) {
+            windowsScore += 2;
             evidence.push(`Windows hostname in DNS: ${preview}`);
           }
         }
@@ -440,6 +544,67 @@ function runTool(toolName, params, packets) {
         response: `OS fingerprint: likely ${topOS} (confidence: ${confidence}). Hostnames found: ${[...hostnames].join(', ') || 'none'}.`,
       };
     }
+    case 'get_timeline': {
+      let minTs = Infinity;
+
+      for (const pk of packets) {
+        if (pk.timestamp < minTs) minTs = pk.timestamp;
+      }
+
+      if (!isFinite(minTs)) {
+        return { result: [], response: 'No timestamp data available.' };
+      }
+
+      const buckets = {};
+
+      for (const pk of packets) {
+        const rel = pk.timestamp - minTs;
+        const bucket = Math.floor(rel / 5) * 5;
+
+        if (!buckets[bucket]) {
+          buckets[bucket] = {
+            protocols: new Set(),
+            dns: new Set(),
+            http: []
+          };
+        }
+
+        buckets[bucket].protocols.add(pk.protocol);
+
+        if (pk.protocol === 'DNS' && pk.payload_preview) {
+          buckets[bucket].dns.add(pk.payload_preview.slice(0, 60));
+        }
+
+        if (
+          pk.payload_preview &&
+          (
+            pk.protocol === 'HTTP' ||
+            KNOWN_HTTP_PORTS.has(pk.dst_port) ||
+            KNOWN_HTTP_PORTS.has(pk.src_port)
+          )
+        ) {
+          const line = pk.payload_preview.slice(0, 80);
+          if (/^(GET|POST|PUT|HEAD)/.test(line)) {
+            buckets[bucket].http.push(line);
+          }
+        }
+      }
+
+      const timeline = Object.entries(buckets)
+        .sort((a, b) => Number(a[0]) - Number(b[0]))
+        .map(([sec, data]) => ({
+          time_offset_seconds: Number(sec),
+          protocols_active: [...data.protocols],
+          dns_queries: [...data.dns].slice(0, 5),
+          http_activity: [...new Set(data.http)].slice(0, 3),
+        }));
+
+      return {
+        result: timeline,
+        response: `Timeline built with ${timeline.length} windows.`,
+      };
+    }
+
     case 'none': {
       return { result: null, response: '' };
     }
@@ -477,6 +642,18 @@ function runTool(toolName, params, packets) {
     }
     case 'get_summary':
     default: {
+      if (!packets.length) {
+        return {
+          result: {
+            total_packets: 0,
+            protocols: {},
+            top_ips: [],
+            total_bytes: 0,
+            duration_seconds: 0,
+          },
+          response: "Empty capture file.",
+        };
+      }
       const protocols = buildProtocolMap(packets);
       const ipCount = {};
       let totalBytes = 0;
@@ -531,14 +708,18 @@ const VALID_TOOLS = new Set([
   'get_summary', 'filter_by_port', 'filter_by_ip', 'filter_by_protocol',
   'find_credentials', 'detect_port_scan', 'get_dns_queries', 'get_top_talkers',
   'filter_large_packets', 'get_vulnerability_report', 'domain_lookup',
-  'search_http_objects', 'get_tls_sni', 'get_quic_traffic', 'get_capture_info', 'fingerprint_os', 'none',]);
+  'search_http_objects', 'get_tls_sni', 'get_quic_traffic', 'get_capture_info', 'fingerprint_os', 'get_timeline', 'none',]);
 
 // ── Dynamic agent ──────────────────────────────────────────────
 async function dynamicAgent(userPrompt, packets, session) {
   const protocols = buildProtocolMap(packets);
 
   const toolSchema = `Available tools (respond ONLY with valid JSON, no markdown):
-- get_summary → {} (use when user asks about protocols present, overview of capture, total packets, duration, traffic summary, or any general "what is in this file" question)- filter_by_port → {"port": number}
+- get_timeline → {} (use when user asks about timeline, sequence of events, browsing behavior, or time-based analysis)
+- get_summary → {}
+  (use when user asks about overview, total packets, duration, etc.)
+
+- filter_by_port → {"port": number}
 - filter_by_ip → {"ip": "x.x.x.x"}
 - filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"FTP"|"SSH"...}
 - find_credentials → {}
@@ -551,7 +732,8 @@ async function dynamicAgent(userPrompt, packets, session) {
 - search_http_objects → {"query": "<filename or url fragment>"}
 - get_tls_sni → {} (use when user asks about HTTPS sites visited, TLS connections, SNI names, encrypted traffic destinations)
 - get_capture_info → {} (use when user asks about file format, link layer type, pcap version, capture metadata)
-- fingerprint_os → {} (use when user asks about operating system, device type, what OS is running, identify the host)- get_quic_traffic → {} (use when user asks about QUIC, HTTP/3, or UDP-based encrypted traffic)
+- fingerprint_os → {} (use when user asks about operating system, device type, what OS is running, identify the host)
+- get_quic_traffic → {} (use when user asks about QUIC, HTTP/3, or UDP-based encrypted traffic)
 - none → {}
 
 Capture: ${packets.length} packets. Protocols: ${JSON.stringify(protocols)}.
@@ -648,7 +830,17 @@ Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
   const explanation = await groqRequest([
     {
       role: 'system',
-      content: `You are a network security expert. Explain findings conversationally in plain English. No markdown, no bullet points, no asterisks. Be specific with numbers and IPs. Under 200 words.${liveEnrichment ? `\nLive threat intel: ${liveEnrichment}` : ''}${protocolHint}`,
+      content: `You are a network security expert. Explain findings conversationally in plain English. No markdown, no bullet points, no asterisks. Be specific with numbers and IPs. Under 200 words.
+
+CRITICAL NETWORKING RULES — never violate these:
+- Port 80 and 443 are ALWAYS destination ports on servers.
+- Clients use ephemeral source ports (>1024) to connect to servers.
+- Never say traffic "comes from port 80/443" — that is incorrect.
+- QUIC is UDP over port 443 and is NOT the same as HTTPS (TCP/TLS).
+- Always distinguish HTTP (plaintext), HTTPS (TLS), and QUIC correctly.
+- Never assume all traffic is encrypted unless explicitly TLS/QUIC.
+
+${liveEnrichment ? `\nLive threat intel: ${liveEnrichment}` : ''}${protocolHint}`,
     },
     {
       role: 'user',
@@ -779,6 +971,18 @@ function parsePcap(buffer) {
 
           packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'TCP';
 
+          // Extract TLS version from ClientHello
+          packet.tls_version = null;
+          if (
+            (packet.dst_port === 443 || packet.src_port === 443) &&
+            packet.raw_payload && packet.raw_payload.length >= 11 &&
+            packet.raw_payload[0] === 0x16 &&
+            packet.raw_payload[5] === 0x01
+          ) {
+            const ver = (packet.raw_payload[9] << 8) | packet.raw_payload[10];
+            packet.tls_version = ver;
+          }
+
           // FIX 7: set unified HTTP candidate flag in the parser
           if (
             KNOWN_HTTP_PORTS.has(packet.src_port) ||
@@ -791,7 +995,15 @@ function parsePcap(buffer) {
         } else if (ipProto === 17 && packetData.length >= transportStart + 8) {
           packet.src_port = packetData.readUInt16BE(transportStart);
           packet.dst_port = packetData.readUInt16BE(transportStart + 2);
-          packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'UDP';
+
+          // QUIC runs over UDP/443 — tag it separately from TLS-over-TCP HTTPS
+          if (packet.dst_port === 443 || packet.src_port === 443) {
+            packet.protocol = 'QUIC';
+          } else {
+            packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'UDP';
+          }
+
+          // Parse DNS question section labels into a readable domain string
 
           // Parse DNS question section labels into a readable domain string
           // so the regex in get_dns_queries can match them from payload_preview.
@@ -888,10 +1100,15 @@ function parsePcap(buffer) {
           }
 
         } else if (nextHeader === 17 && packetData.length >= ip6TransportStart + 8) {
-          // UDP over IPv6
           packet.src_port = packetData.readUInt16BE(ip6TransportStart);
           packet.dst_port = packetData.readUInt16BE(ip6TransportStart + 2);
-          packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'UDP';
+
+          // QUIC runs over UDP/443 — tag it separately from TLS-over-TCP HTTPS
+          if (packet.dst_port === 443 || packet.src_port === 443) {
+            packet.protocol = 'QUIC';
+          } else {
+            packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'UDP';
+          }
 
           const rawSlice = packetData.slice(ip6TransportStart + 8);
           if (rawSlice.length > 0) {
