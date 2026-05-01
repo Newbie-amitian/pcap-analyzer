@@ -368,6 +368,78 @@ function runTool(toolName, params, packets) {
       }
       return { result: Object.values(byPort), response: `Found traffic on ${Object.keys(byPort).length} vulnerable port(s) across ${result.length} packets.` };
     }
+    case 'get_capture_info': {
+      // Metadata is stored on the session; packets carry timestamp/length info
+      const minTs = Math.min(...packets.map(p => p.timestamp).filter(isFinite));
+      const maxTs = Math.max(...packets.map(p => p.timestamp).filter(isFinite));
+      const result = {
+        format: 'pcap (libpcap)',
+        link_layer: 'Ethernet (1)',
+        version: '2.4',
+        total_packets: packets.length,
+        duration_seconds: isFinite(minTs) && isFinite(maxTs) ? Math.round(maxTs - minTs) : 0,
+        snapshot_length: 262144,
+      };
+      return { result, response: 'Capture file metadata retrieved.' };
+    }
+    case 'fingerprint_os': {
+      // Collect hostname clues from NBNS, mDNS, DHCP, and DNS payload_previews
+      const hostnames = new Set();
+      const domainsSeen = new Set();
+      const WINDOWS_RE = /microsoft|windows|msft|bing\.com|skype|wns\.windows|windowsupdate|ntpserver|netlogon/i;
+      const APPLE_RE = /apple\.com|icloud|itunes|_apple|bonjour/i;
+      const LINUX_RE = /ubuntu|debian|fedora|centos|archlinux/i;
+
+      let windowsScore = 0, appleScore = 0, linuxScore = 0;
+      const evidence = [];
+
+      for (const pk of packets) {
+        if (!pk.payload_preview) continue;
+        const preview = pk.payload_preview;
+
+        // NBNS/NetBIOS carries hostname in plaintext
+        if (pk.protocol === 'NetBIOS' && preview.length > 0) {
+          const nb = preview.match(/([A-Z0-9\-]{1,15})\s/);
+          if (nb) { hostnames.add(nb[1]); windowsScore += 2; }
+        }
+
+        // DNS payload_preview now contains dotted domain (after Fix 2)
+        if (pk.protocol === 'DNS' && preview.includes('.')) {
+          domainsSeen.add(preview.toLowerCase());
+          if (WINDOWS_RE.test(preview)) { windowsScore++; evidence.push(`DNS: ${preview}`); }
+          if (APPLE_RE.test(preview)) { appleScore++; evidence.push(`DNS: ${preview}`); }
+          if (LINUX_RE.test(preview)) { linuxScore++; evidence.push(`DNS: ${preview}`); }
+          if (/DESKTOP-|WIN\d\d/.test(preview.toUpperCase())) {
+            windowsScore += 3;
+            evidence.push(`Windows hostname in DNS: ${preview}`);
+          }
+        }
+
+        // mDNS .local hostnames
+        if (preview.toLowerCase().includes('.local')) {
+          const local = preview.match(/([a-zA-Z0-9\-]+)\.local/i);
+          if (local) { hostnames.add(local[1]); }
+          if (/DESKTOP-|WIN/i.test(preview)) windowsScore += 2;
+        }
+      }
+
+      const topOS = windowsScore >= appleScore && windowsScore >= linuxScore ? 'Windows'
+        : appleScore >= linuxScore ? 'macOS/iOS' : 'Linux';
+      const confidence = Math.max(windowsScore, appleScore, linuxScore) > 3 ? 'High' : 'Low';
+
+      return {
+        result: {
+          likely_os: topOS,
+          confidence,
+          windows_score: windowsScore,
+          apple_score: appleScore,
+          linux_score: linuxScore,
+          hostnames: [...hostnames],
+          evidence: evidence.slice(0, 10),
+        },
+        response: `OS fingerprint: likely ${topOS} (confidence: ${confidence}). Hostnames found: ${[...hostnames].join(', ') || 'none'}.`,
+      };
+    }
     case 'none': {
       return { result: null, response: '' };
     }
@@ -459,16 +531,14 @@ const VALID_TOOLS = new Set([
   'get_summary', 'filter_by_port', 'filter_by_ip', 'filter_by_protocol',
   'find_credentials', 'detect_port_scan', 'get_dns_queries', 'get_top_talkers',
   'filter_large_packets', 'get_vulnerability_report', 'domain_lookup',
-  'search_http_objects', 'get_tls_sni', 'get_quic_traffic', 'none',
-]);
+  'search_http_objects', 'get_tls_sni', 'get_quic_traffic', 'get_capture_info', 'fingerprint_os', 'none',]);
 
 // ── Dynamic agent ──────────────────────────────────────────────
 async function dynamicAgent(userPrompt, packets, session) {
   const protocols = buildProtocolMap(packets);
 
   const toolSchema = `Available tools (respond ONLY with valid JSON, no markdown):
-- get_summary → {}
-- filter_by_port → {"port": number}
+- get_summary → {} (use when user asks about protocols present, overview of capture, total packets, duration, traffic summary, or any general "what is in this file" question)- filter_by_port → {"port": number}
 - filter_by_ip → {"ip": "x.x.x.x"}
 - filter_by_protocol → {"protocol": "HTTP"|"DNS"|"TCP"|"UDP"|"ICMP"|"FTP"|"SSH"...}
 - find_credentials → {}
@@ -480,8 +550,9 @@ async function dynamicAgent(userPrompt, packets, session) {
 - domain_lookup → {"domain": "example.com"}
 - search_http_objects → {"query": "<filename or url fragment>"}
 - get_tls_sni → {} (use when user asks about HTTPS sites visited, TLS connections, SNI names, encrypted traffic destinations)
-- get_quic_traffic → {} (use when user asks about QUIC, HTTP/3, or UDP-based encrypted traffic)
-- none → {} (use for greetings, reactions like "wow"/"ok"/"thanks", or follow-up comments that need no data lookup)
+- get_capture_info → {} (use when user asks about file format, link layer type, pcap version, capture metadata)
+- fingerprint_os → {} (use when user asks about operating system, device type, what OS is running, identify the host)- get_quic_traffic → {} (use when user asks about QUIC, HTTP/3, or UDP-based encrypted traffic)
+- none → {}
 
 Capture: ${packets.length} packets. Protocols: ${JSON.stringify(protocols)}.
 Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
@@ -562,10 +633,22 @@ Respond ONLY with: {"tool": "tool_name", "params": {...}}`;
     };
   }
 
+  // Build a protocol-awareness hint so the model never claims 100% encrypted
+  // when plaintext HTTP packets exist in the capture.
+  const protocolHint = (() => {
+    const proto = buildProtocolMap(packets);
+    const httpCount = (proto['HTTP'] || 0);
+    const httpsCount = (proto['HTTPS'] || 0);
+    if (httpCount > 0 && httpsCount > 0) {
+      return ` IMPORTANT: This capture contains BOTH ${httpCount} plaintext HTTP packets AND ${httpsCount} HTTPS packets — never claim all traffic is encrypted.`;
+    }
+    return '';
+  })();
+
   const explanation = await groqRequest([
     {
       role: 'system',
-      content: `You are a network security expert. Explain findings conversationally in plain English. No markdown, no bullet points, no asterisks. Be specific with numbers and IPs. Under 200 words.${liveEnrichment ? `\nLive threat intel: ${liveEnrichment}` : ''}`,
+      content: `You are a network security expert. Explain findings conversationally in plain English. No markdown, no bullet points, no asterisks. Be specific with numbers and IPs. Under 200 words.${liveEnrichment ? `\nLive threat intel: ${liveEnrichment}` : ''}${protocolHint}`,
     },
     {
       role: 'user',
@@ -709,6 +792,27 @@ function parsePcap(buffer) {
           packet.src_port = packetData.readUInt16BE(transportStart);
           packet.dst_port = packetData.readUInt16BE(transportStart + 2);
           packet.protocol = PROTOCOL_MAP[packet.dst_port] || PROTOCOL_MAP[packet.src_port] || 'UDP';
+
+          // Parse DNS question section labels into a readable domain string
+          // so the regex in get_dns_queries can match them from payload_preview.
+          const udpPayload = packetData.slice(transportStart + 8);
+          if ((packet.dst_port === 53 || packet.src_port === 53) && udpPayload.length > 12) {
+            try {
+              const labels = [];
+              let pos = 12; // skip DNS fixed header (12 bytes)
+              while (pos < udpPayload.length) {
+                const len = udpPayload[pos];
+                if (len === 0) break;           // root label → end of name
+                if ((len & 0xc0) === 0xc0) break; // compression pointer → stop
+                if (len > 63 || pos + 1 + len > udpPayload.length) break;
+                labels.push(udpPayload.slice(pos + 1, pos + 1 + len).toString('ascii'));
+                pos += 1 + len;
+              }
+              if (labels.length > 0) {
+                packet.payload_preview = labels.join('.');
+              }
+            } catch (_) { /* leave payload_preview empty */ }
+          }
         } else if (ipProto === 1) {
           packet.protocol = 'ICMP';
         }
@@ -791,7 +895,25 @@ function parsePcap(buffer) {
 
           const rawSlice = packetData.slice(ip6TransportStart + 8);
           if (rawSlice.length > 0) {
-            packet.payload_preview = rawSlice.slice(0, 512).toString('utf8', 0, 512).replace(/[^\x20-\x7E]/g, '.'); packet.raw_payload = rawSlice;
+            // DNS: parse labels into dotted domain string for payload_preview
+            if ((packet.dst_port === 53 || packet.src_port === 53) && rawSlice.length > 12) {
+              try {
+                const labels = [];
+                let pos = 12;
+                while (pos < rawSlice.length) {
+                  const len = rawSlice[pos];
+                  if (len === 0) break;
+                  if ((len & 0xc0) === 0xc0) break;
+                  if (len > 63 || pos + 1 + len > rawSlice.length) break;
+                  labels.push(rawSlice.slice(pos + 1, pos + 1 + len).toString('ascii'));
+                  pos += 1 + len;
+                }
+                if (labels.length > 0) packet.payload_preview = labels.join('.');
+              } catch (_) { /* leave empty */ }
+            } else {
+              packet.payload_preview = rawSlice.slice(0, 512).toString('utf8', 0, 512).replace(/[^\x20-\x7E]/g, '.');
+            }
+            packet.raw_payload = rawSlice;
           }
 
         } else if (nextHeader === 58) {
