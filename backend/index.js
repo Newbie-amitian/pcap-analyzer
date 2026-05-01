@@ -1561,7 +1561,7 @@ const server = http.createServer(async (req, res) => {
   // ── HTTP Objects (Wireshark-style Export Objects) ──────────
   // FIX 2: Serve pre-extracted objects stored at upload time so we
   // never need raw_payload again after the session is created.
-  if (url === '/pcap/images' && method === 'GET') {
+  if (url.startsWith('/pcap/images') && method === 'GET') {
     const q = getQuery(url);
     if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
     const session = sessions.get(q.session_id);
