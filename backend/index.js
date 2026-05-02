@@ -1208,80 +1208,271 @@ async function getPortIntelligence(port) {
   };
 }
 
+// ── Time-based greeting helper ────────────────────────────────────────
+function getTimeBasedGreeting() {
+  const hour = new Date().getHours();
+  if (hour >= 5 && hour < 12) return 'Good morning';
+  if (hour >= 12 && hour < 17) return 'Good afternoon';
+  if (hour >= 17 && hour < 21) return 'Good evening';
+  return 'Hello';
+}
+
+// ── Check if message is a greeting ─────────────────────────────────────
+function isGreeting(text) {
+  const greetings = ['hello', 'hi', 'hey', 'hola', 'good morning', 'good afternoon', 
+    'good evening', 'good night', "what's up", 'whats up', 'howdy', 'greetings',
+    'bonjour', 'namaste', 'yo', 'sup'];
+  const lower = text.toLowerCase().trim();
+  return greetings.some(g => lower === g || lower.startsWith(g + ' ') || lower === g + '!' || lower === g + '.');
+}
+
+// ── Check if message is a compliment/thanks ─────────────────────────────
+function isCompliment(text) {
+  const compliments = ['good job', 'great job', 'well done', 'thanks', 'thank you', 
+    'awesome', 'amazing', 'fantastic', 'brilliant', 'excellent', 'you rock',
+    'you are amazing', 'you\'re amazing', 'love this', 'love it', 'helpful',
+    'you did great', 'nice work', 'great work', 'good work', 'appreciate'];
+  const lower = text.toLowerCase();
+  return compliments.some(c => lower.includes(c));
+}
+
+// ── Check if message is about the agent ────────────────────────────────
+function isAboutAgent(text) {
+  const aboutAgent = ['who are you', 'what are you', 'what can you do', 'your name',
+    'help me', 'how do you work', 'introduce yourself', 'tell me about yourself',
+    'what do you do', 'capabilities', 'features', 'how can you help'];
+  const lower = text.toLowerCase();
+  return aboutAgent.some(a => lower.includes(a));
+}
+
+// ── Check if asking for time ───────────────────────────────────────────
+function isAskingTime(text) {
+  const timePhrases = ['what time', 'current time', 'time is it', 'what\'s the time'];
+  const lower = text.toLowerCase();
+  return timePhrases.some(t => lower.includes(t));
+}
+
+// ── Check if asking how are you ────────────────────────────────────────
+function isHowAreYou(text) {
+  const phrases = ['how are you', 'how do you feel', 'how\'s it going', 'hows it going',
+    'how are things', 'how have you been', 'you doing', 'how is your day'];
+  const lower = text.toLowerCase();
+  return phrases.some(p => lower.includes(p));
+}
+
+// ── Generate natural response ──────────────────────────────────────────
+function generateNaturalResponse(prompt) {
+  const lower = prompt.toLowerCase().trim();
+  
+  // Greetings with time-based response
+  if (isGreeting(prompt)) {
+    const greeting = getTimeBasedGreeting();
+    return {
+      tool: 'chat',
+      response: `👋 ${greeting}!\n\n• I'm your PCAP Security Agent\n• I can analyze network traffic and find anomalies\n• Try asking me about: DNS queries, HTTP requests, TLS connections, or suspicious activity\n\nHow can I help you today?`
+    };
+  }
+  
+  // Compliments
+  if (isCompliment(prompt)) {
+    const responses = [
+      `😊 Thank you so much!\n\n• I'm glad I could help\n• Let me know if you need anything else\n• I'm always here to analyze your PCAP files!`,
+      `✨ That's very kind of you!\n\n• I appreciate the feedback\n• Feel free to ask me anything about your network traffic\n• Happy analyzing! 🕵️‍♂️`,
+      `🎉 Thanks!\n\n• Your feedback motivates me to do better\n• Got more packets to analyze? Let's go!`
+    ];
+    return { tool: 'chat', response: responses[Math.floor(Math.random() * responses.length)] };
+  }
+  
+  // How are you
+  if (isHowAreYou(prompt)) {
+    return {
+      tool: 'chat',
+      response: `🤖 I'm doing great, thank you for asking!\n\n• I've analyzed quite a few packets today\n• Ready to dig into your PCAP whenever you are\n• What would you like to discover?`
+    };
+  }
+  
+  // Asking time
+  if (isAskingTime(prompt)) {
+    const now = new Date();
+    return {
+      tool: 'chat',
+      response: `🕐 Current time: ${now.toLocaleTimeString()}\n\n• Date: ${now.toLocaleDateString()}\n• Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}\n\nNeed me to analyze some network traffic?`
+    };
+  }
+  
+  // About agent
+  if (isAboutAgent(prompt)) {
+    return {
+      tool: 'chat',
+      response: `🕵️‍♂️ I'm your PCAP Security Agent!\n\n**My Capabilities:**\n• 📊 Summarize network captures\n• 🔍 Find specific packets by protocol/IP/port\n• 🛡️ Detect vulnerabilities and risks\n• 🔐 Find credentials in plaintext\n• 🌐 Analyze DNS, HTTP, TLS traffic\n• ⚠️ Detect suspicious activity like port scans\n\n**Try asking:**\n• "Show me DNS queries"\n• "Find all HTTP requests"\n• "Detect port scanning"\n• "What protocols are used?"\n\nI use TShark (Wireshark's CLI) under the hood! 🦈`
+    };
+  }
+  
+  return null; // Not a natural conversation, fall through to PCAP analysis
+}
+
 // ── Local agent ────────────────────────────────────────────────────
 function localDynamicAgent(prompt) {
   const l = prompt.toLowerCase();
+  
+  // ═══════════════════════════════════════════════════════════════
+  // FIRST: Check for natural conversation (greetings, compliments, etc.)
+  // ═══════════════════════════════════════════════════════════════
+  const naturalResponse = generateNaturalResponse(prompt);
+  if (naturalResponse) {
+    return naturalResponse;
+  }
+  
+  // ═══════════════════════════════════════════════════════════════
+  // PCAP ANALYSIS TOOLS
+  // ═══════════════════════════════════════════════════════════════
   const portM = l.match(/port\s*(\d{1,5})/);
   const ipM = l.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
   const macM = l.match(/([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2})/i);
 
-  if (l.includes('hierarchy')) return { tool: 'stat', stat: 'io,phs' };
-  if (l.includes('timeline')) return { tool: 'stat', stat: 'io,stat,1' };
+  // Summary and overview
+  if (l.includes('summary') || l.includes('overview') || l.includes('summarize this') || l.includes('give me a summary')) 
+    return { tool: 'stat', stat: 'io,stat,0', response: '📊 **PCAP Summary**\n\nHere\'s an overview of your network capture:' };
+  
+  // Protocol counts
+  if (l.includes('protocol') && (l.includes('used') || l.includes('count') || l.includes('list') || l.includes('what protocol')))
+    return { tool: 'stat', stat: 'io,phs', response: '📋 **Protocol Breakdown**\n\nShowing all protocols detected in this capture:' };
+  
+  if (l.includes('hierarchy')) return { tool: 'stat', stat: 'io,phs', response: '📊 **Protocol Hierarchy**' };
+  if (l.includes('timeline')) return { tool: 'stat', stat: 'io,stat,1', response: '📈 **Traffic Timeline**' };
   if (l.includes('top talker') || l.includes('bandwidth') || l.includes('endpoint'))
-    return { tool: 'stat', stat: 'conv,ip' };
-  if (l.includes('expert') || l.includes('warning')) return { tool: 'stat', stat: 'expert' };
-  if (l.includes('summary') || l.includes('overview')) return { tool: 'stat', stat: 'io,stat,0' };
-  if (l.includes('vulnerab') || l.includes('risk')) return { tool: 'vuln' };
-  if (l.includes('retransmission')) return { tool: 'packets', filter: 'tcp.analysis.retransmission', fields: DEFAULT_FIELDS };
-  if (l.includes('out of order')) return { tool: 'packets', filter: 'tcp.analysis.out_of_order', fields: DEFAULT_FIELDS };
-  if (l.includes('zero window')) return { tool: 'packets', filter: 'tcp.analysis.zero_window', fields: DEFAULT_FIELDS };
-  if (l.includes('duplicate ack')) return { tool: 'packets', filter: 'tcp.analysis.duplicate_ack', fields: DEFAULT_FIELDS };
+    return { tool: 'stat', stat: 'conv,ip', response: '🌐 **Top Talkers**\n\nShowing IPs with most traffic:' };
+  if (l.includes('expert') || l.includes('warning')) return { tool: 'stat', stat: 'expert', response: '⚠️ **Expert Info & Warnings**' };
+  
+  // Vulnerability and risk
+  if (l.includes('vulnerab') || l.includes('risk') || l.includes('security') || l.includes('threat'))
+    return { tool: 'vuln', response: '🛡️ **Security & Vulnerability Analysis**\n\nAnalyzing ports for potential risks:' };
+  
+  // Suspicious traffic
+  if (l.includes('suspicious') || l.includes('anomaly') || l.includes('attack') || l.includes('malicious'))
+    return { tool: 'packets', filter: 'tcp.flags.syn == 1 && tcp.flags.ack == 0 || tcp.flags.reset == 1 || icmp', fields: DEFAULT_FIELDS, response: '🚨 **Suspicious Activity Detected**\n\nChecking for:\n• Port scans (SYN floods)\n• Connection resets\n• ICMP anomalies' };
+  
+  // TCP issues
+  if (l.includes('retransmission')) return { tool: 'packets', filter: 'tcp.analysis.retransmission', fields: DEFAULT_FIELDS, response: '🔄 **TCP Retransmissions**' };
+  if (l.includes('out of order')) return { tool: 'packets', filter: 'tcp.analysis.out_of_order', fields: DEFAULT_FIELDS, response: '📦 **Out of Order Packets**' };
+  if (l.includes('zero window')) return { tool: 'packets', filter: 'tcp.analysis.zero_window', fields: DEFAULT_FIELDS, response: '🪟 **Zero Window Packets**' };
+  if (l.includes('duplicate ack')) return { tool: 'packets', filter: 'tcp.analysis.duplicate_ack', fields: DEFAULT_FIELDS, response: '🔃 **Duplicate ACKs**' };
   if (l.includes('rst') || l.includes('reset'))
-    return { tool: 'packets', filter: 'tcp.flags.reset == 1', fields: DEFAULT_FIELDS };
+    return { tool: 'packets', filter: 'tcp.flags.reset == 1', fields: DEFAULT_FIELDS, response: '🔴 **TCP Reset Packets**' };
   if (l.includes('syn flood') || l.includes('port scan'))
-    return { tool: 'packets', filter: 'tcp.flags.syn == 1 && tcp.flags.ack == 0', fields: DEFAULT_FIELDS };
-  if (l.includes('http method') || l.includes('http request'))
-    return { tool: 'packets', filter: 'http.request', fields: [...DEFAULT_FIELDS, 'http.request.method', 'http.request.uri', 'http.host'] };
+    return { tool: 'packets', filter: 'tcp.flags.syn == 1 && tcp.flags.ack == 0', fields: DEFAULT_FIELDS, response: '🔍 **Port Scan Detection**\n\nShowing SYN packets (potential port scan):' };
+  
+  // HTTP
+  if (l.includes('http request') || l.includes('http method'))
+    return { tool: 'packets', filter: 'http.request', fields: [...DEFAULT_FIELDS, 'http.request.method', 'http.request.uri', 'http.host'], response: '🌐 **HTTP Requests**' };
   if (l.includes('http status') || l.includes('404') || l.includes('500'))
-    return { tool: 'packets', filter: 'http.response', fields: [...DEFAULT_FIELDS, 'http.response.code', 'http.response.phrase'] };
+    return { tool: 'packets', filter: 'http.response', fields: [...DEFAULT_FIELDS, 'http.response.code', 'http.response.phrase'], response: '📊 **HTTP Responses**' };
   if (l.includes('user agent'))
-    return { tool: 'packets', filter: 'http.user_agent', fields: [...DEFAULT_FIELDS, 'http.user_agent'] };
-  if (l.includes('tls') || l.includes('sni'))
-    return { tool: 'packets', filter: 'tls.handshake.type == 1', fields: [...DEFAULT_FIELDS, 'tls.handshake.extensions_server_name'] };
+    return { tool: 'packets', filter: 'http.user_agent', fields: [...DEFAULT_FIELDS, 'http.user_agent'], response: '🖥️ **User Agents**' };
+  if (l.includes('http') || l.includes('web'))
+    return { tool: 'packets', filter: 'http', fields: [...DEFAULT_FIELDS, 'http.request.method', 'http.request.uri'], response: '🌐 **HTTP Traffic**' };
+  
+  // TLS/HTTPS
+  if (l.includes('tls') || l.includes('sni') || l.includes('https site') || l.includes('https'))
+    return { tool: 'packets', filter: 'tls.handshake.type == 1', fields: [...DEFAULT_FIELDS, 'tls.handshake.extensions_server_name'], response: '🔒 **TLS/HTTPS Traffic**\n\nShowing TLS Client Hello packets (SNI visible):' };
   if (l.includes('certificate'))
-    return { tool: 'packets', filter: 'tls.handshake.type == 11', fields: ['frame.number', 'ip.src', 'ip.dst', 'x509ce.dNSName'] };
+    return { tool: 'packets', filter: 'tls.handshake.type == 11', fields: ['frame.number', 'ip.src', 'ip.dst', 'x509ce.dNSName'], response: '📜 **TLS Certificates**' };
+  
+  // DNS
   if (l.includes('dns') || l.includes('domain'))
-    return { tool: 'packets', filter: 'dns', fields: [...DEFAULT_FIELDS, 'dns.qry.name'] };
-  if (l.includes('credential') || l.includes('password'))
-    return { tool: 'packets', filter: 'ftp.request.command == "USER" || ftp.request.command == "PASS" || http.authorization', fields: DEFAULT_FIELDS };
+    return { tool: 'packets', filter: 'dns', fields: [...DEFAULT_FIELDS, 'dns.qry.name'], response: '🔍 **DNS Traffic**\n\nShowing DNS queries and responses:' };
+  
+  // Credentials
+  if (l.includes('credential') || l.includes('password') || l.includes('auth'))
+    return { tool: 'packets', filter: 'ftp.request.command == "USER" || ftp.request.command == "PASS" || http.authorization', fields: DEFAULT_FIELDS, response: '🔐 **Credential Detection**\n\n⚠️ Checking for plaintext credentials...' };
+  
+  // ARP
   if (l.includes('arp') || l.includes('spoof'))
-    return { tool: 'packets', filter: 'arp', fields: ['frame.number', 'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.proto_ipv4'] };
+    return { tool: 'packets', filter: 'arp', fields: ['frame.number', 'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.proto_ipv4'], response: '🔗 **ARP Traffic**\n\nChecking for ARP spoofing or anomalies:' };
+  
+  // DHCP
   if (l.includes('dhcp'))
-    return { tool: 'packets', filter: 'dhcp', fields: [...DEFAULT_FIELDS, 'dhcp.option.hostname'] };
+    return { tool: 'packets', filter: 'dhcp', fields: [...DEFAULT_FIELDS, 'dhcp.option.hostname'], response: '📡 **DHCP Traffic**' };
+  
+  // ICMP/Ping
   if (l.includes('icmp') || l.includes('ping'))
-    return { tool: 'packets', filter: 'icmp', fields: [...DEFAULT_FIELDS, 'icmp.type'] };
+    return { tool: 'packets', filter: 'icmp', fields: [...DEFAULT_FIELDS, 'icmp.type'], response: '🏓 **ICMP/Ping Traffic**' };
+  
+  // Broadcast
   if (l.includes('broadcast'))
-    return { tool: 'packets', filter: 'eth.dst == ff:ff:ff:ff:ff:ff', fields: DEFAULT_FIELDS };
+    return { tool: 'packets', filter: 'eth.dst == ff:ff:ff:ff:ff:ff', fields: DEFAULT_FIELDS, response: '📢 **Broadcast Traffic**' };
+  
+  // SMB
   if (l.includes('smb'))
-    return { tool: 'packets', filter: 'smb || smb2', fields: [...DEFAULT_FIELDS, 'smb2.cmd'] };
-  if (l.includes('rdp'))
-    return { tool: 'packets', filter: 'tcp.dstport == 3389', fields: DEFAULT_FIELDS };
+    return { tool: 'packets', filter: 'smb || smb2', fields: [...DEFAULT_FIELDS, 'smb2.cmd'], response: '📁 **SMB Traffic**' };
+  
+  // RDP
+  if (l.includes('rdp') || l.includes('remote desktop'))
+    return { tool: 'packets', filter: 'tcp.dstport == 3389', fields: DEFAULT_FIELDS, response: '🖥️ **RDP Traffic**' };
+  
+  // SSH
   if (l.includes('ssh'))
-    return { tool: 'packets', filter: 'tcp.dstport == 22', fields: DEFAULT_FIELDS };
+    return { tool: 'packets', filter: 'tcp.dstport == 22', fields: DEFAULT_FIELDS, response: '🔑 **SSH Traffic**' };
+  
+  // SMTP/Email
   if (l.includes('smtp') || l.includes('email'))
-    return { tool: 'packets', filter: 'smtp', fields: [...DEFAULT_FIELDS, 'smtp.req.from'] };
+    return { tool: 'packets', filter: 'smtp', fields: [...DEFAULT_FIELDS, 'smtp.req.from'], response: '📧 **SMTP/Email Traffic**' };
+  
+  // QUIC
   if (l.includes('quic'))
-    return { tool: 'packets', filter: 'quic', fields: DEFAULT_FIELDS };
+    return { tool: 'packets', filter: 'quic', fields: DEFAULT_FIELDS, response: '⚡ **QUIC Traffic**' };
+  
+  // TCP
+  if (l.includes('tcp'))
+    return { tool: 'packets', filter: 'tcp', fields: DEFAULT_FIELDS, response: '🔀 **TCP Traffic**' };
+  
+  // UDP  
+  if (l.includes('udp'))
+    return { tool: 'packets', filter: 'udp', fields: DEFAULT_FIELDS, response: '📤 **UDP Traffic**' };
+  
+  // MAC address lookup
   if (macM)
-    return { tool: 'packets', filter: `eth.src == ${macM[0]} || eth.dst == ${macM[0]}`, fields: ['frame.number', 'eth.src', 'eth.dst', 'ip.src', 'ip.dst', '_ws.col.Protocol'] };
+    return { tool: 'packets', filter: `eth.src == ${macM[0]} || eth.dst == ${macM[0]}`, fields: ['frame.number', 'eth.src', 'eth.dst', 'ip.src', 'ip.dst', '_ws.col.Protocol'], response: `🔍 **Packets with MAC: ${macM[0]}**` };
+  
+  // Port lookup
   if (portM)
-    return { tool: 'packets', filter: `tcp.port == ${portM[1]} || udp.port == ${portM[1]}`, fields: DEFAULT_FIELDS };
+    return { tool: 'packets', filter: `tcp.port == ${portM[1]} || udp.port == ${portM[1]}`, fields: DEFAULT_FIELDS, response: `🔌 **Packets on Port ${portM[1]}**` };
+  
+  // IP lookup
   if (ipM)
-    return { tool: 'packets', filter: `ip.addr == ${ipM[1]}`, fields: DEFAULT_FIELDS };
+    return { tool: 'packets', filter: `ip.addr == ${ipM[1]}`, fields: DEFAULT_FIELDS, response: `🌐 **Packets involving IP: ${ipM[1]}**` };
+  
+  // Custom filter
   if (l.includes('filter:'))
-    return { tool: 'packets', filter: prompt.split(/filter:/i)[1]?.trim() || '', fields: DEFAULT_FIELDS };
+    return { tool: 'packets', filter: prompt.split(/filter:/i)[1]?.trim() || '', fields: DEFAULT_FIELDS, response: '🔍 **Custom Filter Results**' };
 
-  return { tool: 'stat', stat: 'io,stat,0' };
+  // Default: show summary
+  return { tool: 'stat', stat: 'io,stat,0', response: '📊 **PCAP Overview**\n\nHere\'s a summary of your capture:' };
 }
 
 async function executeTool(agentResult, sessionId) {
-  const { tool, stat, filter, fields } = agentResult;
+  const { tool, stat, filter, fields, response: customResponse } = agentResult;
 
-  if (tool === 'stat') {
-    const raw_text = await runTsharkStat(sessionId, stat);
-    return { result: { raw_text }, response: raw_text || 'No data.' };
+  // ═══════════════════════════════════════════════════════════════
+  // CHAT TOOL - Natural conversation (no TShark needed)
+  // ═══════════════════════════════════════════════════════════════
+  if (tool === 'chat') {
+    return { result: null, response: customResponse || 'Hello! How can I help you?' };
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // STAT TOOL - TShark statistics
+  // ═══════════════════════════════════════════════════════════════
+  if (tool === 'stat') {
+    const raw_text = await runTsharkStat(sessionId, stat);
+    // Build a nice formatted response
+    let formattedResponse = customResponse || '📊 **Statistics**\n\n';
+    return { result: { raw_text }, response: formattedResponse };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // VULN TOOL - Vulnerability analysis
+  // ═══════════════════════════════════════════════════════════════
   if (tool === 'vuln') {
     const packets = await runTshark(sessionId, '', DEFAULT_FIELDS, 10000);
     const portCounts = {};
@@ -1302,11 +1493,26 @@ async function executeTool(agentResult, sessionId) {
       })
     );
     
-    return { result: vulnResults, response: `Analyzed ${vulnResults.length} ports using SearXNG Web Search + NVD CVE API (NO AI!).` };
+    // Build formatted response
+    let formattedResponse = customResponse || '🛡️ **Security Analysis**\n\n';
+    formattedResponse += `\n• Analyzed ${vulnResults.length} unique ports\n• Used SearXNG Web Search + NVD CVE Database\n\n`;
+    
+    return { result: vulnResults, response: formattedResponse };
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // PACKETS TOOL - Filter packets
+  // ═══════════════════════════════════════════════════════════════
   const packets = await runTshark(sessionId, filter || '', fields || DEFAULT_FIELDS, 200);
-  return { result: packets, response: `Found ${packets.length} matching packets.` };
+  
+  // Build formatted response
+  let formattedResponse = customResponse || `🔍 **Packet Results**\n\n`;
+  formattedResponse += `• Found **${packets.length}** matching packets\n`;
+  if (filter) {
+    formattedResponse += `• Filter: \`${filter}\`\n`;
+  }
+  
+  return { result: packets, response: formattedResponse };
 }
 
 // ── Main server ────────────────────────────────────────────────
