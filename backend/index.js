@@ -2790,8 +2790,29 @@ const server = http.createServer(async (req, res) => {
     if (!fs.existsSync(path.join(PCAP_DIR, `${q.session_id}.pcap`)))
       return respond({ error: 'Session expired or not found' }, 404);
 
-    // Efficiently get ALL ports without loading full packet data
-    const portCounts = await getAllPorts(q.session_id);
+    // Use pre-computed ports data if available (MUCH faster, no TShark needed!)
+    let precomputed = precomputedData.get(q.session_id);
+    
+    // If no pre-computed data yet, wait a bit for it
+    if (!precomputed) {
+      console.log(`[PortIntel] Waiting for pre-computation...`);
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        precomputed = precomputedData.get(q.session_id);
+        if (precomputed) break;
+      }
+    }
+    
+    let portCounts;
+    if (precomputed && precomputed.ports) {
+      // Use pre-computed ports (INSTANT!)
+      portCounts = precomputed.ports;
+      console.log(`[PortIntel] ✓ Using pre-computed ports: ${Object.keys(portCounts).length} ports`);
+    } else {
+      // Fallback: run TShark (slower)
+      portCounts = await getAllPorts(q.session_id);
+      console.log(`[PortIntel] Using TShark for ports: ${Object.keys(portCounts).length} ports`);
+    }
     
     const portEntries = Object.entries(portCounts);
     console.log(`[PortIntel] Analyzing ${portEntries.length} unique ports with Web Search + NVD API...`);
