@@ -1,4 +1,7 @@
 node_modules/
 .env
 *.log
+tmp_pcaps/
+tmp_exports/
+*.pcap
 .DS_Store
