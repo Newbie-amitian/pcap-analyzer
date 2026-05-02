@@ -153,9 +153,16 @@ const isValidSessionId = (id) =>
   typeof id === 'string' && /^session-\d{13}-[a-z0-9]{6}$/.test(id);
 
 // ── TShark core runner ─────────────────────────────────────────
+// Include both IPv4 and IPv6 fields, TCP and UDP ports
 const DEFAULT_FIELDS = [
-  'frame.number', 'ip.src', 'ip.dst', 'frame.len',
-  '_ws.col.Protocol', 'tcp.srcport', 'tcp.dstport', 'frame.time_relative',
+  'frame.number', 
+  'ip.src', 'ip.dst',           // IPv4 addresses
+  'ipv6.src', 'ipv6.dst',       // IPv6 addresses
+  'frame.len',
+  '_ws.col.Protocol', 
+  'tcp.srcport', 'tcp.dstport', // TCP ports
+  'udp.srcport', 'udp.dstport', // UDP ports
+  'frame.time_relative',
 ];
 
 function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
@@ -182,15 +189,17 @@ function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
       const lines = stdout.trim().split('\n').filter(l => l.trim());
       const packets = lines.map(line => {
         const c = line.split('\t');
+        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative
+        // Use IPv4 if available, else IPv6; Use TCP ports if available, else UDP ports
         return {
           id: parseInt(c[0]) || 0,
-          src_ip: c[1] || null,
-          dst_ip: c[2] || null,
-          length: parseInt(c[3]) || 0,
-          protocol: c[4] || 'UNKNOWN',
-          src_port: parseInt(c[5]) || null,
-          dst_port: parseInt(c[6]) || null,
-          timestamp: parseFloat(c[7]) || 0,
+          src_ip: c[1] || c[3] || null,  // IPv4 src or IPv6 src
+          dst_ip: c[2] || c[4] || null,  // IPv4 dst or IPv6 dst
+          length: parseInt(c[5]) || 0,
+          protocol: c[6] || 'UNKNOWN',
+          src_port: parseInt(c[7]) || parseInt(c[9]) || null,  // TCP src or UDP src
+          dst_port: parseInt(c[8]) || parseInt(c[10]) || null, // TCP dst or UDP dst
+          timestamp: parseFloat(c[11]) || 0,
         };
       });
       console.log(`[TShark] Returned ${packets.length} packets`);
@@ -221,15 +230,16 @@ function runTsharkPaged(sessionId, skip, limit) {
       const pageLines = lines.slice(skip);
       const packets = pageLines.map(line => {
         const c = line.split('\t');
+        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative
         return {
           id: parseInt(c[0]) || 0,
-          src_ip: c[1] || null,
-          dst_ip: c[2] || null,
-          length: parseInt(c[3]) || 0,
-          protocol: c[4] || 'UNKNOWN',
-          src_port: parseInt(c[5]) || null,
-          dst_port: parseInt(c[6]) || null,
-          timestamp: parseFloat(c[7]) || 0,
+          src_ip: c[1] || c[3] || null,  // IPv4 src or IPv6 src
+          dst_ip: c[2] || c[4] || null,  // IPv4 dst or IPv6 dst
+          length: parseInt(c[5]) || 0,
+          protocol: c[6] || 'UNKNOWN',
+          src_port: parseInt(c[7]) || parseInt(c[9]) || null,  // TCP src or UDP src
+          dst_port: parseInt(c[8]) || parseInt(c[10]) || null, // TCP dst or UDP dst
+          timestamp: parseFloat(c[11]) || 0,
         };
       });
       console.log(`[TSharkPaged] → ${packets.length} packets returned`);
@@ -1261,7 +1271,7 @@ const server = http.createServer(async (req, res) => {
     const per_page = Math.min(200, parseInt(q.per_page || '50'));
     const skip = (page - 1) * per_page;
 
-    const extendedFields = [...DEFAULT_FIELDS, '_ws.col.Info', 'udp.srcport', 'udp.dstport'];
+    const extendedFields = [...DEFAULT_FIELDS, '_ws.col.Info'];
     
     const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
     if (!fs.existsSync(pcapPath)) return respond({ packets: [], total: 0, page, per_page });
@@ -1281,16 +1291,17 @@ const server = http.createServer(async (req, res) => {
       
       const packets = pageLines.map(line => {
         const c = line.split('\t');
+        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative, info
         return {
           id: parseInt(c[0]) || 0,
-          src_ip: c[1] || null,
-          dst_ip: c[2] || null,
-          length: parseInt(c[3]) || 0,
-          protocol: c[4] || 'UNKNOWN',
-          src_port: parseInt(c[5]) || parseInt(c[9]) || null,
-          dst_port: parseInt(c[6]) || parseInt(c[10]) || null,
-          timestamp: parseFloat(c[7]) || 0,
-          info: c[8] || '',
+          src_ip: c[1] || c[3] || null,  // IPv4 src or IPv6 src
+          dst_ip: c[2] || c[4] || null,  // IPv4 dst or IPv6 dst
+          length: parseInt(c[5]) || 0,
+          protocol: c[6] || 'UNKNOWN',
+          src_port: parseInt(c[7]) || parseInt(c[9]) || null,  // TCP src or UDP src
+          dst_port: parseInt(c[8]) || parseInt(c[10]) || null, // TCP dst or UDP dst
+          timestamp: parseFloat(c[11]) || 0,
+          info: c[12] || '',
         };
       });
 
