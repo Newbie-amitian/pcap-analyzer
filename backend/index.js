@@ -6,21 +6,14 @@ const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
 
-// SearXNG Configuration - FROM ENVIRONMENT VARIABLES
+// SearXNG Configuration - YOUR INSTANCE ONLY
 // ============================
-// Primary instance from SEARXNG_URL env var, with fallbacks
-const SEARXNG_INSTANCES = [
-  process.env.SEARXNG_URL,                // Your SearXNG instance (from env)
-  'https://searx.be',                     // Fallback 1 (public)
-  'https://search.bus-hit.me',            // Fallback 2 (public)
-].filter(Boolean);  // Remove undefined/empty values
+const SEARXNG_URL = process.env.SEARXNG_URL || 'https://searxng-krq1.onrender.com';
 
 // Search settings
 const SEARXNG_TIMEOUT_MS = 10000;
 const SEARXNG_MAX_RESULTS = 5;
 const SEARXNG_ENGINES = 'google,bing,duckduckgo,startpage';
-
-let currentSearXInstance = 0;
 
 // ── TShark binary path ─────────────────────────────────────────
 const TSHARK_BIN = process.env.TSHARK_PATH ||
@@ -536,18 +529,14 @@ function getTlsHandshakeType(type) {
 const portInfoCache = new Map();
 const PORT_INFO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
-// SearXNG search function (NO AI - pure HTTP requests to free metasearch)
+// SearXNG search function (NO AI - pure HTTP requests to your SearXNG instance)
 function searxngSearch(query) {
   return new Promise((resolve) => {
-    const instance = SEARXNG_INSTANCES[currentSearXInstance];
-    const url = `${instance}/search?q=${encodeURIComponent(query)}&format=json&engines=${SEARXNG_ENGINES}`;
+    const url = `${SEARXNG_URL}/search?q=${encodeURIComponent(query)}&format=json&engines=${SEARXNG_ENGINES}`;
     
-    console.log(`[SearXNG] Searching: "${query}" via ${instance}`);
+    console.log(`[SearXNG] Searching: "${query}" via ${SEARXNG_URL}`);
     
-    // Use http for localhost, https for public instances
-    const httpClient = instance.startsWith('https') ? https : http;
-    
-    const req = httpClient.get(url, {
+    const req = https.get(url, {
       headers: { 
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json'
@@ -566,50 +555,30 @@ function searxngSearch(query) {
               snippet: r.content || r.snippet || '',
               engine: r.engine || 'unknown'
             }));
-            console.log(`[SearXNG] ✓ Found ${results.length} results from ${instance}`);
+            console.log(`[SearXNG] ✓ Found ${results.length} results`);
             resolve(results);
           } else {
-            console.log(`[SearXNG] No results from ${instance}, trying next instance...`);
-            // Rotate to next instance
-            currentSearXInstance = (currentSearXInstance + 1) % SEARXNG_INSTANCES.length;
+            console.log(`[SearXNG] No results found`);
             resolve(null);
           }
         } catch (e) {
-          console.error(`[SearXNG] Parse error from ${instance}: ${e.message}`);
-          // Rotate to next instance on error
-          currentSearXInstance = (currentSearXInstance + 1) % SEARXNG_INSTANCES.length;
+          console.error(`[SearXNG] Parse error: ${e.message}`);
           resolve(null);
         }
       });
     });
     
     req.on('error', (e) => {
-      console.error(`[SearXNG] Request error from ${instance}: ${e.message}`);
-      // Rotate to next instance
-      currentSearXInstance = (currentSearXInstance + 1) % SEARXNG_INSTANCES.length;
+      console.error(`[SearXNG] Request error: ${e.message}`);
       resolve(null);
     });
     
     req.on('timeout', () => {
       req.destroy();
-      console.error(`[SearXNG] Timeout from ${instance}, rotating instance...`);
-      currentSearXInstance = (currentSearXInstance + 1) % SEARXNG_INSTANCES.length;
+      console.error(`[SearXNG] Timeout`);
       resolve(null);
     });
   });
-}
-
-// Try multiple SearXNG instances
-async function searchWithFallback(query, maxAttempts = 3) {
-  for (let i = 0; i < maxAttempts; i++) {
-    const results = await searxngSearch(query);
-    if (results && results.length > 0) {
-      return results;
-    }
-    // Small delay before trying next instance
-    await new Promise(r => setTimeout(r, 500));
-  }
-  return null;
 }
 
 async function searchPortInfo(port) {
@@ -625,7 +594,7 @@ async function searchPortInfo(port) {
     const query = `TCP UDP port ${port} service protocol what is it used for IANA`;
     console.log(`[SearXNG] Searching for port ${port} info...`);
     
-    const results = await searchWithFallback(query, 3);
+    const results = await searxngSearch(query);
 
     if (results && results.length > 0) {
       // Extract relevant info from search results - PURE LOGIC, NO AI
@@ -741,7 +710,60 @@ function parsePortSearchResults(port, results) {
   };
 }
 
-// ── CVE API cache ─────────────────────────────────────────────────
+// ── IANA Port Database (Built-in, no web search needed) ─────────────
+const IANA_PORTS = {
+  // Well-known ports (0-1023)
+  20: { name: 'ftp-data', desc: 'FTP Data Transfer', risk: 'MEDIUM', secure: 'SFTP (22)' },
+  21: { name: 'ftp', desc: 'File Transfer Protocol (Control)', risk: 'HIGH', secure: 'SFTP (22)' },
+  22: { name: 'ssh', desc: 'Secure Shell', risk: 'LOW', secure: 'Already secure' },
+  23: { name: 'telnet', desc: 'Telnet (Unencrypted)', risk: 'CRITICAL', secure: 'SSH (22)' },
+  25: { name: 'smtp', desc: 'Simple Mail Transfer Protocol', risk: 'MEDIUM', secure: 'SMTPS (465)' },
+  53: { name: 'dns', desc: 'Domain Name System', risk: 'MEDIUM', secure: 'DNSSEC/DoH' },
+  67: { name: 'dhcp', desc: 'DHCP Server', risk: 'LOW', secure: 'N/A' },
+  68: { name: 'dhcp', desc: 'DHCP Client', risk: 'LOW', secure: 'N/A' },
+  69: { name: 'tftp', desc: 'Trivial FTP (Unencrypted)', risk: 'HIGH', secure: 'SFTP (22)' },
+  80: { name: 'http', desc: 'Hypertext Transfer Protocol', risk: 'MEDIUM', secure: 'HTTPS (443)' },
+  110: { name: 'pop3', desc: 'Post Office Protocol v3', risk: 'MEDIUM', secure: 'POP3S (995)' },
+  119: { name: 'nntp', desc: 'Network News Transfer', risk: 'MEDIUM', secure: 'NNTPS (563)' },
+  123: { name: 'ntp', desc: 'Network Time Protocol', risk: 'LOW', secure: 'Authenticated NTP' },
+  135: { name: 'rpc', desc: 'Remote Procedure Call', risk: 'HIGH', secure: 'Firewall restrict' },
+  137: { name: 'netbios-ns', desc: 'NetBIOS Name Service', risk: 'MEDIUM', secure: 'Disable if unused' },
+  138: { name: 'netbios-dgm', desc: 'NetBIOS Datagram', risk: 'MEDIUM', secure: 'Disable if unused' },
+  139: { name: 'netbios-ssn', desc: 'NetBIOS Session', risk: 'HIGH', secure: 'SMB over SSH' },
+  143: { name: 'imap', desc: 'Internet Message Access Protocol', risk: 'MEDIUM', secure: 'IMAPS (993)' },
+  161: { name: 'snmp', desc: 'Simple Network Management Protocol', risk: 'HIGH', secure: 'SNMPv3' },
+  162: { name: 'snmp-trap', desc: 'SNMP Trap', risk: 'MEDIUM', secure: 'SNMPv3' },
+  389: { name: 'ldap', desc: 'Lightweight Directory Access Protocol', risk: 'MEDIUM', secure: 'LDAPS (636)' },
+  443: { name: 'https', desc: 'HTTP Secure', risk: 'LOW', secure: 'Already secure' },
+  445: { name: 'smb', desc: 'Server Message Block', risk: 'HIGH', secure: 'VPN only' },
+  465: { name: 'smtps', desc: 'SMTP Secure', risk: 'LOW', secure: 'Already secure' },
+  514: { name: 'syslog', desc: 'Syslog', risk: 'MEDIUM', secure: 'TLS syslog' },
+  587: { name: 'smtp-msa', desc: 'SMTP Message Submission', risk: 'MEDIUM', secure: 'STARTTLS' },
+  636: { name: 'ldaps', desc: 'LDAP Secure', risk: 'LOW', secure: 'Already secure' },
+  993: { name: 'imaps', desc: 'IMAP Secure', risk: 'LOW', secure: 'Already secure' },
+  995: { name: 'pop3s', desc: 'POP3 Secure', risk: 'LOW', secure: 'Already secure' },
+  1080: { name: 'socks', desc: 'SOCKS Proxy', risk: 'MEDIUM', secure: 'SOCKS5 + Auth' },
+  1433: { name: 'mssql', desc: 'Microsoft SQL Server', risk: 'HIGH', secure: 'Encrypt connections' },
+  1434: { name: 'mssql-monitor', desc: 'MS SQL Monitor', risk: 'HIGH', secure: 'Firewall restrict' },
+  1521: { name: 'oracle', desc: 'Oracle Database', risk: 'HIGH', secure: 'Encrypt connections' },
+  1723: { name: 'pptp', desc: 'Point-to-Point Tunneling', risk: 'MEDIUM', secure: 'OpenVPN/WireGuard' },
+  2049: { name: 'nfs', desc: 'Network File System', risk: 'HIGH', secure: 'NFSv4 + Kerberos' },
+  3306: { name: 'mysql', desc: 'MySQL Database', risk: 'HIGH', secure: 'Bind localhost + TLS' },
+  3389: { name: 'rdp', desc: 'Remote Desktop Protocol', risk: 'HIGH', secure: 'VPN + NLA' },
+  5432: { name: 'postgresql', desc: 'PostgreSQL Database', risk: 'HIGH', secure: 'Bind localhost + TLS' },
+  5900: { name: 'vnc', desc: 'Virtual Network Computing', risk: 'HIGH', secure: 'VPN + SSH tunnel' },
+  5901: { name: 'vnc-1', desc: 'VNC Display 1', risk: 'HIGH', secure: 'VPN + SSH tunnel' },
+  6379: { name: 'redis', desc: 'Redis Database', risk: 'HIGH', secure: 'Bind localhost + AUTH' },
+  8080: { name: 'http-proxy', desc: 'HTTP Proxy/Alt Port', risk: 'MEDIUM', secure: 'HTTPS (443)' },
+  8443: { name: 'https-alt', desc: 'HTTPS Alt Port', risk: 'LOW', secure: 'Already secure' },
+  9200: { name: 'elasticsearch', desc: 'Elasticsearch HTTP', risk: 'HIGH', secure: 'Bind localhost + Auth' },
+  27017: { name: 'mongodb', desc: 'MongoDB Database', risk: 'HIGH', secure: 'Bind localhost + Auth' },
+};
+
+// Services that should trigger CVE lookup (specific products, not generic protocols)
+const CVE_SERVICES = ['ssh', 'ftp', 'telnet', 'smb', 'rdp', 'vnc', 'mysql', 'postgresql', 'mongodb', 'redis', 'elasticsearch', 'mssql', 'oracle'];
+
+// ── CVECache ─────────────────────────────────────────────────
 const cveCache = new Map();
 const CVE_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -750,6 +772,12 @@ function fetchCveData(serviceName, port) {
   return new Promise((resolve) => {
     if (!serviceName || serviceName === 'unknown') return resolve(null);
     
+    // Only search CVE for specific services, not generic protocols
+    if (!CVE_SERVICES.includes(serviceName)) {
+      console.log(`[CVE] Skipping CVE for generic service: ${serviceName}`);
+      return resolve(null);
+    }
+    
     // Check cache first
     const cached = cveCache.get(serviceName);
     if (cached && (Date.now() - cached.timestamp) < CVE_CACHE_TTL) {
@@ -757,7 +785,8 @@ function fetchCveData(serviceName, port) {
       return resolve(cached.data);
     }
     
-    const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(serviceName + ' vulnerability')}&resultsPerPage=3`;
+    // More specific CVE search
+    const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(serviceName)}&resultsPerPage=2`;
     console.log(`[CVE] Fetching for port ${port} (${serviceName})...`);
     
     const req = https.get(url, {
@@ -822,57 +851,133 @@ function fetchCveData(serviceName, port) {
   });
 }
 
-// ── Get comprehensive port info (Web Search + CVE) ───────────────────
+// ── Get comprehensive port info (IANA DB first, Web Search fallback, CVE only for specific services) ─
 async function getPortIntelligence(port) {
-  // First, search the web for port info
-  const webInfo = await searchPortInfo(port);
+  // Check built-in IANA database first (instant, no network)
+  const ianaInfo = IANA_PORTS[port];
   
-  // Then, fetch CVE data using the discovered service name
-  let cveData = null;
-  if (webInfo.service_name && webInfo.service_name !== 'unknown') {
-    cveData = await fetchCveData(webInfo.service_name, port);
+  if (ianaInfo) {
+    console.log(`[PortIntel] Port ${port} found in IANA database: ${ianaInfo.name}`);
+    
+    // Fetch CVE only for specific services
+    let cveData = null;
+    if (CVE_SERVICES.includes(ianaInfo.name)) {
+      cveData = await fetchCveData(ianaInfo.name, port);
+    }
+    
+    let risk = ianaInfo.risk;
+    let reason = ianaInfo.desc;
+    
+    // If CVE found and it's relevant, update risk
+    if (cveData && cveData.length > 0 && cveData[0].cvss_score >= 7) {
+      risk = cveData[0].severity.toUpperCase();
+      reason = cveData[0].description;
+    }
+    
+    return {
+      port: port,
+      service_name: ianaInfo.name,
+      description: ianaInfo.desc,
+      secure_alternative: ianaInfo.secure,
+      common_uses: [],
+      risk: risk,
+      reason: reason,
+      cve_id: cveData?.[0]?.cve_id || null,
+      cvss_score: cveData?.[0]?.cvss_score || null,
+      cve_count: cveData?.length || 0,
+      all_cves: cveData || [],
+      source: 'IANA Port Registry',
+      search_source: 'iana_db',
+      search_result: null
+    };
   }
   
-  // Determine risk level
-  let risk = 'MEDIUM';
-  let reason = webInfo.description;
+  // Ephemeral ports (49152-65535) - client-side, LOW risk
+  if (port >= 49152 && port <= 65535) {
+    console.log(`[PortIntel] Port ${port} is ephemeral (client-side)`);
+    return {
+      port: port,
+      service_name: 'ephemeral',
+      description: `Ephemeral port ${port} - client-side temporary connection`,
+      secure_alternative: 'Usually client-side, low risk',
+      common_uses: ['Client connections', 'Temporary connections'],
+      risk: 'LOW',
+      reason: 'Ephemeral port - typically used for outbound client connections',
+      cve_id: null,
+      cvss_score: null,
+      cve_count: 0,
+      all_cves: [],
+      source: 'IANA Port Registry',
+      search_source: 'iana_ephemeral',
+      search_result: null
+    };
+  }
   
-  if (cveData && cveData.length > 0) {
-    const topCve = cveData[0];
-    risk = topCve.severity.toUpperCase();
-    reason = topCve.description;
-  } else {
-    // Assess risk based on service
-    const riskyServices = ['telnet', 'ftp', 'rsh', 'rexec', 'vnc', 'smb', 'rdp', 'snmp'];
-    const criticalServices = ['telnet', 'ftp'];
+  // Registered ports (1024-49151) - could be app-specific
+  if (port >= 1024 && port < 49152) {
+    // Check cache first
+    const cached = portInfoCache.get(port);
+    if (cached && (Date.now() - cached.timestamp) < PORT_INFO_CACHE_TTL) {
+      console.log(`[PortIntel] Using cached info for registered port ${port}`);
+      return cached.data;
+    }
     
-    if (criticalServices.includes(webInfo.service_name)) {
-      risk = 'CRITICAL';
-      reason = `${webInfo.service_name.toUpperCase()} - Unencrypted protocol, high security risk`;
-    } else if (riskyServices.includes(webInfo.service_name)) {
+    // Search web for registered port info
+    console.log(`[PortIntel] Searching web for registered port ${port}`);
+    const webInfo = await searchPortInfo(port);
+    
+    // Registered ports are generally MEDIUM risk unless known otherwise
+    let risk = 'MEDIUM';
+    let reason = webInfo.description;
+    
+    // Only flag as HIGH if it's a known risky service
+    const riskyServices = ['telnet', 'ftp', 'vnc', 'smb', 'rdp', 'snmp'];
+    if (riskyServices.includes(webInfo.service_name)) {
       risk = 'HIGH';
-      reason = `${webInfo.service_name.toUpperCase()} - Potential security concerns`;
+      reason = `${webInfo.service_name.toUpperCase()} detected on non-standard port`;
     } else if (webInfo.service_name === 'ssh' || webInfo.service_name === 'https') {
       risk = 'LOW';
       reason = `${webInfo.service_name.toUpperCase()} - Secure protocol`;
     }
+    
+    const result = {
+      port: port,
+      service_name: webInfo.service_name,
+      description: webInfo.description,
+      secure_alternative: webInfo.secure_alternative,
+      common_uses: webInfo.common_uses,
+      risk: risk,
+      reason: reason,
+      cve_id: null,
+      cvss_score: null,
+      cve_count: 0,
+      all_cves: [],
+      source: 'SearXNG Web Search',
+      search_source: webInfo.source,
+      search_result: webInfo.search_result || null
+    };
+    
+    // Cache the result
+    portInfoCache.set(port, { data: result, timestamp: Date.now() });
+    return result;
   }
   
+  // Default for any other ports
   return {
     port: port,
-    service_name: webInfo.service_name,
-    description: webInfo.description,
-    secure_alternative: webInfo.secure_alternative,
-    common_uses: webInfo.common_uses,
-    risk: risk,
-    reason: reason,
-    cve_id: cveData?.[0]?.cve_id || null,
-    cvss_score: cveData?.[0]?.cvss_score || null,
-    cve_count: cveData?.length || 0,
-    all_cves: cveData || [],
-    source: webInfo.source === 'searxng_web_search' ? 'SearXNG + NVD CVE API' : 'NVD CVE API',
-    search_source: webInfo.source,
-    search_result: webInfo.search_result || null
+    service_name: 'unknown',
+    description: `Port ${port} - unknown service`,
+    secure_alternative: 'Investigate manually',
+    common_uses: ['Unknown'],
+    risk: 'MEDIUM',
+    reason: 'Unknown service - manual investigation recommended',
+    cve_id: null,
+    cvss_score: null,
+    cve_count: 0,
+    all_cves: [],
+    source: 'none',
+    search_source: 'none',
+    search_result: null
   };
 }
 
@@ -996,7 +1101,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url === '/pcap/health') {
-    return respond({ status: 'ok', engine: 'TShark (Local) + SearXNG + NVD CVE API', sessions: sessions.size, note: 'NO AI - Pure dynamic code and logic!' });
+    return respond({ status: 'ok', engine: 'TShark + IANA Port DB + SearXNG + NVD CVE', sessions: sessions.size, note: 'NO AI - Pure dynamic code and logic!' });
   }
 
   // ── Upload ─────────────────────────────────────────────────
@@ -1361,9 +1466,9 @@ const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
   console.log(`✅ TShark PCAP Analyzer running on port ${PORT}`);
   console.log(`🔧 TShark binary: ${TSHARK_BIN}`);
-  console.log(`🌐 SearXNG URL:   ${process.env.SEARXNG_URL || 'Not set (using fallbacks)'}`);
-  console.log(`🌐 Web Search:    SearXNG (Free, Open-Source)`);
-  console.log(`🛡️ CVE API:       NVD (National Vulnerability Database)`);
+  console.log(`🌐 SearXNG URL:   ${SEARXNG_URL}`);
+  console.log(`📚 Port DB:       IANA Registry (40+ well-known ports)`);
+  console.log(`🛡️ CVE API:       NVD (only for risky services)`);
   console.log(`🚫 NO AI:         Pure dynamic code and logic!`);
   console.log(`📁 PCAP dir:      ${path.resolve(PCAP_DIR)}`);
   console.log(`📁 Export dir:    ${path.resolve(EXPORT_DIR)}`);
