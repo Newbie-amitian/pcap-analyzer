@@ -6,16 +6,43 @@ const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
 
-// SearXNG Configuration - YOUR INSTANCE ONLY
-// ============================
-const SEARXNG_URL = process.env.SEARXNG_URL || 'https://searxng-krq1.onrender.com';
+// ═══════════════════════════════════════════════════════════════════
+// REQUIRED ENVIRONMENT VARIABLES (Set these in Render dashboard!)
+// ═══════════════════════════════════════════════════════════════════
+const SEARXNG_URL = process.env.SEARXNG_URL;
+const HF_LLM_URL = process.env.HF_LLM_URL;
+// ALLOWED_ORIGIN: Your frontend URL (default: localhost for local dev)
+// Change this when deploying to Vercel: https://your-app.vercel.app
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
 
-// HuggingFace LLM Space Configuration
-// ============================
-const HF_LLM_URL = process.env.HF_LLM_URL || 'https://dps5786-pcap-llm-agent.hf.space/chat';
-const HF_LLM_TIMEOUT_MS = 25000; // 25 seconds (UptimeRobot keeps Space warm, so no cold start)
+// Validate required env vars on startup
+const missingVars = [];
+if (!SEARXNG_URL) missingVars.push('SEARXNG_URL');
+if (!HF_LLM_URL) missingVars.push('HF_LLM_URL');
 
-// Search settings
+if (missingVars.length > 0) {
+  console.error('═══════════════════════════════════════════════════════════════');
+  console.error('❌ FATAL: Missing required environment variables!');
+  console.error('═══════════════════════════════════════════════════════════════');
+  missingVars.forEach(v => console.error(`   - ${v}`));
+  console.error('');
+  console.error('Set these in your Render dashboard → Environment tab:');
+  console.error('   SEARXNG_URL     = https://searxng-krq1.onrender.com');
+  console.error('   HF_LLM_URL      = https://dps5786-pcap-llm-agent.hf.space/chat');
+  console.error('   ALLOWED_ORIGIN  = http://localhost:3000 (or your Vercel URL)');
+  console.error('═══════════════════════════════════════════════════════════════');
+  process.exit(1); // Crash early with clear error
+}
+
+console.log('✅ Environment variables loaded:');
+console.log(`   SEARXNG_URL    = ${SEARXNG_URL}`);
+console.log(`   HF_LLM_URL     = ${HF_LLM_URL}`);
+console.log(`   ALLOWED_ORIGIN = ${ALLOWED_ORIGIN}`);
+
+// ═══════════════════════════════════════════════════════════════════
+// Configuration
+// ═══════════════════════════════════════════════════════════════════
+const HF_LLM_TIMEOUT_MS = 25000; // 25 seconds (UptimeRobot keeps Space warm)
 const SEARXNG_TIMEOUT_MS = 10000;
 const SEARXNG_MAX_RESULTS = 5;
 const SEARXNG_ENGINES = 'google,bing,duckduckgo,startpage';
@@ -82,10 +109,11 @@ setInterval(() => {
 }, 2 * 60_000);
 
 // ── CORS ──────────────────────────────────────────────────────
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 function getCorsHeaders(origin) {
+  // Only allow requests from the configured frontend
+  const allowedOrigin = ALLOWED_ORIGIN === '*' ? '*' : ALLOWED_ORIGIN;
   return {
-    'Access-Control-Allow-Origin': ALLOWED_ORIGIN === '*' ? '*' : (origin || ALLOWED_ORIGIN),
+    'Access-Control-Allow-Origin': allowedOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
   };
