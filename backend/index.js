@@ -538,160 +538,138 @@ function getTlsHandshakeType(type) {
   return types[type] || `Type ${type}`;
 }
 
-// ── Parse TShark Verbose Output (Wireshark-style) ─────────────────────────────
-function parseVerboseOutput(output, targetPacket) {
-  const lines = output.split('\n');
+// ── Parse TShark PDML Output (XML - captures ALL protocols) ─────────────────────────────
+function parsePdmlOutput(pdmlXml, targetPacket) {
   const packets = [];
-  let currentPacket = null;
-  let currentLayer = null;
-  let currentSubLayer = null;
-  let lastIndent = 0;
   
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim()) continue;
+  // Simple XML parsing without external libraries
+  const packetMatches = pdmlXml.match(/<packet[^>]*>[\s\S]*?<\/packet>/g) || [];
+  
+  for (const packetXml of packetMatches) {
+    const packet = {
+      frame: {},
+      layers: [],
+      info: ''
+    };
     
-    // Calculate indentation level
-    const trimmedLine = line.trimStart();
-    const indent = line.length - trimmedLine.length;
+    // Extract all protocol elements
+    const protoMatches = packetXml.match(/<proto[^>]*name="[^"]+"[^>]*>[\s\S]*?<\/proto>/g) || [];
     
-    // Detect new packet (starts with "Frame X:")
-    if (trimmedLine.match(/^Frame \d+:/)) {
-      if (currentPacket) packets.push(currentPacket);
-      currentPacket = {
-        frame: {},
-        layers: [],
-        raw_text: ''
-      };
-      currentLayer = null;
-      currentSubLayer = null;
-      lastIndent = indent;
-      continue;
-    }
-    
-    if (!currentPacket) continue;
-    
-    // Detect new protocol layer (lines ending with no colon, followed by indented content)
-    // Protocol layers typically start at indent 0-4 and have specific patterns
-    const layerPatterns = [
-      /^Ethernet II/,
-      /^Internet Protocol Version \d/,
-      /^IPv[46]/,
-      /^User Datagram Protocol/,
-      /^Transmission Control Protocol/,
-      /^Internet Control Message Protocol/,
-      /^Address Resolution Protocol/,
-      /^Domain Name System/,
-      /^Hypertext Transfer Protocol/,
-      /^HTTP\/\d/,
-      /^Transport Layer Security/,
-      /^Secure Sockets Layer/,
-      /^DHCPv?6?/,
-      /^Simple Network Management Protocol/,
-      /^Server Message Block/,
-      /^NetBIOS/,
-      /^OpenVPN/,
-      /^Generic Routing Encapsulation/,
-      /^Spanning Tree Protocol/,
-      /^Link Layer Discovery Protocol/,
-      /^Cisco Discovery Protocol/,
-      /^Dynamic Host Configuration Protocol/,
-      /^Internet Group Management Protocol/,
-      /^Pragmatic General Multicast/,
-      /^Real-time Transport Protocol/,
-      /^Session Description Protocol/,
-      /^Session Announcement Protocol/,
-      /^File Transfer Protocol/,
-      /^Simple Mail Transfer Protocol/,
-      /^Post Office Protocol/,
-      /^Internet Message Access Protocol/,
-      /^Border Gateway Protocol/,
-      /^Open Shortest Path First/,
-      /^Layer [0-9]/,
-      /^\w+[\s\w]*:$/,  // Generic protocol name ending with colon
-    ];
-    
-    // Check if this is a new layer header (typically at indent 0-4)
-    if (indent <= 8 && !trimmedLine.includes(': ') && !trimmedLine.startsWith('[')) {
-      const possibleLayer = trimmedLine.replace(/:$/, '').trim();
-      if (possibleLayer.length > 3 && possibleLayer.length < 60) {
-        // Check if it matches a known protocol pattern
-        const isLayer = layerPatterns.some(p => p.test(possibleLayer));
-        if (isLayer || (indent === 0 && possibleLayer.includes('Protocol'))) {
-          currentLayer = {
-            name: possibleLayer,
-            fields: [],
-            sublayers: []
-          };
-          currentPacket.layers.push(currentLayer);
-          currentSubLayer = null;
-          lastIndent = indent;
-          continue;
-        }
-      }
-    }
-    
-    // Parse field lines (contains ": " separator)
-    if (trimmedLine.includes(': ')) {
-      const colonIndex = trimmedLine.indexOf(': ');
-      const key = trimmedLine.substring(0, colonIndex).trim();
-      const value = trimmedLine.substring(colonIndex + 2).trim();
+    for (const protoXml of protoMatches) {
+      // Get protocol name
+      const nameMatch = protoXml.match(/name="([^"]+)"/);
+      const protoName = nameMatch ? nameMatch[1] : 'unknown';
+      const shownameMatch = protoXml.match(/showname="([^"]+)"/);
+      const protoShowName = shownameMatch ? shownameMatch[1] : protoName;
       
-      if (key && value !== undefined) {
-        const field = { key, value, indent };
+      // Skip frame protocol - handle separately
+      if (protoName === 'frame' || protoName === 'geninfo') {
+        // Extract frame fields
+        const fieldMatches = protoXml.match(/<field[^>]*showname="[^"]+"[^>]*\/>/g) || [];
+        const frameFields = [];
         
-        // Determine which layer/sublayer to add to
-        if (indent > 12 && currentSubLayer) {
-          currentSubLayer.fields.push(field);
-        } else if (currentLayer) {
-          // Check if this starts a new sublayer (indented section)
-          if (indent > lastIndent + 4) {
-            currentSubLayer = {
-              name: key,
-              fields: [field]
-            };
-            currentLayer.sublayers.push(currentSubLayer);
-          } else {
-            currentLayer.fields.push(field);
-            currentSubLayer = null;
+        for (const fieldXml of fieldMatches) {
+          const fieldShowname = fieldXml.match(/showname="([^"]+)"/);
+          const fieldShow = fieldXml.match(/show="([^"]+)"/);
+          
+          if (fieldShowname) {
+            const parts = fieldShowname[1].split(': ');
+            const key = parts[0].trim();
+            const value = fieldShow ? fieldShow[1] : (parts.slice(1).join(': ') || '');
+            
+            if (key && value) {
+              frameFields.push({ key, value });
+              
+              // Store important frame fields
+              if (key === 'Frame Number') packet.frame.number = value;
+              if (key === 'Arrival Time') packet.frame.time = value;
+              if (key === 'Time since reference') packet.frame.time_relative = value;
+              if (key === 'Frame Length') packet.frame.length = value;
+            }
           }
-        } else {
-          // Frame-level fields
-          currentPacket.frame[key] = value;
         }
-        lastIndent = indent;
+        
+        if (frameFields.length > 0) {
+          packet.layers.push({
+            name: 'Frame',
+            protocol: 'frame',
+            fields: frameFields
+          });
+        }
+        continue;
       }
-    } else if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
-      // Bracketed metadata like [Coloring Rule Name: UDP]
-      const content = trimmedLine.slice(1, -1);
-      if (content.includes(': ')) {
-        const [key, value] = content.split(': ');
-        if (currentLayer) {
-          currentLayer.fields.push({ key: `[${key}]`, value, indent });
+      
+      // Extract fields from this protocol
+      const fields = [];
+      const fieldMatches = protoXml.match(/<field[^>]*showname="[^"]+"[^>]*\/>/g) || [];
+      
+      for (const fieldXml of fieldMatches) {
+        const fieldShowname = fieldXml.match(/showname="([^"]+)"/);
+        const fieldShow = fieldXml.match(/show="([^"]+)"/);
+        
+        if (fieldShowname) {
+          const parts = fieldShowname[1].split(': ');
+          const key = parts[0].trim();
+          const value = fieldShow ? fieldShow[1] : (parts.slice(1).join(': ') || '');
+          
+          // Filter out empty or very long values
+          if (key && value && value.length < 500) {
+            fields.push({ key, value });
+          }
         }
       }
-    } else if (currentLayer && trimmedLine.length > 0 && !trimmedLine.includes(':')) {
-      // Continuation line or standalone value
-      if (currentLayer.fields.length > 0) {
-        const lastField = currentLayer.fields[currentLayer.fields.length - 1];
-        if (lastField.value.length < 200) {
-          lastField.value += ' ' + trimmedLine;
+      
+      // Also extract nested fields
+      const nestedFieldMatches = protoXml.match(/<field[^>]*name="[^"]+"[^>]*show="[^"]+"[^>]*\/>/g) || [];
+      for (const fieldXml of nestedFieldMatches) {
+        const nameMatch = fieldXml.match(/name="([^"]+)"/);
+        const showMatch = fieldXml.match(/show="([^"]+)"/);
+        const shownameMatch = fieldXml.match(/showname="([^"]+)"/);
+        
+        if (shownameMatch) {
+          const parts = shownameMatch[1].split(': ');
+          const key = parts[0].trim();
+          const value = showMatch ? showMatch[1] : (parts.slice(1).join(': ') || '');
+          
+          if (key && value && value.length < 500 && !fields.find(f => f.key === key)) {
+            fields.push({ key, value });
+          }
+        } else if (nameMatch && showMatch) {
+          const key = nameMatch[1].split('.').pop().replace(/_/g, ' ');
+          const value = showMatch[1];
+          
+          if (key && value && value.length < 500 && !fields.find(f => f.key === key)) {
+            fields.push({ key, value });
+          }
         }
+      }
+      
+      // Only add layer if it has fields or is a known protocol
+      if (fields.length > 0 || ['eth', 'ip', 'ipv6', 'tcp', 'udp', 'dns', 'http', 'tls', 'dhcp', 'dhcpv6', 'mdns', 'ssdp', 'icmp', 'arp', 'ssdp', 'snmp', 'smb', 'ftp', 'ssh', 'smtp', 'ntp', 'igmp'].includes(protoName)) {
+        packet.layers.push({
+          name: protoShowName || protoName.toUpperCase(),
+          protocol: protoName.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10),
+          fields: fields.length > 0 ? fields : [{ key: 'Protocol', value: protoShowName || protoName }]
+        });
       }
     }
+    
+    // Extract Info column if present
+    const infoMatch = packetXml.match(/<field[^>]*name="_ws\.col\.Info"[^>]*show="([^"]+)"/);
+    if (infoMatch) {
+      packet.info = infoMatch[1];
+    }
+    
+    packets.push(packet);
   }
   
-  // Don't forget the last packet
-  if (currentPacket) packets.push(currentPacket);
-  
-  // Find the target packet (TShark -V outputs all packets up to -c limit)
-  const target = packets.find((p, i) => i === targetPacket - 1);
-  
+  // Find the target packet
+  const target = packets[targetPacket - 1];
   if (!target && packets.length > 0) {
-    return packets[packets.length - 1]; // Return last packet if target not found
+    return packets[packets.length - 1];
   }
   
-  return target || { frame: {}, layers: [], raw_text: output };
+  return target || { frame: {}, layers: [], info: '' };
 }
 
 // ── SEARXNG WEB SEARCH FOR PORT INFO ─────────────────────────────────
@@ -701,6 +679,7 @@ const PORT_INFO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 // SearXNG search function (NO AI - pure HTTP requests to your SearXNG instance)
 function searxngSearch(query) {
   return new Promise((resolve) => {
+    // Ensure JSON format is requested
     const url = `${SEARXNG_URL}/search?q=${encodeURIComponent(query)}&format=json&engines=${SEARXNG_ENGINES}`;
     
     console.log(`[SearXNG] Searching: "${query}" via ${SEARXNG_URL}`);
@@ -708,7 +687,8 @@ function searxngSearch(query) {
     const req = https.get(url, {
       headers: { 
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        'Accept-Encoding': 'identity'
       },
       timeout: SEARXNG_TIMEOUT_MS
     }, (res) => {
@@ -716,6 +696,14 @@ function searxngSearch(query) {
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
+          // Check if response is HTML (error page)
+          if (data.trim().toLowerCase().startsWith('<!doctype') || 
+              data.trim().toLowerCase().startsWith('<html')) {
+            console.error(`[SearXNG] Received HTML instead of JSON. Response may need format=json enabled on server.`);
+            console.error(`[SearXNG] HTML preview: ${data.slice(0, 200)}...`);
+            return resolve(null);
+          }
+          
           const json = JSON.parse(data);
           if (json.results && json.results.length > 0) {
             const results = json.results.slice(0, SEARXNG_MAX_RESULTS).map(r => ({
@@ -732,6 +720,7 @@ function searxngSearch(query) {
           }
         } catch (e) {
           console.error(`[SearXNG] Parse error: ${e.message}`);
+          console.error(`[SearXNG] Response preview: ${data.slice(0, 300)}...`);
           resolve(null);
         }
       });
@@ -1421,7 +1410,7 @@ const server = http.createServer(async (req, res) => {
     return respond(details);
   }
 
-  // ── Full Wireshark-style Packet Dissection (TShark -V) ────────────────────────
+  // ── Full Wireshark-style Packet Dissection (TShark PDML) ────────────────────────
   if (url.startsWith('/pcap/packet-dissection') && method === 'GET') {
     const q = getQuery(url);
     if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
@@ -1432,9 +1421,9 @@ const server = http.createServer(async (req, res) => {
     const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
     if (!fs.existsSync(pcapPath)) return respond({ error: 'Session expired or not found' }, 404);
 
-    // Use TShark's verbose mode for full dissection like Wireshark
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -V -c ${packetNum}`;
-    console.log(`[TShark-Dissect] Getting full dissection for packet ${packetNum}`);
+    // Use TShark's PDML output for COMPLETE protocol dissection (XML format - captures ALL protocols)
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T pdml -c ${packetNum}`;
+    console.log(`[TShark-Dissect] Getting PDML dissection for packet ${packetNum}`);
     
     exec(cmd, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
@@ -1442,8 +1431,9 @@ const server = http.createServer(async (req, res) => {
         return respond({ error: 'Failed to dissect packet' }, 500);
       }
       
-      // Parse the verbose output into structured layers
-      const dissection = parseVerboseOutput(stdout, packetNum);
+      // Parse the PDML XML output into structured layers
+      const dissection = parsePdmlOutput(stdout, packetNum);
+      console.log(`[TShark-Dissect] ✓ Parsed ${dissection.layers?.length || 0} layers`);
       return respond(dissection);
     });
     return;
