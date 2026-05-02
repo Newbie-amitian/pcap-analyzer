@@ -2396,48 +2396,83 @@ const server = http.createServer(async (req, res) => {
       }
 
       // ═══════════════════════════════════════════════════════════════
-      // PRE-COMPUTE EVERYTHING - Runs ONCE, queries are INSTANT later!
+      // QUICK STATS FIRST - Return response FAST, pre-compute in background!
       // ═══════════════════════════════════════════════════════════════
-      console.log(`[Upload] Starting pre-computation for ${session_id}...`);
-      const precomputed = await precomputeAllData(session_id);
+      console.log(`[Upload] Getting quick stats for ${session_id}...`);
       
-      if (precomputed) {
-        // Store pre-computed data for instant queries
-        precomputedData.set(session_id, precomputed);
-        console.log(`[Upload] ✓ Pre-computation complete! Data cached for instant queries.`);
-        console.log(`[Upload] ✓ Stored in precomputedData: ${session_id}`);
-        console.log(`[Upload] ✓ Data summary: ${precomputed.total_packets} packets, ${precomputed.dns_queries?.length || 0} DNS, ${precomputed.http_hosts?.length || 0} HTTP hosts`);
-        console.log(`[Upload] ✓ precomputedData now has ${precomputedData.size} sessions`);
-      } else {
-        console.warn(`[Upload] ⚠ Pre-computation had issues, queries may be slower.`);
-      }
-
+      // Get basic stats QUICKLY (just packet count and protocols)
+      const [quickTotal, quickProtos, quickDuration] = await Promise.all([
+        getTruePacketCount(session_id),
+        getProtocolCounts(session_id, 2000),  // Sample 2000 packets for protocols
+        new Promise((resolve) => {
+          const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.time_relative 2>/dev/null | tail -1`;
+          exec(cmd, { timeout: 10000 }, (err, stdout) => {
+            resolve(parseFloat(stdout.trim()) || 0);
+          });
+        }),
+      ]);
+      
+      console.log(`[Upload] Quick stats: ${quickTotal} packets, ${Object.keys(quickProtos || {}).length} protocols`);
+      
+      // Update session with quick stats
       const sessionData = sessions.get(session_id);
       if (sessionData) {
-        sessionData.total_packets = precomputed?.total_packets || 0;
-        sessionData.precomputed = true;
+        sessionData.total_packets = quickTotal || 0;
+        sessionData.precomputed = false;  // Mark as not yet pre-computed
         sessions.set(session_id, sessionData);
       }
 
-      return respond({
+      // ═══════════════════════════════════════════════════════════════
+      // RETURN RESPONSE IMMEDIATELY - Don't wait for full pre-computation!
+      // ═══════════════════════════════════════════════════════════════
+      respond({
         session_id,
         summary: {
-          total_packets: precomputed?.total_packets || 0,
-          protocols: precomputed?.protocols || {},
-          duration_seconds: precomputed?.duration_seconds || 0,
-          time_range: { start: 0, end: precomputed?.duration_seconds || 0 },
-          raw_text: precomputed?.raw_stats || '',
+          total_packets: quickTotal || 0,
+          protocols: quickProtos || {},
+          duration_seconds: Math.round(quickDuration) || 0,
+          time_range: { start: 0, end: Math.round(quickDuration) || 0 },
+          raw_text: '',
         },
-        // Include pre-computed data so frontend can use it immediately
         precomputed: {
-          dns_queries: precomputed?.dns_queries?.length || 0,
-          http_hosts: precomputed?.http_hosts?.length || 0,
-          https_sites: precomputed?.https_sites?.length || 0,
-          http_objects: precomputed?.http_objects?.length || 0,
-          unique_ips: (precomputed?.unique_src_ips?.length || 0) + (precomputed?.unique_dst_ips?.length || 0),
-          ports: Object.keys(precomputed?.ports || {}).length,
+          status: 'computing',  // Tell frontend we're still computing
+          dns_queries: 0,
+          http_hosts: 0,
+          https_sites: 0,
+          http_objects: 0,
+          unique_ips: 0,
+          ports: 0,
         },
       });
+      
+      // ═══════════════════════════════════════════════════════════════
+      // PRE-COMPUTE IN BACKGROUND - Runs ONCE, queries are INSTANT later!
+      // ═══════════════════════════════════════════════════════════════
+      console.log(`[Upload] Starting BACKGROUND pre-computation for ${session_id}...`);
+      
+      // Run pre-computation in background (don't await!)
+      precomputeAllData(session_id).then((precomputed) => {
+        if (precomputed) {
+          // Store pre-computed data for instant queries
+          precomputedData.set(session_id, precomputed);
+          console.log(`[Upload] ✓ Background pre-computation complete!`);
+          console.log(`[Upload] ✓ Data: ${precomputed.total_packets} packets, ${precomputed.dns_queries?.length || 0} DNS, ${precomputed.http_hosts?.length || 0} HTTP hosts`);
+          
+          // Update session to mark pre-computation complete
+          const sd = sessions.get(session_id);
+          if (sd) {
+            sd.precomputed = true;
+            sd.total_packets = precomputed.total_packets;
+            sessions.set(session_id, sd);
+          }
+        } else {
+          console.warn(`[Upload] ⚠ Background pre-computation had issues.`);
+        }
+      }).catch(err => {
+        console.error(`[Upload] Background pre-computation error: ${err.message}`);
+      });
+      
+      return;  // Response already sent!
     } catch (e) {
       console.error(`[Upload] Error: ${e.message}`);
       return respond({ error: e.message }, 500);
@@ -2780,7 +2815,24 @@ const server = http.createServer(async (req, res) => {
       console.log(`[Agent-Stream] Query received for session: ${session_id}`);
       
       // Check for pre-computed data
-      const precomputed = precomputedData.get(session_id);
+      let precomputed = precomputedData.get(session_id);
+      
+      // If no pre-computed data yet, check if it's still computing
+      if (!precomputed) {
+        const sessionInfo = sessions.get(session_id);
+        if (sessionInfo && sessionInfo.precomputed === false) {
+          console.log(`[Agent-Stream] Pre-computation still running, waiting...`);
+          // Wait up to 30 seconds for pre-computation to complete
+          for (let i = 0; i < 30; i++) {
+            await new Promise(r => setTimeout(r, 1000));
+            precomputed = precomputedData.get(session_id);
+            if (precomputed) {
+              console.log(`[Agent-Stream] ✓ Pre-computation completed while waiting!`);
+              break;
+            }
+          }
+        }
+      }
       
       if (!precomputed) {
         console.error(`[Agent-Stream] ❌ NO PRE-COMPUTED DATA for ${session_id}!`);
@@ -2790,7 +2842,7 @@ const server = http.createServer(async (req, res) => {
           'Connection': 'keep-alive',
           ...getCorsHeaders(origin),
         });
-        res.write(`data: ${JSON.stringify({ error: 'Session data not found. Please re-upload.' })}\n\n`);
+        res.write(`data: ${JSON.stringify({ token: '⏳ Still analyzing your PCAP file. Please wait a few seconds and try again. Large files may take up to a minute to fully analyze.' })}\n\n`);
         res.write('data: [DONE]\n\n');
         return res.end();
       }
@@ -2865,9 +2917,38 @@ const server = http.createServer(async (req, res) => {
         });
       }
       
-      // NO PRE-COMPUTED DATA - This shouldn't happen!
-      console.error(`[Agent] ❌ NO PRE-COMPUTED DATA for ${session_id}!`);
-      console.error(`[Agent] Available sessions:`, [...precomputedData.keys()]);
+      // NO PRE-COMPUTED DATA YET - Maybe still computing?
+      console.log(`[Agent] ⚠ No pre-computed data yet for ${session_id}`);
+      console.log(`[Agent] Available sessions:`, [...precomputedData.keys()]);
+      
+      // Check if session exists but pre-computation is still running
+      const sessionInfo = sessions.get(session_id);
+      if (sessionInfo && sessionInfo.precomputed === false) {
+        console.log(`[Agent] Pre-computation still running, waiting...`);
+        // Wait up to 30 seconds for pre-computation to complete
+        for (let i = 0; i < 30; i++) {
+          await new Promise(r => setTimeout(r, 1000));
+          const checkPrecomputed = precomputedData.get(session_id);
+          if (checkPrecomputed) {
+            console.log(`[Agent] ✓ Pre-computation completed while waiting!`);
+            const llmPrompt = buildLLMPromptFromPrecomputed(prompt, checkPrecomputed);
+            const llmResponse = await callLLM(llmPrompt);
+            return respond({
+              tool_called: 'llm',
+              parameters: {},
+              result: null,
+              response: llmResponse || 'Unable to analyze. Please try again.',
+            });
+          }
+        }
+        // Still not ready after 30 seconds
+        return respond({
+          tool_called: 'chat',
+          parameters: {},
+          result: null,
+          response: '⏳ Still analyzing your PCAP file. Please wait a few seconds and try again. Large files may take up to a minute to fully analyze.',
+        });
+      }
       
       // ═══════════════════════════════════════════════════════════════
       // FALLBACK - No pre-computed data, run TShark (slower)
