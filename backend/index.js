@@ -89,6 +89,53 @@ const SESSION_TTL_MS = 30 * 60 * 1000;
 // Pre-computed data store (cached analysis results)
 const precomputedData = new Map();
 
+// ═══════════════════════════════════════════════════════════════════
+// SESSION RECOVERY - Handle Render spin-down and restart
+// When Render spins down, memory is wiped but PCAP files survive on disk
+// This function recovers sessions from disk if they exist
+// ═══════════════════════════════════════════════════════════════════
+async function ensureSession(sessionId) {
+  // Check if session exists in memory
+  if (sessions.has(sessionId)) {
+    return true;
+  }
+  
+  const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+  
+  // If PCAP file exists on disk, recreate the session
+  if (fs.existsSync(pcapPath)) {
+    console.log(`[SessionRecovery] Recreating lost session: ${sessionId}`);
+    
+    // Recreate session in memory
+    sessions.set(sessionId, {
+      session_id: sessionId,
+      filename: 'restored.pcap',
+      created_at: Date.now(),
+      precomputed: false,
+    });
+    
+    // Re-run precomputation in background (don't block)
+    precomputeAllData(sessionId).then(data => {
+      if (data) {
+        precomputedData.set(sessionId, data);
+        const sd = sessions.get(sessionId);
+        if (sd) {
+          sd.precomputed = true;
+          sd.total_packets = data.total_packets;
+        }
+        console.log(`[SessionRecovery] ✓ Precomputation complete for ${sessionId}`);
+      }
+    }).catch(err => {
+      console.error(`[SessionRecovery] Precomputation error: ${err.message}`);
+    });
+    
+    return true;
+  }
+  
+  // Session truly doesn't exist
+  return false;
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of sessions) {
@@ -2541,6 +2588,12 @@ const server = http.createServer(async (req, res) => {
       const q = getQuery(url);
       if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
 
+      // Try to recover session if it was lost due to server restart
+      const sessionExists = await ensureSession(q.session_id);
+      if (!sessionExists) {
+        return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
+      }
+
       const page = Math.max(1, parseInt(q.page || '1'));
       const per_page = Math.min(100, parseInt(q.per_page || '50'));  // Reduced from 200 to 100
       const skip = (page - 1) * per_page;
@@ -2787,8 +2840,12 @@ const server = http.createServer(async (req, res) => {
   if (url.startsWith('/pcap/vulnerabilities') && method === 'GET') {
     const q = getQuery(url);
     if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
-    if (!fs.existsSync(path.join(PCAP_DIR, `${q.session_id}.pcap`)))
-      return respond({ error: 'Session expired or not found' }, 404);
+    
+    // Try to recover session if it was lost due to server restart
+    const sessionExists = await ensureSession(q.session_id);
+    if (!sessionExists) {
+      return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
+    }
 
     // Use pre-computed ports data if available (MUCH faster, no TShark needed!)
     let precomputed = precomputedData.get(q.session_id);
@@ -2900,10 +2957,14 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
         return res.end(JSON.stringify({ error: 'Invalid session_id' }));
       }
-      if (!fs.existsSync(path.join(PCAP_DIR, `${session_id}.pcap`))) {
+      
+      // Try to recover session if it was lost due to server restart
+      const sessionExists = await ensureSession(session_id);
+      if (!sessionExists) {
         res.writeHead(404, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
-        return res.end(JSON.stringify({ error: 'Session expired or PCAP not found' }));
+        return res.end(JSON.stringify({ error: 'Session expired or not found. Please re-upload your PCAP file.' }));
       }
+      
       if (!prompt || typeof prompt !== 'string') {
         res.writeHead(400, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
         return res.end(JSON.stringify({ error: 'Missing prompt' }));
@@ -2971,8 +3032,13 @@ const server = http.createServer(async (req, res) => {
       const { prompt, session_id } = parsed || {};
 
       if (!isValidSessionId(session_id)) return respond({ error: 'Invalid session_id' }, 400);
-      if (!fs.existsSync(path.join(PCAP_DIR, `${session_id}.pcap`)))
-        return respond({ error: 'Session expired or PCAP not found' }, 404);
+      
+      // Try to recover session if it was lost due to server restart
+      const sessionExists = await ensureSession(session_id);
+      if (!sessionExists) {
+        return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
+      }
+      
       if (!prompt || typeof prompt !== 'string')
         return respond({ error: 'Missing prompt' }, 400);
 
@@ -3102,6 +3168,12 @@ const server = http.createServer(async (req, res) => {
     const q = getQuery(url);
     if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
 
+    // Try to recover session if it was lost due to server restart
+    const sessionExists = await ensureSession(q.session_id);
+    if (!sessionExists) {
+      return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
+    }
+
     const artifacts = imageStore.get(q.session_id);
     if (!artifacts || artifacts.size === 0)
       return respond({
@@ -3125,6 +3197,13 @@ const server = http.createServer(async (req, res) => {
   if (url.startsWith('/pcap/image-data') && method === 'GET') {
     const q = getQuery(url);
     if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
+    
+    // Try to recover session if it was lost due to server restart
+    const sessionExists = await ensureSession(q.session_id);
+    if (!sessionExists) {
+      return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
+    }
+    
     const art = imageStore.get(q.session_id)?.get(q.key || '');
     if (!art) return respond({ error: 'Object not found' }, 404);
 
