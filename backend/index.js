@@ -125,12 +125,15 @@ setInterval(() => {
 
 // ── CORS ──────────────────────────────────────────────────────
 function getCorsHeaders(origin) {
-  // Only allow requests from the configured frontend
-  const allowedOrigin = ALLOWED_ORIGIN === '*' ? '*' : ALLOWED_ORIGIN;
+  // Allow both localhost variants during dev
+  const allowed = [ALLOWED_ORIGIN, 'http://localhost:3000', 'http://127.0.0.1:3000'];
+  const allowedOrigin = allowed.includes(origin) ? origin : ALLOWED_ORIGIN;
   return {
     'Access-Control-Allow-Origin': allowedOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Credentials': 'true',
+    'Vary': 'Origin',
   };
 }
 
