@@ -163,6 +163,7 @@ const DEFAULT_FIELDS = [
   'tcp.srcport', 'tcp.dstport', // TCP ports
   'udp.srcport', 'udp.dstport', // UDP ports
   'frame.time_relative',
+  'frame.time',                 // Absolute date/time
 ];
 
 function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
@@ -189,7 +190,7 @@ function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
       const lines = stdout.trim().split('\n').filter(l => l.trim());
       const packets = lines.map(line => {
         const c = line.split('\t');
-        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative
+        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative, frame.time
         // Use IPv4 if available, else IPv6; Use TCP ports if available, else UDP ports
         return {
           id: parseInt(c[0]) || 0,
@@ -200,6 +201,7 @@ function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
           src_port: parseInt(c[7]) || parseInt(c[9]) || null,  // TCP src or UDP src
           dst_port: parseInt(c[8]) || parseInt(c[10]) || null, // TCP dst or UDP dst
           timestamp: parseFloat(c[11]) || 0,
+          datetime: c[12] || '',  // Absolute date/time
         };
       });
       console.log(`[TShark] Returned ${packets.length} packets`);
@@ -230,7 +232,7 @@ function runTsharkPaged(sessionId, skip, limit) {
       const pageLines = lines.slice(skip);
       const packets = pageLines.map(line => {
         const c = line.split('\t');
-        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative
+        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative, frame.time
         return {
           id: parseInt(c[0]) || 0,
           src_ip: c[1] || c[3] || null,  // IPv4 src or IPv6 src
@@ -240,6 +242,7 @@ function runTsharkPaged(sessionId, skip, limit) {
           src_port: parseInt(c[7]) || parseInt(c[9]) || null,  // TCP src or UDP src
           dst_port: parseInt(c[8]) || parseInt(c[10]) || null, // TCP dst or UDP dst
           timestamp: parseFloat(c[11]) || 0,
+          datetime: c[12] || '',  // Absolute date/time
         };
       });
       console.log(`[TSharkPaged] → ${packets.length} packets returned`);
@@ -1475,7 +1478,7 @@ const server = http.createServer(async (req, res) => {
       
       const packets = pageLines.map(line => {
         const c = line.split('\t');
-        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative, info
+        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative, frame.time, info
         return {
           id: parseInt(c[0]) || 0,
           src_ip: c[1] || c[3] || null,  // IPv4 src or IPv6 src
@@ -1485,7 +1488,8 @@ const server = http.createServer(async (req, res) => {
           src_port: parseInt(c[7]) || parseInt(c[9]) || null,  // TCP src or UDP src
           dst_port: parseInt(c[8]) || parseInt(c[10]) || null, // TCP dst or UDP dst
           timestamp: parseFloat(c[11]) || 0,
-          info: c[12] || '',
+          datetime: c[12] || '',  // Absolute date/time
+          info: c[13] || '',
         };
       });
 
