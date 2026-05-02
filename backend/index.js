@@ -125,15 +125,25 @@ setInterval(() => {
 
 // ── CORS ──────────────────────────────────────────────────────
 function getCorsHeaders(origin) {
-  // Allow both localhost variants during dev
-  const allowed = [ALLOWED_ORIGIN, 'http://localhost:3000', 'http://127.0.0.1:3000'];
-  const allowedOrigin = allowed.includes(origin) ? origin : ALLOWED_ORIGIN;
+  // For development, allow any localhost origin
+  // For production, use ALLOWED_ORIGIN or the request origin if it's allowed
+  let allowedOrigin = ALLOWED_ORIGIN;
+  
+  // Allow any localhost port for development
+  if (origin && (origin.includes('localhost') || origin.includes('127.0.0.1'))) {
+    allowedOrigin = origin;
+  }
+  
+  // If ALLOWED_ORIGIN is '*', allow any origin
+  if (ALLOWED_ORIGIN === '*') {
+    allowedOrigin = '*';
+  }
+  
   return {
     'Access-Control-Allow-Origin': allowedOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Credentials': 'true',
-    'Vary': 'Origin',
+    'Access-Control-Max-Age': '86400', // Cache preflight for 24 hours
   };
 }
 
@@ -1970,14 +1980,13 @@ RULES:
     
     console.log(`[LLM-Stream] Starting streaming request to Cloudflare...`);
     
-    // Set up SSE headers
+    // Set up SSE headers with proper CORS
+    const corsHeaders = getCorsHeaders(origin);
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': ALLOWED_ORIGIN === '*' ? '*' : ALLOWED_ORIGIN,
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      ...corsHeaders,
     });
     
     const req = https.request(options, (cfRes) => {
@@ -2350,9 +2359,19 @@ const server = http.createServer(async (req, res) => {
   const clientIp = req.headers['x-forwarded-for']?.split(',')[0].trim()
     || req.socket.remoteAddress || 'unknown';
 
+  // Log all incoming requests for debugging
+  console.log(`[Request] ${method} ${url} Origin: ${origin || 'none'}`);
+
   const respond = (data, status = 200) => json(res, data, status, origin, enc);
 
-  if (method === 'OPTIONS') { res.writeHead(204, getCorsHeaders(origin)); return res.end(); }
+  // Handle CORS preflight FIRST - before any other processing
+  if (method === 'OPTIONS') {
+    console.log(`[CORS] Preflight request from origin: ${origin}`);
+    const corsHeaders = getCorsHeaders(origin);
+    console.log(`[CORS] Returning headers:`, corsHeaders);
+    res.writeHead(204, corsHeaders);
+    return res.end();
+  }
 
   if (url === '/ping' || url === '/pcap/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', ...getCorsHeaders(origin) });
@@ -3098,6 +3117,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   return respond({ error: 'Not found' }, 404);
+});
+
+// Global error handler to prevent crashes
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err.message);
+  console.error(err.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled rejection:', reason);
 });
 
 const PORT = process.env.PORT || 4000;
