@@ -51,8 +51,8 @@ console.log(`   ALLOWED_ORIGIN = ${ALLOWED_ORIGIN}`);
 // ═══════════════════════════════════════════════════════════════════
 // Cloudflare Workers AI - MUCH FASTER than HuggingFace Spaces!
 const CF_LLM_MODEL = '@cf/meta/llama-3-8b-instruct';
-const CF_LLM_TIMEOUT_MS = 10000; // 10 seconds (Cloudflare is FAST!)
-const HF_LLM_TIMEOUT_MS = 10000; // Kept for compatibility
+const CF_LLM_TIMEOUT_MS = 8000; // 8 seconds (Cloudflare is FAST!)
+const HF_LLM_TIMEOUT_MS = 8000; // Kept for compatibility
 const SEARXNG_TIMEOUT_MS = 10000;
 const SEARXNG_MAX_RESULTS = 5;
 const SEARXNG_ENGINES = 'google,bing,duckduckgo,startpage';
@@ -1390,9 +1390,7 @@ async function generateNaturalResponse(prompt) {
   // For more complex natural conversation, use LLM for dynamic response
   if (isCompliment(prompt) || isHowAreYou(prompt) || isAboutAgent(prompt) || isAskingTime(prompt) || isGreeting(prompt)) {
     // SHORT prompt for fast LLM response
-    const llmPrompt = `You are a PCAP Security Agent. User said: "${prompt}"
-
-Reply warmly with bullet points (•) and emojis. Keep it 2-3 sentences. Be helpful.`;
+    const llmPrompt = `User: "${prompt}"\nReply with 3 bullets + emojis. Be brief.`;
 
     const llmResponse = await callLLM(llmPrompt);
     if (llmResponse) {
@@ -1628,9 +1626,10 @@ async function callLLM(prompt) {
     // Use Cloudflare Workers AI - FAST edge inference!
     const postData = JSON.stringify({
       messages: [
-        { role: 'system', content: 'You are a helpful PCAP Security Agent. Always respond with bullet points (•) and emojis. Keep responses concise (3-4 sentences max). Be friendly and helpful.' },
+        { role: 'system', content: 'You are a PCAP Security Agent. Respond with 3-4 bullet points (•) and emojis. Be concise.' },
         { role: 'user', content: prompt }
-      ]
+      ],
+      max_tokens: 256  // Limit tokens for faster response
     });
     
     const options = {
@@ -1696,95 +1695,57 @@ async function formatResponseWithLLM(userPrompt, agentResult, toolResult, sessio
   // Build context for LLM based on the tool type - KEEP PROMPTS SHORT!
   let llmPrompt = '';
   
-  // Handle unknown queries (llm tool)
+  // Handle unknown queries (llm tool) - SHORT PROMPT FOR SPEED
   if (agentResult.tool === 'llm') {
-    llmPrompt = `You are a friendly PCAP Security Agent. User said: "${userPrompt}"
-
-Reply warmly with bullet points (•) and emojis. Keep it short (2-3 sentences). End with a helpful question.`;
+    llmPrompt = `User: "${userPrompt}"\nReply with 3 bullets (•) + emojis. Be brief.`;
   }
-  // Handle statistics - EXTRACT KEY DATA, don't send raw output!
+  // Handle statistics - SHORT PROMPT FOR SPEED
   else if (agentResult.tool === 'stat' && toolResult.result?.raw_text) {
     const raw = toolResult.result.raw_text;
-    
-    // Extract key numbers from the raw output
     const durationMatch = raw.match(/Duration:\s*([\d.]+)/);
     const framesMatch = raw.match(/(\d+)\s+frames?\s+\|\s+(\d+)\s+bytes/i) || raw.match(/\|\s*(\d+)\s*\|\s*(\d+)/);
+    const duration = durationMatch ? durationMatch[1] : '?';
+    const frames = framesMatch ? framesMatch[1] : '?';
+    const bytes = framesMatch ? framesMatch[2] : '?';
     
-    const duration = durationMatch ? durationMatch[1] : 'unknown';
-    const frames = framesMatch ? framesMatch[1] : 'unknown';
-    const bytes = framesMatch ? framesMatch[2] : 'unknown';
-    
-    llmPrompt = `You are a PCAP Security Agent. The user asked: "${userPrompt}"
-
-Key data from analysis:
-- Total packets: ${frames}
-- Total bytes: ${bytes}
-- Duration: ${duration} seconds
-
-Summarize this in 3-4 bullet points (•) with emojis. Be concise and helpful.`;
+    llmPrompt = `PCAP: ${frames} packets, ${bytes} bytes, ${duration}s.\n3 bullets + emojis.`;
   }
-  // Handle protocol hierarchy - PARSE IT!
+  // Handle protocol hierarchy - SHORT PROMPT FOR SPEED
   else if (agentResult.tool === 'stat' && agentResult.stat === 'io,phs') {
     const raw = toolResult.result?.raw_text || '';
+    const protoMatches = raw.match(/(\w+)\s+frames:(\d+)/g) || [];
+    const topProtos = protoMatches.slice(0, 5).map(m => {
+      const parts = m.match(/(\w+)\s+frames:(\d+)/);
+      return parts ? `${parts[1]}(${parts[2]})` : '';
+    }).filter(Boolean).join(', ');
     
-    // Extract top protocols
-    const protoMatches = raw.match(/(\w+)\s+frames:(\d+)\s+bytes:(\d+)/g) || [];
-    const topProtos = protoMatches.slice(0, 8).map(m => {
-      const parts = m.match(/(\w+)\s+frames:(\d+)\s+bytes:(\d+)/);
-      return parts ? `${parts[1]}: ${parts[2]} packets` : '';
-    }).filter(Boolean);
-    
-    llmPrompt = `You are a PCAP Security Agent. User asked: "${userPrompt}"
-
-Top protocols found:
-${topProtos.join('\n')}
-
-Summarize in 3-4 bullet points (•) with emojis. Mention the main protocols and their purpose.`;
+    llmPrompt = `Protocols: ${topProtos}\n3 bullets + emojis.`;
   }
-  // Handle top talkers - PARSE IT!
+  // Handle top talkers - SHORT PROMPT FOR SPEED
   else if (agentResult.tool === 'stat' && agentResult.stat === 'conv,ip') {
     const raw = toolResult.result?.raw_text || '';
-    
-    // Extract top IPs
     const ipMatches = raw.match(/(\d+\.\d+\.\d+\.\d+)\s*<->\s*(\d+\.\d+\.\d+\.\d+)/g) || [];
-    const topIPs = ipMatches.slice(0, 5);
+    const topIPs = ipMatches.slice(0, 3).join(', ');
     
-    llmPrompt = `You are a PCAP Security Agent. User asked: "${userPrompt}"
-
-Top communicating IPs:
-${topIPs.map(ip => `• ${ip}`).join('\n')}
-
-Summarize in 3-4 bullet points with emojis. Note any patterns or concerns.`;
+    llmPrompt = `Top IPs: ${topIPs}\n3 bullets + emojis.`;
   }
-  // Handle packet results
+  // Handle packet results - SHORT PROMPT FOR SPEED
   else if (agentResult.tool === 'packets' && Array.isArray(toolResult.result)) {
     const count = toolResult.result.length;
-    const protocols = [...new Set(toolResult.result.map(p => p.protocol))].slice(0, 5);
+    const protocols = [...new Set(toolResult.result.map(p => p.protocol))].slice(0, 3).join(', ');
     
-    llmPrompt = `You are a PCAP Security Agent. User asked: "${userPrompt}"
-
-Found ${count} packets. Protocols: ${protocols.join(', ')}
-
-Summarize in 3-4 bullet points (•) with emojis. Be concise.`;
+    llmPrompt = `${count} packets. Protocols: ${protocols}\n3 bullets + emojis.`;
   }
-  // Handle vulnerability analysis
+  // Handle vulnerability analysis - SHORT PROMPT FOR SPEED
   else if (agentResult.tool === 'vuln' && Array.isArray(toolResult.result)) {
     const highRisk = toolResult.result.filter(v => v.risk === 'HIGH' || v.risk === 'CRITICAL').length;
     const totalPorts = toolResult.result.length;
     
-    llmPrompt = `You are a PCAP Security Agent. User asked: "${userPrompt}"
-
-Security scan results:
-- ${totalPorts} unique ports found
-- ${highRisk} high/critical risk ports
-
-Summarize security findings in 3-4 bullet points (•) with 🛡️⚠️ emojis. Suggest actions for risky ports.`;
+    llmPrompt = `Security: ${totalPorts} ports, ${highRisk} risky.\n3 bullets with 🛡️⚠️.`;
   }
-  // Default case
+  // Default case - SHORT PROMPT FOR SPEED
   else {
-    llmPrompt = `You are a PCAP Security Agent. User asked: "${userPrompt}"
-
-Provide a helpful 2-3 sentence response with bullet points (•) and emojis.`;
+    llmPrompt = `User: "${userPrompt}"\n3 bullets + emojis.`;
   }
 
   const llmResponse = await callLLM(llmPrompt);
@@ -2290,11 +2251,23 @@ const server = http.createServer(async (req, res) => {
       // Use LLM to format the response nicely
       const llmResponse = await formatResponseWithLLM(prompt, agentResult, toolResult, session_id);
 
+      // If LLM formatted the response, return ONLY the LLM response (no raw data)
+      // This makes the output clean and AI-like instead of showing raw TShark output
+      if (llmResponse) {
+        return respond({
+          tool_called: agentResult.tool,
+          parameters: { filter: agentResult.filter || '', stat: agentResult.stat || '' },
+          result: null,  // Don't return raw data - LLM already formatted it!
+          response: llmResponse,
+        });
+      }
+
+      // Fallback: return raw result if LLM failed
       return respond({
         tool_called: agentResult.tool,
         parameters: { filter: agentResult.filter || '', stat: agentResult.stat || '' },
         result: toolResult.result,
-        response: llmResponse || toolResult.response,
+        response: toolResult.response,
       });
     } catch (e) {
       console.error(`[Agent] Error: ${e.message}`);
