@@ -465,6 +465,9 @@ async function precomputeAllData(sessionId) {
     // Conversation stats
     ip_conversations: [],
     
+    // Packets (first 500 for dashboard)
+    packets: [],
+    
     // Raw stats text
     raw_stats: '',
     raw_hierarchy: '',
@@ -619,6 +622,37 @@ async function precomputeAllData(sessionId) {
         is_image: v.contentType.startsWith('image/'),
       }));
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // FETCH PACKETS FOR DASHBOARD - First 500 packets for quick display
+    // ═══════════════════════════════════════════════════════════════
+    console.log(`[PreCompute] Fetching packets for dashboard...`);
+    const packetsData = await new Promise((resolve) => {
+      const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e frame.number -e ip.src -e ip.dst -e frame.len -e _ws.col.Protocol -e tcp.srcport -e tcp.dstport -e udp.srcport -e udp.dstport -e frame.time_relative 2>/dev/null | head -500`;
+      exec(cmd, { timeout: 30000 }, (err, stdout) => {
+        if (err || !stdout.trim()) return resolve([]);
+        const lines = stdout.trim().split('\n').filter(l => l.trim());
+        const packets = lines.map(line => {
+          const c = line.split('\t');
+          const protocol = (c[4] || '').trim();
+          const srcPort = parseInt(c[5]) || parseInt(c[7]) || null;
+          const dstPort = parseInt(c[6]) || parseInt(c[8]) || null;
+          return {
+            id: parseInt(c[0]) || 0,
+            src_ip: c[1] || null,
+            dst_ip: c[2] || null,
+            length: parseInt(c[3]) || 0,
+            protocol: detectProtocolFromPort(srcPort, dstPort, protocol),
+            src_port: srcPort,
+            dst_port: dstPort,
+            timestamp: parseFloat(c[9]) || 0,
+          };
+        });
+        resolve(packets);
+      });
+    });
+    data.packets = packetsData;
+    console.log(`[PreCompute] Cached ${packetsData.length} packets for dashboard`);
 
     const elapsed = Date.now() - startTime;
     console.log(`[PreCompute] ✓ Complete in ${elapsed}ms`);
@@ -2481,19 +2515,39 @@ const server = http.createServer(async (req, res) => {
 
   // ── Packets ────────────────────────────────────────────────
   if (url.startsWith('/pcap/packets') && method === 'GET') {
-    const q = getQuery(url);
-    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
+    try {
+      const q = getQuery(url);
+      if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
 
-    const page = Math.max(1, parseInt(q.page || '1'));
-    const per_page = Math.min(200, parseInt(q.per_page || '50'));
-    const skip = (page - 1) * per_page;
+      const page = Math.max(1, parseInt(q.page || '1'));
+      const per_page = Math.min(100, parseInt(q.per_page || '50'));  // Reduced from 200 to 100
+      const skip = (page - 1) * per_page;
 
-    const packets = await runTsharkPaged(q.session_id, skip, per_page);
+      // Check if we have pre-computed packets
+      const precomputed = precomputedData.get(q.session_id);
+      if (precomputed?.packets?.length) {
+        console.log(`[Packets] Using pre-computed packets for ${q.session_id}`);
+        const start = skip;
+        const end = skip + per_page;
+        const packets = precomputed.packets.slice(start, end);
+        return respond({ packets, total: precomputed.total_packets, page, per_page });
+      }
 
-    const sessionData = sessions.get(q.session_id);
-    const realTotal = sessionData?.total_packets ?? 0;
+      // Fall back to TShark with timeout protection
+      const packets = await Promise.race([
+        runTsharkPaged(q.session_id, skip, per_page),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('TShark timeout')), 15000))
+      ]);
 
-    return respond({ packets, total: realTotal, page, per_page });
+      const sessionData = sessions.get(q.session_id);
+      const realTotal = sessionData?.total_packets ?? packets.length;
+
+      return respond({ packets, total: realTotal, page, per_page });
+    } catch (err) {
+      console.error(`[Packets] Error: ${err.message}`);
+      // Return empty result instead of erroring
+      return respond({ packets: [], total: 0, page: 1, per_page: 50, error: 'Still processing. Refresh in a few seconds.' });
+    }
   }
 
   // ── Detailed Packet Dissection ────────────────────────────────
