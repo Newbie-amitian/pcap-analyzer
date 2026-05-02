@@ -538,7 +538,7 @@ function getTlsHandshakeType(type) {
   return types[type] || `Type ${type}`;
 }
 
-// ── Parse TShark PDML Output (XML - captures ALL protocols) ─────────────────────────────
+// ── Parse TShark PDML Output (XML - captures ALL protocols with hierarchy) ─────────────────────────────
 function parsePdmlOutput(pdmlXml, targetPacket) {
   const packets = [];
   
@@ -567,29 +567,19 @@ function parsePdmlOutput(pdmlXml, targetPacket) {
         continue;
       }
       
-      // Extract ALL fields recursively from this protocol
-      const fields = extractAllFields(protoXml);
+      // Extract ALL fields RECURSIVELY with hierarchy from this protocol
+      const fields = extractFieldsHierarchical(protoXml, 0);
       
       // Handle frame protocol specially
       if (protoName === 'frame') {
-        const frameFields = [];
-        for (const field of fields) {
-          frameFields.push({ key: field.key, value: field.value });
-          
-          // Store important frame fields
-          if (field.key === 'Frame Number') packet.frame.number = field.value;
-          if (field.key === 'Arrival Time') packet.frame.time = field.value;
-          if (field.key === 'Time since reference') packet.frame.time_relative = field.value;
-          if (field.key === 'Frame Length') packet.frame.length = field.value;
-        }
+        // Extract frame-level data for the packet object
+        extractFrameData(fields, packet);
         
-        if (frameFields.length > 0) {
-          packet.layers.push({
-            name: 'Frame',
-            protocol: 'frame',
-            fields: frameFields
-          });
-        }
+        packet.layers.push({
+          name: 'Frame',
+          protocol: 'frame',
+          fields: fields
+        });
         continue;
       }
       
@@ -602,7 +592,7 @@ function parsePdmlOutput(pdmlXml, targetPacket) {
         packet.layers.push({
           name: protoShowName || protoName.toUpperCase(),
           protocol: protoName.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10),
-          fields: fields.length > 0 ? fields : [{ key: 'Protocol', value: protoShowName || protoName }]
+          fields: fields.length > 0 ? fields : [{ key: 'Protocol', value: protoShowName || protoName, children: [] }]
         });
       }
     }
@@ -628,32 +618,65 @@ function parsePdmlOutput(pdmlXml, targetPacket) {
   return target || { frame: {}, layers: [], info: '' };
 }
 
-// Recursively extract all fields from a protocol XML block
-function extractAllFields(protoXml) {
+// Extract frame-level data from parsed fields
+function extractFrameData(fields, packet) {
+  for (const field of fields) {
+    if (field.key === 'Frame Number') packet.frame.number = field.value;
+    if (field.key === 'Arrival Time') packet.frame.time = field.value;
+    if (field.key === 'Time Since Reference' || field.key === 'Time since reference') packet.frame.time_relative = field.value;
+    if (field.key === 'Frame Length') packet.frame.length = field.value;
+    // Recursively check children
+    if (field.children && field.children.length > 0) {
+      extractFrameData(field.children, packet);
+    }
+  }
+}
+
+// Recursively extract fields with hierarchy from a protocol XML block
+function extractFieldsHierarchical(xmlBlock, depth) {
   const fields = [];
   const seen = new Set();
   
-  // Pattern to match field elements (both self-closing and nested)
-  const fieldPattern = /<field[^>]*(?:\/>|>[\s\S]*?<\/field>)/g;
-  const fieldMatches = protoXml.match(fieldPattern) || [];
+  // Find all direct child field elements (not nested ones - those are handled recursively)
+  // A field can be self-closing <field .../> or have content <field ...>...</field>
+  const fieldPattern = /<field\s+([^>]*)(?:\/>|>([\s\S]*?)<\/field>)/g;
   
-  for (const fieldXml of fieldMatches) {
-    // Extract showname (human readable) and show (value)
-    const shownameMatch = fieldXml.match(/showname="([^"]+)"/);
-    const showMatch = fieldXml.match(/show="([^"]+)"/);
-    const nameMatch = fieldXml.match(/name="([^"]+)"/);
+  let match;
+  while ((match = fieldPattern.exec(xmlBlock)) !== null) {
+    const attrs = match[1];
+    const content = match[2] || '';
+    
+    // Extract attributes
+    const shownameMatch = attrs.match(/showname="([^"]+)"/);
+    const showMatch = attrs.match(/show="([^"]+)"/);
+    const nameMatch = attrs.match(/name="([^"]+)"/);
+    const sizeMatch = attrs.match(/size="([^"]+)"/);
+    const posMatch = attrs.match(/pos="([^"]+)"/);
+    
+    // Skip certain internal fields
+    const fieldName = nameMatch ? nameMatch[1] : '';
+    if (fieldName.startsWith('_ws.') && !fieldName.includes('Info')) {
+      continue;
+    }
     
     let key = '';
     let value = '';
+    let isExpandable = false;
     
     if (shownameMatch) {
       // Parse "Key: Value" format from showname
-      const parts = shownameMatch[1].split(': ');
-      key = parts[0].trim();
-      value = showMatch ? showMatch[1] : parts.slice(1).join(': ');
+      const showname = shownameMatch[1];
+      const colonIdx = showname.indexOf(': ');
+      if (colonIdx > 0) {
+        key = showname.substring(0, colonIdx).trim();
+        value = showMatch ? showMatch[1] : showname.substring(colonIdx + 2).trim();
+      } else {
+        key = showname.trim();
+        value = showMatch ? showMatch[1] : '';
+      }
     } else if (nameMatch && showMatch) {
       // Fallback to name attribute
-      key = nameMatch[1].split('.').pop().replace(/_/g, ' ');
+      key = fieldName.split('.').pop().replace(/_/g, ' ');
       value = showMatch[1];
     }
     
@@ -662,28 +685,42 @@ function extractAllFields(protoXml) {
       key = key.charAt(0).toUpperCase() + key.slice(1);
     }
     
-    // Filter out empty, duplicate, or very long values
-    if (key && value && value.length < 500 && !seen.has(key + ':' + value)) {
-      seen.add(key + ':' + value);
-      fields.push({ key, value });
+    // Check if this field has nested child fields
+    let children = [];
+    if (content && content.includes('<field')) {
+      // Recursively extract nested fields
+      children = extractFieldsHierarchical(content, depth + 1);
+      isExpandable = children.length > 0;
     }
     
-    // Also check for nested fields within this field
-    const nestedPattern = /<field[^>]*showname="[^"]+"[^>]*\/>/g;
-    const nestedMatches = fieldXml.match(nestedPattern) || [];
-    for (const nestedXml of nestedMatches) {
-      const nestedShowname = nestedXml.match(/showname="([^"]+)"/);
-      const nestedShow = nestedXml.match(/show="([^"]+)"/);
-      
-      if (nestedShowname) {
-        const parts = nestedShowname[1].split(': ');
-        const nKey = parts[0].trim();
-        const nValue = nestedShow ? nestedShow[1] : parts.slice(1).join(': ');
-        
-        if (nKey && nValue && nValue.length < 500 && !seen.has(nKey + ':' + nValue)) {
-          seen.add(nKey + ':' + nValue);
-          fields.push({ key: nKey, value: nValue });
-        }
+    // Filter out empty, duplicate, or very long values
+    // Also filter out fields that only contain hex data with no readable value
+    const isOnlyHex = value && /^[0-9a-fA-F:\s]+$/.test(value) && value.length > 50;
+    
+    if (key && value && value.length < 500 && !isOnlyHex) {
+      const fieldKey = key + ':' + value.substring(0, 50);
+      if (!seen.has(fieldKey)) {
+        seen.add(fieldKey);
+        fields.push({
+          key,
+          value,
+          children,
+          isExpandable,
+          depth
+        });
+      }
+    } else if (key && isExpandable && children.length > 0) {
+      // Include expandable parent even if it has no value
+      const fieldKey = key + ':expandable';
+      if (!seen.has(fieldKey)) {
+        seen.add(fieldKey);
+        fields.push({
+          key,
+          value: value || '',
+          children,
+          isExpandable: true,
+          depth
+        });
       }
     }
   }
@@ -1467,45 +1504,138 @@ const server = http.createServer(async (req, res) => {
     const per_page = Math.min(200, parseInt(q.per_page || '50'));
     const skip = (page - 1) * per_page;
 
-    const extendedFields = [...DEFAULT_FIELDS, '_ws.col.Info'];
-    
     const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
     if (!fs.existsSync(pcapPath)) return respond({ packets: [], total: 0, page, per_page });
 
-    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t`;
-    for (const f of extendedFields) cmd += ` -e ${f}`;
-    cmd += ` -c ${skip + per_page}`;
+    // Use TShark's tabular output format which includes Info column properly
+    // -P prints packet summary with columns, -T json gives us structured data
+    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T json -c ${skip + per_page}`;
+    
+    console.log(`[TSharkDetailed] Running JSON output for packets`);
 
     exec(cmd, { timeout: 60000, maxBuffer: 100 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         console.error(`[TSharkDetailed] Error: ${err.message}`);
+        if (stderr) console.error(`[TSharkDetailed] stderr: ${stderr.slice(0, 300)}`);
         return respond({ packets: [], total: 0, page, per_page });
       }
 
-      const lines = stdout.trim().split('\n').filter(l => l.trim());
-      const pageLines = lines.slice(skip);
-      
-      const packets = pageLines.map(line => {
-        const c = line.split('\t');
-        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative, frame.time, info
-        return {
-          id: parseInt(c[0]) || 0,
-          src_ip: c[1] || c[3] || null,  // IPv4 src or IPv6 src
-          dst_ip: c[2] || c[4] || null,  // IPv4 dst or IPv6 dst
-          length: parseInt(c[5]) || 0,
-          protocol: c[6] || 'UNKNOWN',
-          src_port: parseInt(c[7]) || parseInt(c[9]) || null,  // TCP src or UDP src
-          dst_port: parseInt(c[8]) || parseInt(c[10]) || null, // TCP dst or UDP dst
-          timestamp: parseFloat(c[11]) || 0,
-          datetime: c[12] || '',  // Absolute date/time
-          info: c[13] || '',
-        };
-      });
+      try {
+        const jsonData = JSON.parse(stdout);
+        const pageData = jsonData.slice(skip);
+        
+        const packets = pageData.map((pkt, idx) => {
+          const layers = pkt._source?.layers || {};
+          const frame = layers.frame || {};
+          
+          // Extract source IP (IPv4 or IPv6)
+          let src_ip = null;
+          let dst_ip = null;
+          if (layers.ip) {
+            src_ip = layers.ip['ip.src'] || null;
+            dst_ip = layers.ip['ip.dst'] || null;
+          } else if (layers.ipv6) {
+            src_ip = layers.ipv6['ipv6.src'] || null;
+            dst_ip = layers.ipv6['ipv6.dst'] || null;
+          }
+          
+          // Extract ports
+          let src_port = null;
+          let dst_port = null;
+          if (layers.tcp) {
+            src_port = parseInt(layers.tcp['tcp.srcport']) || null;
+            dst_port = parseInt(layers.tcp['tcp.dstport']) || null;
+          } else if (layers.udp) {
+            src_port = parseInt(layers.udp['udp.srcport']) || null;
+            dst_port = parseInt(layers.udp['udp.dstport']) || null;
+          }
+          
+          // Extract protocol
+          let protocol = 'UNKNOWN';
+          if (layers.tcp) protocol = 'TCP';
+          else if (layers.udp) protocol = 'UDP';
+          else if (layers.icmp || layers.icmpv6) protocol = 'ICMP';
+          else if (layers.arp) protocol = 'ARP';
+          else if (layers.dns || layers.mdns) protocol = layers.mdns ? 'MDNS' : 'DNS';
+          else if (layers.http) protocol = 'HTTP';
+          else if (layers.tls || layers.ssl) protocol = 'TLS';
+          else if (layers.dhcp || layers.dhcpv6) protocol = layers.dhcpv6 ? 'DHCPv6' : 'DHCP';
+          else if (layers.ssh) protocol = 'SSH';
+          else if (layers.ftp) protocol = 'FTP';
+          else if (layers.ssdp) protocol = 'SSDP';
+          else if (layers.ntp) protocol = 'NTP';
+          else if (layers.igmp) protocol = 'IGMP';
+          if (frame['frame.protocols']) {
+            const protocols = frame['frame.protocols'].split(':');
+            if (protocols.length > 0 && protocol === 'UNKNOWN') {
+              protocol = protocols[protocols.length - 1].toUpperCase();
+            }
+          }
+          
+          // Extract Info - this is the key part!
+          let info = '';
+          // Try multiple sources for Info
+          if (layers.dns || layers.mdns) {
+            const dnsLayer = layers.dns || layers.mdns;
+            if (dnsLayer['dns.qry.name']) {
+              info = dnsLayer['dns.flags.response'] === '1' ? 
+                `Response: ${dnsLayer['dns.qry.name']}` : 
+                `Query: ${dnsLayer['dns.qry.name']}`;
+            }
+            if (dnsLayer['dns.a']) info += ` A: ${dnsLayer['dns.a']}`;
+            if (dnsLayer['dns.aaaa']) info += ` AAAA: ${dnsLayer['dns.aaaa']}`;
+          } else if (layers.dhcpv6) {
+            info = layers.dhcpv6['dhcpv6.msg_type'] || 'DHCPv6';
+            if (layers.dhcpv6['dhcpv6.transaction_id']) {
+              info += ` XID: ${layers.dhcpv6['dhcpv6.transaction_id']}`;
+            }
+          } else if (layers.http) {
+            if (layers.http['http.request.method']) {
+              info = `${layers.http['http.request.method']} ${layers.http['http.request.uri'] || '/'}`;
+            } else if (layers.http['http.response.code']) {
+              info = `HTTP ${layers.http['http.response.code']} ${layers.http['http.response.phrase'] || ''}`;
+            }
+          } else if (layers.tcp) {
+            const flags = [];
+            if (layers.tcp['tcp.flags.syn'] === '1') flags.push('SYN');
+            if (layers.tcp['tcp.flags.ack'] === '1') flags.push('ACK');
+            if (layers.tcp['tcp.flags.fin'] === '1') flags.push('FIN');
+            if (layers.tcp['tcp.flags.reset'] === '1') flags.push('RST');
+            if (flags.length > 0) info = `[${flags.join(', ')}]`;
+            if (layers.tcp['tcp.seq']) info += ` Seq=${layers.tcp['tcp.seq']}`;
+            if (layers.tcp['tcp.ack']) info += ` Ack=${layers.tcp['tcp.ack']}`;
+          } else if (layers.udp) {
+            info = `Len=${layers.udp['udp.length'] || ''}`;
+          } else if (layers.icmp || layers.icmpv6) {
+            const icmp = layers.icmp || layers.icmpv6;
+            info = `Type=${icmp['icmp.type'] || icmp['icmpv6.type'] || ''}`;
+          } else if (layers.arp) {
+            info = layers.arp['arp.opcode'] === '1' ? 'Who has ...?' : 'ARP reply';
+          }
+          
+          // Build packet object
+          return {
+            id: parseInt(frame['frame.number']) || (skip + idx + 1),
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            protocol,
+            length: parseInt(frame['frame.len']) || 0,
+            timestamp: parseFloat(frame['frame.time_relative']) || 0,
+            datetime: frame['frame.time'] || '',
+            info: info.trim(),
+          };
+        });
 
-      const sessionData = sessions.get(q.session_id);
-      const realTotal = sessionData?.total_packets ?? lines.length;
+        const sessionData = sessions.get(q.session_id);
+        const realTotal = sessionData?.total_packets ?? jsonData.length;
 
-      return respond({ packets, total: realTotal, page, per_page });
+        return respond({ packets, total: realTotal, page, per_page });
+      } catch (parseErr) {
+        console.error(`[TSharkDetailed] JSON parse error: ${parseErr.message}`);
+        return respond({ packets: [], total: 0, page, per_page });
+      }
     });
     return;
   }
