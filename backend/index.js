@@ -188,7 +188,7 @@ function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
 
     console.log(`[TShark] Running: ${cmd}`);
 
-    exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+    exec(cmd, { timeout: 60000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         console.error(`[TShark] exec error: ${err.message}`);
         if (stderr) console.error(`[TShark] stderr: ${stderr.slice(0, 400)}`);
@@ -234,7 +234,7 @@ function runTsharkPaged(sessionId, skip, limit) {
 
     console.log(`[TSharkPaged] skip=${skip} limit=${limit} cmd: ${cmd}`);
 
-    exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+    exec(cmd, { timeout: 60000, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         console.error(`[TSharkPaged] exec error: ${err.message}`);
         if (stderr) console.error(`[TSharkPaged] stderr: ${stderr.slice(0, 400)}`);
@@ -275,11 +275,45 @@ function getTruePacketCount(sessionId) {
     const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
     if (!fs.existsSync(pcapPath)) return resolve(0);
     const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.number`;
-    exec(cmd, { timeout: 120000 }, (err, stdout) => {
+    exec(cmd, { timeout: 120000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
       if (err) return resolve(0);
       const count = stdout.trim().split('\n').filter(l => l.trim()).length;
       console.log(`[TShark] True packet count: ${count}`);
       resolve(count);
+    });
+  });
+}
+
+// ── Get ALL unique ports efficiently (just ports, no full packet data) ────────
+function getAllPorts(sessionId) {
+  return new Promise((resolve) => {
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) return resolve({});
+    
+    // Only extract ports - MUCH smaller output than full packet data!
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e tcp.dstport -e udp.dstport`;
+    
+    console.log(`[TShark-Ports] Extracting all ports from PCAP...`);
+    
+    exec(cmd, { timeout: 60000, maxBuffer: 100 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[TShark-Ports] Error: ${err.message}`);
+        return resolve({});
+      }
+      
+      const portCounts = {};
+      const lines = stdout.trim().split('\n').filter(l => l.trim());
+      
+      for (const line of lines) {
+        const [tcpPort, udpPort] = line.split('\t');
+        const port = parseInt(tcpPort || udpPort);
+        if (port && port > 0) {
+          portCounts[port] = (portCounts[port] || 0) + 1;
+        }
+      }
+      
+      console.log(`[TShark-Ports] Found ${Object.keys(portCounts).length} unique ports from ${lines.length} packets`);
+      resolve(portCounts);
     });
   });
 }
@@ -290,7 +324,7 @@ function runTsharkStat(sessionId, statCommand) {
     if (!fs.existsSync(pcapPath)) return resolve('PCAP not found');
     const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -q -z ${statCommand}`;
     console.log(`[TShark-Stat] Running: ${cmd}`);
-    exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+    exec(cmd, { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         console.error(`[TShark-Stat] Error: ${err.message}`);
         if (stderr) console.error(`[TShark-Stat] stderr: ${stderr.slice(0, 400)}`);
@@ -1484,17 +1518,11 @@ async function executeTool(agentResult, sessionId) {
   }
 
   // ═══════════════════════════════════════════════════════════════
-  // VULN TOOL - Vulnerability analysis
+  // VULN TOOL - Vulnerability analysis (uses efficient port extraction)
   // ═══════════════════════════════════════════════════════════════
   if (tool === 'vuln') {
-    const packets = await runTshark(sessionId, '', DEFAULT_FIELDS, 10000);
-    const portCounts = {};
-    for (const p of packets) {
-      const port = p.dst_port;
-      if (port) {
-        portCounts[port] = (portCounts[port] || 0) + 1;
-      }
-    }
+    // Efficiently get ALL ports without loading full packet data
+    const portCounts = await getAllPorts(sessionId);
     
     const portEntries = Object.entries(portCounts);
     console.log(`[Vuln] Analyzing ${portEntries.length} ports with web search + CVE API...`);
@@ -2068,14 +2096,8 @@ const server = http.createServer(async (req, res) => {
     if (!fs.existsSync(path.join(PCAP_DIR, `${q.session_id}.pcap`)))
       return respond({ error: 'Session expired or not found' }, 404);
 
-    const packets = await runTshark(q.session_id, '', DEFAULT_FIELDS, 10000);
-    const portCounts = {};
-    for (const p of packets) {
-      const port = p.dst_port;
-      if (port) {
-        portCounts[port] = (portCounts[port] || 0) + 1;
-      }
-    }
+    // Efficiently get ALL ports without loading full packet data
+    const portCounts = await getAllPorts(q.session_id);
     
     const portEntries = Object.entries(portCounts);
     console.log(`[PortIntel] Analyzing ${portEntries.length} unique ports with Web Search + NVD API...`);
