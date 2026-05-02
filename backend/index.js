@@ -6,269 +6,1365 @@ const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
 
-// ── Directory Setup ──────────────────────────────────────────
-const PCAP_DIR = '/tmp/pcaps';
-const EXPORT_DIR = '/tmp/exports';
+// SearXNG Configuration - FROM ENVIRONMENT VARIABLES
+// ============================
+// Primary instance from SEARXNG_URL env var, with fallbacks
+const SEARXNG_INSTANCES = [
+  process.env.SEARXNG_URL,                // Your SearXNG instance (from env)
+  'https://searx.be',                     // Fallback 1 (public)
+  'https://search.bus-hit.me',            // Fallback 2 (public)
+].filter(Boolean);  // Remove undefined/empty values
+
+// Search settings
+const SEARXNG_TIMEOUT_MS = 10000;
+const SEARXNG_MAX_RESULTS = 5;
+const SEARXNG_ENGINES = 'google,bing,duckduckgo,startpage';
+
+let currentSearXInstance = 0;
+
+// ── TShark binary path ─────────────────────────────────────────
+const TSHARK_BIN = process.env.TSHARK_PATH ||
+  (process.platform === 'win32'
+    ? 'C:\\Program Files\\Wireshark\\tshark.exe'
+    : 'tshark');
+
+console.log(`[Init] TShark path: ${TSHARK_BIN}`);
+
+exec(`"${TSHARK_BIN}" -v`, (err, stdout) => {
+  if (err) {
+    console.error(`[FATAL] tshark not found at: ${TSHARK_BIN}`);
+    console.error(`        Set TSHARK_PATH env var to override.`);
+  } else {
+    console.log(`[Init] Found: ${stdout.split('\n')[0]}`);
+  }
+});
+
+// ── Directories ────────────────────────────────────────────────
+const PCAP_DIR = './tmp_pcaps';
+const EXPORT_DIR = './tmp_exports';
 if (!fs.existsSync(PCAP_DIR)) fs.mkdirSync(PCAP_DIR, { recursive: true });
 if (!fs.existsSync(EXPORT_DIR)) fs.mkdirSync(EXPORT_DIR, { recursive: true });
 
-// ── In-memory stores ─────────────────────────────────────────
+// ── Session store ──────────────────────────────────────────────
 const sessions = new Map();
 const imageStore = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 setInterval(() => {
   const now = Date.now();
-  for (const [id] of sessions) {
-    if (now - sessions.get(id).created_at > SESSION_TTL_MS) {
-      const pcapPath = path.join(PCAP_DIR, `${id}.pcap`);
-      const exportPath = path.join(EXPORT_DIR, id);
-      if (fs.existsSync(pcapPath)) fs.unlinkSync(pcapPath);
-      if (fs.existsSync(exportPath)) fs.rmSync(exportPath, { recursive: true });
-      sessions.delete(id); imageStore.delete(id);
+  for (const [id, session] of sessions) {
+    if (now - session.created_at > SESSION_TTL_MS) {
+      try { const p = path.join(PCAP_DIR, `${id}.pcap`); if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) { }
+      try { const p = path.join(EXPORT_DIR, id); if (fs.existsSync(p)) fs.rmSync(p, { recursive: true }); } catch (_) { }
+      sessions.delete(id);
+      imageStore.delete(id);
+      console.log(`[Session] Expired: ${id}`);
     }
   }
 }, 5 * 60 * 1000);
 
-// ── CORS & HTTP Helpers ─────────────────────────────────────
+// ── Rate limiting ──────────────────────────────────────────────
+const rateLimits = new Map();
+const RATE_UPLOAD = { max: 10, windowMs: 60_000 };
+const RATE_AGENT = { max: 30, windowMs: 60_000 };
+
+function checkRateLimit(ip, limit) {
+  const key = `${ip}:${limit.max}`;
+  const now = Date.now();
+  const e = rateLimits.get(key) || { count: 0, windowStart: now };
+  if (now - e.windowStart > limit.windowMs) { e.count = 0; e.windowStart = now; }
+  e.count++;
+  rateLimits.set(key, e);
+  return e.count <= limit.max;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateLimits)
+    if (now - v.windowStart > 5 * 60_000) rateLimits.delete(k);
+}, 2 * 60_000);
+
+// ── CORS ──────────────────────────────────────────────────────
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
-function getCorsHeaders(origin) { return { 'Access-Control-Allow-Origin': ALLOWED_ORIGIN === '*' ? '*' : origin, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' }; }
-function parseBody(req) { return new Promise((res, rej) => { const c = []; req.on('data', d => c.push(d)); req.on('end', () => res(Buffer.concat(c))); req.on('error', rej); }); }
+function getCorsHeaders(origin) {
+  return {
+    'Access-Control-Allow-Origin': ALLOWED_ORIGIN === '*' ? '*' : (origin || ALLOWED_ORIGIN),
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  };
+}
+
+// ── HTTP helpers ───────────────────────────────────────────────
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', d => chunks.push(d));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
 function parseMultipart(buffer, boundary) {
-  const bBuf = Buffer.from('\r\n--' + boundary.replace(/^["']|["']$/g, '').trim()); const fBuf = Buffer.from('--' + boundary.replace(/^["']|["']$/g, '').trim()); const CRLF = Buffer.from('\r\n\r\n'); const parts = [];
-  let pos = buffer.indexOf(fBuf); if (pos === -1) return parts; pos += fBuf.length; let s = 0;
-  while (pos < buffer.length && s++ < 1000) { const lEnd = buffer.indexOf(Buffer.from('\r\n'), pos); if (lEnd === -1) break; if (buffer.slice(pos, lEnd).toString().startsWith('--')) break; const hEnd = buffer.indexOf(CRLF, lEnd + 2); if (hEnd === -1) break; const nBound = buffer.indexOf(bBuf, hEnd + 4); parts.push({ headers: buffer.slice(lEnd + 2, hEnd).toString(), data: buffer.slice(hEnd + 4, nBound === -1 ? buffer.length : nBound) }); if (nBound === -1) break; pos = nBound + bBuf.length; }
+  const clean = boundary.replace(/^["']|["']$/g, '').trim();
+  const bBuf = Buffer.from('\r\n--' + clean);
+  const fBuf = Buffer.from('--' + clean);
+  const CRLF4 = Buffer.from('\r\n\r\n');
+  const parts = [];
+  let pos = buffer.indexOf(fBuf);
+  if (pos === -1) return parts;
+  pos += fBuf.length;
+  let safety = 0;
+  while (pos < buffer.length && safety++ < 1000) {
+    const lEnd = buffer.indexOf(Buffer.from('\r\n'), pos);
+    if (lEnd === -1) break;
+    if (buffer.slice(pos, lEnd).toString().startsWith('--')) break;
+    const hEnd = buffer.indexOf(CRLF4, lEnd + 2);
+    if (hEnd === -1) break;
+    const nBound = buffer.indexOf(bBuf, hEnd + 4);
+    parts.push({
+      headers: buffer.slice(lEnd + 2, hEnd).toString(),
+      data: buffer.slice(hEnd + 4, nBound === -1 ? buffer.length : nBound),
+    });
+    if (nBound === -1) break;
+    pos = nBound + bBuf.length;
+  }
   return parts;
 }
-function json(res, data, status, origin, enc) {
-  const p = JSON.stringify(data); const h = getCorsHeaders(origin);
-  if (/\bgzip\b/.test(enc) && p.length > 1024) { zlib.gzip(Buffer.from(p), (e, c) => { if (e) { res.writeHead(status, { 'Content-Type': 'application/json', ...h }); res.end(p); return; } res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', ...h }); res.end(c); }); }
-  else { res.writeHead(status || 200, { 'Content-Type': 'application/json', ...h }); res.end(p); }
-}
-function getQuery(url) { const q = {}; const i = url.indexOf('?'); if (i === -1) return q; for (const p of url.slice(i + 1).split('&')) { const [k, v] = p.split('='); if (k) q[decodeURIComponent(k)] = decodeURIComponent(v || ''); } return q; }
-const isValidSessionId = (id) => typeof id === 'string' && /^session-\d{13}-[a-z0-9]{6}$/.test(id);
 
-// ── TShark Core Engine ──────────────────────────────────────
-const DEFAULT_FIELDS = ['frame.number', 'ip.src', 'ip.dst', 'frame.len', '_ws.col.Protocol', 'tcp.srcport', 'tcp.dstport', 'frame.time_relative'];
+function json(res, data, status, origin, acceptEncoding) {
+  const payload = JSON.stringify(data);
+  const headers = { 'Content-Type': 'application/json', ...getCorsHeaders(origin) };
+  if (/\bgzip\b/.test(acceptEncoding) && payload.length > 1024) {
+    zlib.gzip(Buffer.from(payload), (err, compressed) => {
+      if (err) { res.writeHead(status || 200, headers); return res.end(payload); }
+      res.writeHead(status || 200, { ...headers, 'Content-Encoding': 'gzip' });
+      res.end(compressed);
+    });
+  } else {
+    res.writeHead(status || 200, headers);
+    res.end(payload);
+  }
+}
+
+function getQuery(url) {
+  const q = {};
+  const i = url.indexOf('?');
+  if (i === -1) return q;
+  for (const part of url.slice(i + 1).split('&')) {
+    const [k, v] = part.split('=');
+    if (k) q[decodeURIComponent(k)] = decodeURIComponent(v || '');
+  }
+  return q;
+}
+
+const isValidSessionId = (id) =>
+  typeof id === 'string' && /^session-\d{13}-[a-z0-9]{6}$/.test(id);
+
+// ── TShark core runner ─────────────────────────────────────────
+const DEFAULT_FIELDS = [
+  'frame.number', 'ip.src', 'ip.dst', 'frame.len',
+  '_ws.col.Protocol', 'tcp.srcport', 'tcp.dstport', 'frame.time_relative',
+];
 
 function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
   return new Promise((resolve) => {
-    const pPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pPath)) return resolve([]);
-    let cmd = `tshark -r "${pPath}" -T fields -E separator='\\t' -e ${fields.join(' -e ')}`;
-    if (filter) cmd += ` -Y "${filter}"`;
-    if (limit > 0) cmd += ` | head -n ${limit}`;
-    exec(cmd, { timeout: 15000 }, (err, stdout) => {
-      if (err) return resolve([]);
-      resolve(stdout.trim().split('\n').filter(l => l.trim()).map(line => {
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) {
+      console.warn(`[TShark] PCAP not found: ${pcapPath}`);
+      return resolve([]);
+    }
+
+    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t`;
+    for (const f of fields) cmd += ` -e ${f}`;
+    if (filter) cmd += ` -Y "${filter.replace(/"/g, '\\"')}"`;
+    if (limit > 0) cmd += ` -c ${limit}`;
+
+    console.log(`[TShark] Running: ${cmd}`);
+
+    exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[TShark] exec error: ${err.message}`);
+        if (stderr) console.error(`[TShark] stderr: ${stderr.slice(0, 400)}`);
+        return resolve([]);
+      }
+      const lines = stdout.trim().split('\n').filter(l => l.trim());
+      const packets = lines.map(line => {
         const c = line.split('\t');
-        return { id: parseInt(c[0]) || 0, src_ip: c[1] || null, dst_ip: c[2] || null, length: parseInt(c[3]) || 0, protocol: c[4] || 'UNKNOWN', src_port: parseInt(c[5]) || null, dst_port: parseInt(c[6]) || null, timestamp: parseFloat(c[7]) || 0 };
-      }));
+        return {
+          id: parseInt(c[0]) || 0,
+          src_ip: c[1] || null,
+          dst_ip: c[2] || null,
+          length: parseInt(c[3]) || 0,
+          protocol: c[4] || 'UNKNOWN',
+          src_port: parseInt(c[5]) || null,
+          dst_port: parseInt(c[6]) || null,
+          timestamp: parseFloat(c[7]) || 0,
+        };
+      });
+      console.log(`[TShark] Returned ${packets.length} packets`);
+      resolve(packets);
+    });
+  });
+}
+
+// ── Paginated packet fetch ─────────────────────────────────────
+function runTsharkPaged(sessionId, skip, limit) {
+  return new Promise((resolve) => {
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) return resolve([]);
+
+    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t`;
+    for (const f of DEFAULT_FIELDS) cmd += ` -e ${f}`;
+    cmd += ` -c ${skip + limit}`;
+
+    console.log(`[TSharkPaged] skip=${skip} limit=${limit} cmd: ${cmd}`);
+
+    exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[TSharkPaged] exec error: ${err.message}`);
+        if (stderr) console.error(`[TSharkPaged] stderr: ${stderr.slice(0, 400)}`);
+        return resolve([]);
+      }
+      const lines = stdout.trim().split('\n').filter(l => l.trim());
+      const pageLines = lines.slice(skip);
+      const packets = pageLines.map(line => {
+        const c = line.split('\t');
+        return {
+          id: parseInt(c[0]) || 0,
+          src_ip: c[1] || null,
+          dst_ip: c[2] || null,
+          length: parseInt(c[3]) || 0,
+          protocol: c[4] || 'UNKNOWN',
+          src_port: parseInt(c[5]) || null,
+          dst_port: parseInt(c[6]) || null,
+          timestamp: parseFloat(c[7]) || 0,
+        };
+      });
+      console.log(`[TSharkPaged] → ${packets.length} packets returned`);
+      resolve(packets);
+    });
+  });
+}
+
+// ── True packet count ──────────────────────────────────────────
+function getTruePacketCount(sessionId) {
+  return new Promise((resolve) => {
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) return resolve(0);
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.number`;
+    exec(cmd, { timeout: 120000 }, (err, stdout) => {
+      if (err) return resolve(0);
+      const count = stdout.trim().split('\n').filter(l => l.trim()).length;
+      console.log(`[TShark] True packet count: ${count}`);
+      resolve(count);
     });
   });
 }
 
 function runTsharkStat(sessionId, statCommand) {
   return new Promise((resolve) => {
-    const pPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pPath)) return resolve("PCAP not found");
-    exec(`tshark -r "${pPath}" -q -z ${statCommand}`, { timeout: 15000 }, (err, stdout) => resolve(stdout || "Stat failed"));
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) return resolve('PCAP not found');
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -q -z ${statCommand}`;
+    console.log(`[TShark-Stat] Running: ${cmd}`);
+    exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[TShark-Stat] Error: ${err.message}`);
+        if (stderr) console.error(`[TShark-Stat] stderr: ${stderr.slice(0, 400)}`);
+        return resolve('Stat failed');
+      }
+      resolve(stdout || '');
+    });
   });
 }
 
-// ── Vulnerable Ports Map ────────────────────────────────────
-const VULN_PORTS = { 21: 'HIGH', 22: 'LOW', 23: 'CRITICAL', 25: 'MEDIUM', 53: 'LOW', 69: 'HIGH', 80: 'MEDIUM', 110: 'HIGH', 135: 'HIGH', 137: 'HIGH', 138: 'HIGH', 139: 'HIGH', 161: 'HIGH', 389: 'MEDIUM', 445: 'CRITICAL', 1433: 'HIGH', 1521: 'HIGH', 1723: 'MEDIUM', 3306: 'HIGH', 3389: 'HIGH', 4444: 'CRITICAL', 5432: 'HIGH', 5900: 'HIGH', 6379: 'CRITICAL', 8080: 'LOW', 9200: 'CRITICAL', 27017: 'CRITICAL' };
+// ── Detailed packet dissection ──────────────────────────────────
+const DETAIL_FIELDS = [
+  'frame.number', 'frame.time', 'frame.time_relative', 'frame.len',
+  'eth.src', 'eth.dst', 'eth.type',
+  'ip.src', 'ip.dst', 'ip.ttl', 'ip.id', 'ip.proto',
+  'ip.flags.df', 'ip.flags.mf',
+  'ipv6.src', 'ipv6.dst',
+  'tcp.srcport', 'tcp.dstport', 'tcp.seq', 'tcp.ack',
+  'tcp.flags.syn', 'tcp.flags.ack', 'tcp.flags.fin', 'tcp.flags.reset',
+  'tcp.window_size',
+  'udp.srcport', 'udp.dstport', 'udp.length',
+  'icmp.type', 'icmp.code',
+  'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.hw_mac', 'arp.dst.proto_ipv4',
+  'dns.qry.name', 'dns.a', 'dns.aaaa', 'dns.flags.response',
+  'http.request.method', 'http.request.uri', 'http.host',
+  'http.response.code', 'http.response.phrase',
+  'tls.handshake.type', 'tls.handshake.extensions_server_name',
+  '_ws.col.Info', '_ws.col.Protocol',
+];
 
-// ── ULTIMATE INTENT ROUTER (50+ Rules) ─────────────────────
+function getPacketDetails(sessionId, packetNumber) {
+  return new Promise((resolve) => {
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) {
+      return resolve({ error: 'PCAP not found' });
+    }
+
+    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t`;
+    for (const f of DETAIL_FIELDS) cmd += ` -e ${f}`;
+    cmd += ` -c ${packetNumber}`;
+
+    console.log(`[TShark-Detail] Getting packet ${packetNumber} (sequential read)`);
+
+    exec(cmd, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[TShark-Detail] Error: ${err.message}`);
+        if (stderr) console.error(`[TShark-Detail] stderr: ${stderr.slice(0, 200)}`);
+        return resolve({ error: 'Failed to parse packet - ' + err.message.slice(0, 100) });
+      }
+
+      const lines = stdout.trim().split('\n').filter(l => l.trim());
+      const targetLine = lines[packetNumber - 1];
+      if (!targetLine) {
+        console.error(`[TShark-Detail] Packet ${packetNumber} not found. Total lines: ${lines.length}`);
+        return resolve({ error: `Packet ${packetNumber} not found. File has ${lines.length} packets.` });
+      }
+
+      const values = targetLine.split('\t');
+      const fields = {};
+      DETAIL_FIELDS.forEach((field, i) => {
+        fields[field] = values[i] || null;
+      });
+
+      const tree = buildPacketTree(fields);
+      console.log(`[TShark-Detail] ✓ Packet ${packetNumber} parsed, ${tree.layers.length} layers`);
+      resolve(tree);
+    });
+  });
+}
+
+function buildPacketTree(f) {
+  const tree = {
+    frame: {
+      number: f['frame.number'],
+      time: f['frame.time'],
+      time_relative: f['frame.time_relative'],
+      length: f['frame.len'],
+    },
+    layers: []
+  };
+
+  if (f['eth.src'] || f['eth.dst']) {
+    tree.layers.push({
+      name: 'Ethernet II',
+      protocol: 'eth',
+      fields: [
+        { key: 'Source MAC', value: f['eth.src'] },
+        { key: 'Destination MAC', value: f['eth.dst'] },
+        { key: 'Type', value: f['eth.type'] },
+      ].filter(v => v.value)
+    });
+  }
+
+  if (f['ip.src'] || f['ip.dst']) {
+    const ipFlags = [];
+    if (f['ip.flags.df'] === '1') ipFlags.push('DF (Don\'t Fragment)');
+    if (f['ip.flags.mf'] === '1') ipFlags.push('MF (More Fragments)');
+    
+    tree.layers.push({
+      name: 'Internet Protocol Version 4',
+      protocol: 'ipv4',
+      fields: [
+        { key: 'Source IP', value: f['ip.src'] },
+        { key: 'Destination IP', value: f['ip.dst'] },
+        { key: 'TTL', value: f['ip.ttl'] },
+        { key: 'Protocol', value: getProtocolName(f['ip.proto']) },
+        { key: 'ID', value: f['ip.id'] ? `0x${parseInt(f['ip.id']).toString(16).padStart(4, '0')}` : null },
+        { key: 'Flags', value: ipFlags.length > 0 ? ipFlags.join(', ') : null },
+      ].filter(v => v.value)
+    });
+  } else if (f['ipv6.src'] || f['ipv6.dst']) {
+    tree.layers.push({
+      name: 'Internet Protocol Version 6',
+      protocol: 'ipv6',
+      fields: [
+        { key: 'Source IP', value: f['ipv6.src'] },
+        { key: 'Destination IP', value: f['ipv6.dst'] },
+      ].filter(v => v.value)
+    });
+  }
+
+  if (f['tcp.srcport'] || f['tcp.dstport']) {
+    const tcpFlags = [];
+    if (f['tcp.flags.syn'] === '1') tcpFlags.push('SYN');
+    if (f['tcp.flags.ack'] === '1') tcpFlags.push('ACK');
+    if (f['tcp.flags.fin'] === '1') tcpFlags.push('FIN');
+    if (f['tcp.flags.reset'] === '1') tcpFlags.push('RST');
+    
+    tree.layers.push({
+      name: 'Transmission Control Protocol',
+      protocol: 'tcp',
+      fields: [
+        { key: 'Source Port', value: f['tcp.srcport'] },
+        { key: 'Destination Port', value: f['tcp.dstport'] },
+        { key: 'Sequence Number', value: f['tcp.seq'] },
+        { key: 'Acknowledgment Number', value: f['tcp.ack'] },
+        { key: 'Flags', value: tcpFlags.length > 0 ? `[${tcpFlags.join(', ')}]` : null },
+        { key: 'Window Size', value: f['tcp.window_size'] },
+      ].filter(v => v.value)
+    });
+  }
+
+  if (f['udp.srcport'] || f['udp.dstport']) {
+    tree.layers.push({
+      name: 'User Datagram Protocol',
+      protocol: 'udp',
+      fields: [
+        { key: 'Source Port', value: f['udp.srcport'] },
+        { key: 'Destination Port', value: f['udp.dstport'] },
+        { key: 'Length', value: f['udp.length'] },
+      ].filter(v => v.value)
+    });
+  }
+
+  if (f['icmp.type']) {
+    tree.layers.push({
+      name: 'Internet Control Message Protocol',
+      protocol: 'icmp',
+      fields: [
+        { key: 'Type', value: getIcmpType(f['icmp.type']) },
+        { key: 'Code', value: f['icmp.code'] },
+      ].filter(v => v.value)
+    });
+  }
+
+  if (f['arp.opcode']) {
+    tree.layers.push({
+      name: 'Address Resolution Protocol',
+      protocol: 'arp',
+      fields: [
+        { key: 'Operation', value: f['arp.opcode'] === '1' ? 'Request' : 'Reply' },
+        { key: 'Sender MAC', value: f['arp.src.hw_mac'] },
+        { key: 'Sender IP', value: f['arp.src.proto_ipv4'] },
+        { key: 'Target MAC', value: f['arp.dst.hw_mac'] },
+        { key: 'Target IP', value: f['arp.dst.proto_ipv4'] },
+      ].filter(v => v.value)
+    });
+  }
+
+  if (f['dns.qry.name']) {
+    tree.layers.push({
+      name: 'Domain Name System',
+      protocol: 'dns',
+      fields: [
+        { key: 'Type', value: f['dns.flags.response'] === '1' ? 'Response' : 'Query' },
+        { key: 'Query Name', value: f['dns.qry.name'] },
+        { key: 'Answer (A)', value: f['dns.a'] },
+        { key: 'Answer (AAAA)', value: f['dns.aaaa'] },
+      ].filter(v => v.value)
+    });
+  }
+
+  if (f['http.request.method'] || f['http.response.code']) {
+    const httpFields = [
+      { key: 'Method', value: f['http.request.method'] },
+      { key: 'URI', value: f['http.request.uri'] },
+      { key: 'Host', value: f['http.host'] },
+      { key: 'Status Code', value: f['http.response.code'] },
+      { key: 'Status Phrase', value: f['http.response.phrase'] },
+    ].filter(v => v.value);
+    
+    if (httpFields.length > 0) {
+      tree.layers.push({
+        name: 'Hypertext Transfer Protocol',
+        protocol: 'http',
+        fields: httpFields
+      });
+    }
+  }
+
+  if (f['tls.handshake.type'] || f['tls.handshake.extensions_server_name']) {
+    tree.layers.push({
+      name: 'Transport Layer Security',
+      protocol: 'tls',
+      fields: [
+        { key: 'Handshake Type', value: getTlsHandshakeType(f['tls.handshake.type']) },
+        { key: 'SNI (Server Name)', value: f['tls.handshake.extensions_server_name'] },
+      ].filter(v => v.value)
+    });
+  }
+
+  if (tree.layers.length === 0 && f['_ws.col.Protocol']) {
+    tree.layers.push({
+      name: f['_ws.col.Protocol'],
+      protocol: f['_ws.col.Protocol'].toLowerCase(),
+      fields: [
+        { key: 'Protocol', value: f['_ws.col.Protocol'] },
+        { key: 'Info', value: f['_ws.col.Info'] || 'No detailed dissection available' },
+      ].filter(v => v.value)
+    });
+  }
+
+  tree.info = f['_ws.col.Info'];
+  tree.protocol = f['_ws.col.Protocol'];
+
+  return tree;
+}
+
+function getProtocolName(proto) {
+  const protocols = {
+    '1': 'ICMP', '2': 'IGMP', '6': 'TCP', '17': 'UDP',
+    '41': 'IPv6', '47': 'GRE', '50': 'ESP', '51': 'AH',
+    '58': 'ICMPv6', '89': 'OSPF', '132': 'SCTP'
+  };
+  return protocols[proto] || `Protocol ${proto}`;
+}
+
+function getIcmpType(type) {
+  const types = {
+    '0': 'Echo Reply', '3': 'Destination Unreachable', '4': 'Source Quench',
+    '5': 'Redirect', '8': 'Echo Request', '11': 'Time Exceeded',
+    '12': 'Parameter Problem', '13': 'Timestamp', '14': 'Timestamp Reply'
+  };
+  return types[type] || `Type ${type}`;
+}
+
+function getTlsHandshakeType(type) {
+  const types = {
+    '1': 'Client Hello', '2': 'Server Hello', '11': 'Certificate',
+    '12': 'Server Key Exchange', '14': 'Server Hello Done',
+    '16': 'Client Key Exchange', '20': 'Finished'
+  };
+  return types[type] || `Type ${type}`;
+}
+
+// ── SEARXNG WEB SEARCH FOR PORT INFO ─────────────────────────────────
+const portInfoCache = new Map();
+const PORT_INFO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// SearXNG search function (NO AI - pure HTTP requests to free metasearch)
+function searxngSearch(query) {
+  return new Promise((resolve) => {
+    const instance = SEARXNG_INSTANCES[currentSearXInstance];
+    const url = `${instance}/search?q=${encodeURIComponent(query)}&format=json&engines=${SEARXNG_ENGINES}`;
+    
+    console.log(`[SearXNG] Searching: "${query}" via ${instance}`);
+    
+    // Use http for localhost, https for public instances
+    const httpClient = instance.startsWith('https') ? https : http;
+    
+    const req = httpClient.get(url, {
+      headers: { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+      },
+      timeout: SEARXNG_TIMEOUT_MS
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.results && json.results.length > 0) {
+            const results = json.results.slice(0, SEARXNG_MAX_RESULTS).map(r => ({
+              title: r.title || '',
+              url: r.url || '',
+              snippet: r.content || r.snippet || '',
+              engine: r.engine || 'unknown'
+            }));
+            console.log(`[SearXNG] ✓ Found ${results.length} results from ${instance}`);
+            resolve(results);
+          } else {
+            console.log(`[SearXNG] No results from ${instance}, trying next instance...`);
+            // Rotate to next instance
+            currentSearXInstance = (currentSearXInstance + 1) % SEARXNG_INSTANCES.length;
+            resolve(null);
+          }
+        } catch (e) {
+          console.error(`[SearXNG] Parse error from ${instance}: ${e.message}`);
+          // Rotate to next instance on error
+          currentSearXInstance = (currentSearXInstance + 1) % SEARXNG_INSTANCES.length;
+          resolve(null);
+        }
+      });
+    });
+    
+    req.on('error', (e) => {
+      console.error(`[SearXNG] Request error from ${instance}: ${e.message}`);
+      // Rotate to next instance
+      currentSearXInstance = (currentSearXInstance + 1) % SEARXNG_INSTANCES.length;
+      resolve(null);
+    });
+    
+    req.on('timeout', () => {
+      req.destroy();
+      console.error(`[SearXNG] Timeout from ${instance}, rotating instance...`);
+      currentSearXInstance = (currentSearXInstance + 1) % SEARXNG_INSTANCES.length;
+      resolve(null);
+    });
+  });
+}
+
+// Try multiple SearXNG instances
+async function searchWithFallback(query, maxAttempts = 3) {
+  for (let i = 0; i < maxAttempts; i++) {
+    const results = await searxngSearch(query);
+    if (results && results.length > 0) {
+      return results;
+    }
+    // Small delay before trying next instance
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return null;
+}
+
+async function searchPortInfo(port) {
+  // Check cache first
+  const cached = portInfoCache.get(port);
+  if (cached && (Date.now() - cached.timestamp) < PORT_INFO_CACHE_TTL) {
+    console.log(`[SearXNG] Using cached info for port ${port}`);
+    return cached.data;
+  }
+
+  try {
+    // Search for port information using SearXNG (NO AI!)
+    const query = `TCP UDP port ${port} service protocol what is it used for IANA`;
+    console.log(`[SearXNG] Searching for port ${port} info...`);
+    
+    const results = await searchWithFallback(query, 3);
+
+    if (results && results.length > 0) {
+      // Extract relevant info from search results - PURE LOGIC, NO AI
+      const info = parsePortSearchResults(port, results);
+      
+      // Cache the result
+      portInfoCache.set(port, { data: info, timestamp: Date.now() });
+      console.log(`[SearXNG] ✓ Found info for port ${port}: ${info.service_name}`);
+      return info;
+    }
+  } catch (e) {
+    console.error(`[SearXNG] Error for port ${port}:`, e.message);
+  }
+
+  // Return default if search fails
+  return {
+    service_name: 'unknown',
+    description: `Port ${port} - no information found via web search`,
+    secure_alternative: 'Investigate manually',
+    common_uses: ['Unknown'],
+    source: 'none'
+  };
+}
+
+function parsePortSearchResults(port, results) {
+  // Combine all snippets for pattern matching - PURE LOGIC, NO AI
+  const combinedText = results.map(r => `${r.title} ${r.snippet}`).join(' ').toLowerCase();
+  const firstResult = results[0];
+  
+  // Common patterns to look for - DATABASE OF KNOWN SERVICES (not AI, just data)
+  const servicePatterns = [
+    { pattern: /\bhttp\b/i, name: 'http', desc: 'Hypertext Transfer Protocol - web traffic', secure: 'HTTPS (443)', uses: ['Web browsing', 'APIs', 'Web services'] },
+    { pattern: /\bhttps\b/i, name: 'https', desc: 'Secure HTTP - encrypted web traffic', secure: 'Already secure', uses: ['Secure web browsing', 'Secure APIs'] },
+    { pattern: /\bftp\b/i, name: 'ftp', desc: 'File Transfer Protocol - file transfers', secure: 'SFTP (22) or FTPS (990)', uses: ['File transfers', 'Legacy systems'] },
+    { pattern: /\bssh\b/i, name: 'ssh', desc: 'Secure Shell - encrypted remote access', secure: 'Already secure', uses: ['Remote administration', 'Secure file transfer'] },
+    { pattern: /\btelnet\b/i, name: 'telnet', desc: 'Telnet - unencrypted remote terminal', secure: 'SSH (22)', uses: ['Legacy systems', 'Network devices'] },
+    { pattern: /\bsmtp\b/i, name: 'smtp', desc: 'Simple Mail Transfer Protocol - email', secure: 'SMTPS (465) or STARTTLS', uses: ['Email servers', 'Mail delivery'] },
+    { pattern: /\bdns\b/i, name: 'dns', desc: 'Domain Name System - name resolution', secure: 'DNSSEC / DoH', uses: ['Name resolution', 'Service discovery'] },
+    { pattern: /\bpop3\b/i, name: 'pop3', desc: 'Post Office Protocol - email retrieval', secure: 'POP3S (995)', uses: ['Email clients'] },
+    { pattern: /\bimap\b/i, name: 'imap', desc: 'Internet Message Access Protocol - email', secure: 'IMAPS (993)', uses: ['Email clients', 'Sync email'] },
+    { pattern: /\bmysql\b/i, name: 'mysql', desc: 'MySQL Database - relational database', secure: 'Bind localhost + SSL', uses: ['Web applications', 'Databases'] },
+    { pattern: /\bpostgresql\b/i, name: 'postgresql', desc: 'PostgreSQL Database', secure: 'Bind localhost + SSL', uses: ['Web applications', 'Databases'] },
+    { pattern: /\bmongodb\b/i, name: 'mongodb', desc: 'MongoDB - NoSQL database', secure: 'Bind localhost + Auth', uses: ['Web applications', 'NoSQL storage'] },
+    { pattern: /\bredis\b/i, name: 'redis', desc: 'Redis - in-memory data store', secure: 'Bind localhost + AUTH', uses: ['Caching', 'Sessions', 'Queues'] },
+    { pattern: /\belasticsearch\b/i, name: 'elasticsearch', desc: 'Elasticsearch - search engine', secure: 'Bind localhost + Auth', uses: ['Search', 'Analytics', 'Logging'] },
+    { pattern: /\brdp\b|remote desktop\b/i, name: 'rdp', desc: 'Remote Desktop Protocol', secure: 'VPN + NLA', uses: ['Remote access', 'Remote desktop'] },
+    { pattern: /\bvnc\b/i, name: 'vnc', desc: 'Virtual Network Computing - remote desktop', secure: 'VPN + SSH tunnel', uses: ['Remote access', 'Screen sharing'] },
+    { pattern: /\bsmb\b|samba\b/i, name: 'smb', desc: 'Server Message Block - file sharing', secure: 'VPN only / Disable if unused', uses: ['File sharing', 'Printers', 'Windows networking'] },
+    { pattern: /\bldap\b/i, name: 'ldap', desc: 'Lightweight Directory Access Protocol', secure: 'LDAPS (636)', uses: ['Authentication', 'Active Directory'] },
+    { pattern: /\bsnmp\b/i, name: 'snmp', desc: 'Simple Network Management Protocol', secure: 'SNMPv3', uses: ['Network monitoring', 'Device management'] },
+    { pattern: /\bdocker\b/i, name: 'docker', desc: 'Docker API - container management', secure: 'Bind localhost + TLS', uses: ['Container management', 'DevOps'] },
+    { pattern: /\bkubernetes\b|k8s\b/i, name: 'kubernetes', desc: 'Kubernetes - container orchestration', secure: 'Restrict access + mTLS', uses: ['Container orchestration', 'Cloud native'] },
+    { pattern: /\bproxy\b|\bnginx\b|\bapache\b/i, name: 'web-proxy', desc: 'Web server / Reverse proxy', secure: 'Enable HTTPS', uses: ['Web serving', 'Load balancing', 'Reverse proxy'] },
+    { pattern: /\bgaming\b|game\b/i, name: 'gaming', desc: 'Gaming service port', secure: 'Verify application', uses: ['Online gaming', 'Game servers'] },
+    { pattern: /\btorrent\b|p2p\b|peer\b/i, name: 'p2p', desc: 'Peer-to-peer / Torrent traffic', secure: 'Monitor traffic', uses: ['File sharing', 'P2P applications'] },
+    { pattern: /\bntp\b/i, name: 'ntp', desc: 'Network Time Protocol - time synchronization', secure: 'Use authenticated NTP', uses: ['Time sync', 'Clock synchronization'] },
+    { pattern: /\bkerberos\b/i, name: 'kerberos', desc: 'Kerberos - network authentication', secure: 'Already secure', uses: ['Authentication', 'SSO'] },
+    { pattern: /\bnfs\b/i, name: 'nfs', desc: 'Network File System', secure: 'NFSv4 with Kerberos', uses: ['File sharing', 'Network storage'] },
+    { pattern: /\bopenvpn\b/i, name: 'openvpn', desc: 'OpenVPN - VPN protocol', secure: 'Already secure', uses: ['VPN', 'Secure tunneling'] },
+    { pattern: /\bwireguard\b/i, name: 'wireguard', desc: 'WireGuard - modern VPN', secure: 'Already secure', uses: ['VPN', 'Secure tunneling'] },
+  ];
+
+  // Pattern matching - PURE CODE LOGIC
+  for (const { pattern, name, desc, secure, uses } of servicePatterns) {
+    if (pattern.test(combinedText)) {
+      return {
+        service_name: name,
+        description: desc,
+        secure_alternative: secure,
+        common_uses: uses,
+        source: 'searxng_web_search',
+        search_result: {
+          title: firstResult.title,
+          url: firstResult.url,
+          engine: firstResult.engine
+        }
+      };
+    }
+  }
+
+  // If no pattern matched, generate dynamic info based on port range
+  let genericName = 'custom-service';
+  let genericDesc = `Port ${port} - custom or application-specific service`;
+  let genericSecure = 'Investigate application';
+  let genericUses = ['Application specific'];
+  
+  if (port >= 0 && port < 1024) {
+    genericName = 'well-known-port';
+    genericDesc = `Well-known port ${port} - check IANA registry (iana.org/assignments/service-names-port-numbers)`;
+    genericUses = ['System services', 'Standard protocols'];
+  } else if (port >= 1024 && port < 49152) {
+    genericName = 'registered-port';
+    genericDesc = `Registered port ${port} - may be used by specific applications`;
+    genericUses = ['Application specific', 'Custom services'];
+  } else if (port >= 49152) {
+    genericName = 'ephemeral-port';
+    genericDesc = `Ephemeral port ${port} - typically used for outbound/client connections`;
+    genericSecure = 'Usually client-side, low risk';
+    genericUses = ['Client connections', 'Temporary connections'];
+  }
+
+  return {
+    service_name: genericName,
+    description: genericDesc,
+    secure_alternative: genericSecure,
+    common_uses: genericUses,
+    source: 'searxng_web_search',
+    search_result: {
+      title: firstResult.title,
+      url: firstResult.url,
+      engine: firstResult.engine
+    }
+  };
+}
+
+// ── CVE API cache ─────────────────────────────────────────────────
+const cveCache = new Map();
+const CVE_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// ── Fetch CVE data from NVD API ─────────────────────────────────────
+function fetchCveData(serviceName, port) {
+  return new Promise((resolve) => {
+    if (!serviceName || serviceName === 'unknown') return resolve(null);
+    
+    // Check cache first
+    const cached = cveCache.get(serviceName);
+    if (cached && (Date.now() - cached.timestamp) < CVE_CACHE_TTL) {
+      console.log(`[CVE] Using cached data for port ${port} (${serviceName})`);
+      return resolve(cached.data);
+    }
+    
+    const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(serviceName + ' vulnerability')}&resultsPerPage=3`;
+    console.log(`[CVE] Fetching for port ${port} (${serviceName})...`);
+    
+    const req = https.get(url, {
+      headers: { 'User-Agent': 'PCAP-Analyzer/1.0' },
+      timeout: 3000
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.vulnerabilities && json.vulnerabilities.length > 0) {
+            const result = json.vulnerabilities.map(v => {
+              const cve = v.cve;
+              const cveId = cve.id;
+              const desc = cve.descriptions?.[0]?.value || 'No description';
+              const metrics = cve.metrics;
+              let cvssScore = null;
+              let severity = 'MEDIUM';
+              
+              if (metrics?.cvssMetricV31) {
+                cvssScore = metrics.cvssMetricV31[0].cvssData.baseScore;
+                severity = metrics.cvssMetricV31[0].cvssData.baseSeverity;
+              } else if (metrics?.cvssMetricV2) {
+                cvssScore = metrics.cvssMetricV2[0].cvssData.baseScore;
+                severity = metrics.cvssMetricV2[0].baseSeverity || 'MEDIUM';
+              }
+              
+              return {
+                cve_id: cveId,
+                description: desc.slice(0, 200) + (desc.length > 200 ? '...' : ''),
+                cvss_score: cvssScore,
+                severity: severity,
+                source: 'NVD CVE API'
+              };
+            });
+            
+            cveCache.set(serviceName, { data: result, timestamp: Date.now() });
+            console.log(`[CVE] Found ${result.length} CVEs for ${serviceName}`);
+            resolve(result);
+          } else {
+            console.log(`[CVE] No CVEs found for ${serviceName}`);
+            resolve(null);
+          }
+        } catch (e) {
+          console.error(`[CVE] Parse error: ${e.message}`);
+          resolve(null);
+        }
+      });
+    });
+    
+    req.on('error', (e) => {
+      console.error(`[CVE] Request error: ${e.message}`);
+      resolve(null);
+    });
+    
+    req.on('timeout', () => {
+      req.destroy();
+      console.error(`[CVE] Request timeout`);
+      resolve(null);
+    });
+  });
+}
+
+// ── Get comprehensive port info (Web Search + CVE) ───────────────────
+async function getPortIntelligence(port) {
+  // First, search the web for port info
+  const webInfo = await searchPortInfo(port);
+  
+  // Then, fetch CVE data using the discovered service name
+  let cveData = null;
+  if (webInfo.service_name && webInfo.service_name !== 'unknown') {
+    cveData = await fetchCveData(webInfo.service_name, port);
+  }
+  
+  // Determine risk level
+  let risk = 'MEDIUM';
+  let reason = webInfo.description;
+  
+  if (cveData && cveData.length > 0) {
+    const topCve = cveData[0];
+    risk = topCve.severity.toUpperCase();
+    reason = topCve.description;
+  } else {
+    // Assess risk based on service
+    const riskyServices = ['telnet', 'ftp', 'rsh', 'rexec', 'vnc', 'smb', 'rdp', 'snmp'];
+    const criticalServices = ['telnet', 'ftp'];
+    
+    if (criticalServices.includes(webInfo.service_name)) {
+      risk = 'CRITICAL';
+      reason = `${webInfo.service_name.toUpperCase()} - Unencrypted protocol, high security risk`;
+    } else if (riskyServices.includes(webInfo.service_name)) {
+      risk = 'HIGH';
+      reason = `${webInfo.service_name.toUpperCase()} - Potential security concerns`;
+    } else if (webInfo.service_name === 'ssh' || webInfo.service_name === 'https') {
+      risk = 'LOW';
+      reason = `${webInfo.service_name.toUpperCase()} - Secure protocol`;
+    }
+  }
+  
+  return {
+    port: port,
+    service_name: webInfo.service_name,
+    description: webInfo.description,
+    secure_alternative: webInfo.secure_alternative,
+    common_uses: webInfo.common_uses,
+    risk: risk,
+    reason: reason,
+    cve_id: cveData?.[0]?.cve_id || null,
+    cvss_score: cveData?.[0]?.cvss_score || null,
+    cve_count: cveData?.length || 0,
+    all_cves: cveData || [],
+    source: webInfo.source === 'searxng_web_search' ? 'SearXNG + NVD CVE API' : 'NVD CVE API',
+    search_source: webInfo.source,
+    search_result: webInfo.search_result || null
+  };
+}
+
+// ── Local agent ────────────────────────────────────────────────────
 function localDynamicAgent(prompt) {
   const l = prompt.toLowerCase();
-  let tool = 'get_summary', params = {}, filter = '', fields = DEFAULT_FIELDS;
-
   const portM = l.match(/port\s*(\d{1,5})/);
   const ipM = l.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
   const macM = l.match(/([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2})/i);
 
-  // --- CORE STATS ---
-  if (l.includes('hierarchy') || l.includes('protocol distribution')) { tool = 'get_hierarchy'; }
-  else if (l.includes('expert') || l.includes('warnings') || l.includes('errors')) { tool = 'get_expert_info'; }
-  else if (l.includes('endpoint') || l.includes('top talker') || l.includes('bandwidth')) { tool = 'get_endpoints'; }
-  
-  // --- TCP ANALYSIS ---
-  else if (l.includes('retransmission') || l.includes('retransmit')) { tool = 'get_tcp_anomalies'; filter = 'tcp.analysis.retransmission'; fields = [...DEFAULT_FIELDS, 'tcp.analysis.retransmission']; }
-  else if (l.includes('out of order')) { tool = 'get_tcp_anomalies'; filter = 'tcp.analysis.out_of_order'; }
-  else if (l.includes('zero window') || l.includes('flow control')) { tool = 'get_tcp_anomalies'; filter = 'tcp.analysis.zero_window'; }
-  else if (l.includes('duplicate ack')) { tool = 'get_tcp_anomalies'; filter = 'tcp.analysis.duplicate_ack'; }
-  else if (l.includes('rst') || l.includes('reset')) { tool = 'get_tcp_anomalies'; filter = 'tcp.flags.reset == 1'; }
-  else if (l.includes('syn flood') || l.includes('port scan') || l.includes('scanning')) { tool = 'get_tcp_anomalies'; filter = 'tcp.flags.syn == 1 && tcp.flags.ack == 0'; }
-  else if (l.includes('fin')) { tool = 'get_tcp_anomalies'; filter = 'tcp.flags.fin == 1'; }
-  
-  // --- HTTP ---
-  else if (l.includes('http method') || l.includes('get post put')) { tool = 'get_http_methods'; filter = 'http.request'; fields = [...DEFAULT_FIELDS, 'http.request.method', 'http.request.uri', 'http.host']; }
-  else if (l.includes('http status') || l.includes('status code') || l.includes('404') || l.includes('500')) { tool = 'get_http_status'; filter = 'http.response.code'; fields = [...DEFAULT_FIELDS, 'http.response.code', 'http.response.phrase']; }
-  else if (l.includes('user agent') || l.includes('browser')) { tool = 'get_http_details'; filter = 'http.user_agent'; fields = [...DEFAULT_FIELDS, 'http.user_agent']; }
-  else if (l.includes('http header') || l.includes('content type')) { tool = 'get_http_details'; filter = 'http.request || http.response'; fields = [...DEFAULT_FIELDS, 'http.content_type']; }
-  
-  // --- TLS / HTTPS ---
-  else if (l.includes('tls') || l.includes('ssl') || l.includes('sni')) { tool = 'get_tls_sni'; filter = 'tls.handshake.type == 1'; fields = [...DEFAULT_FIELDS, 'tls.handshake.extensions_server_name']; }
-  else if (l.includes('ja3') || l.includes('fingerprint')) { tool = 'get_tls_sni'; filter = 'tls.handshake.type == 1'; fields = [...DEFAULT_FIELDS, 'tcp.handshake.ja3']; }
-  else if (l.includes('certificate') || l.includes('cert')) { tool = 'get_tls_certs'; filter = 'tls.handshake.type == 11'; fields = ['frame.number', 'ip.src', 'ip.dst', 'x509ce.dNSName']; }
-  
-  // --- DNS ---
-  else if (l.includes('dns') || l.includes('domain')) { tool = 'get_dns'; filter = 'dns'; fields = [...DEFAULT_FIELDS, 'dns.qry.name', 'dns.qry.type']; }
-  else if (l.includes('dga') || l.includes('suspicious domain')) { tool = 'get_dns'; filter = 'dns.qry.name.len > 25'; fields = [...DEFAULT_FIELDS, 'dns.qry.name']; }
-  
-  // --- AUTH & PLAINTEXT ---
-  else if (l.includes('credential') || l.includes('password') || l.includes('login')) { tool = 'get_creds'; filter = 'ftp.request.command == USER || ftp.request.command == PASS || http.authorization || smb2.auth'; }
-  else if (l.includes('telnet')) { tool = 'get_creds'; filter = 'telnet'; }
-  
-  // --- NETWORK / LAYER 2 ---
-  else if (l.includes('arp') || l.includes('spoof')) { tool = 'get_arp'; filter = 'arp'; fields = ['frame.number', 'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.proto_ipv4']; }
-  else if (l.includes('dhcp')) { tool = 'get_dhcp'; filter = 'dhcp'; fields = [...DEFAULT_FIELDS, 'dhcp.option.hostname', 'dhcp.option.requested_ip_address']; }
-  else if (l.includes('icmp') || l.includes('ping')) { tool = 'get_icmp'; filter = 'icmp'; fields = [...DEFAULT_FIELDS, 'icmp.type']; }
-  else if (l.includes('broadcast') || l.includes('multicast')) { tool = 'get_arp'; filter = 'eth.dst == ff:ff:ff:ff:ff:ff || eth.dst[0:1] == "01:00:5e"'; }
-  else if (macM) { tool = 'get_arp'; filter = `eth.src == ${macM[0]} || eth.dst == ${macM[0]}`; fields = ['frame.number', 'eth.src', 'eth.dst', 'ip.src', 'ip.dst', '_ws.col.Protocol']; }
-  
-  // --- PROTOCOLS ---
-  else if (l.includes('smb') || l.includes('cifs')) { tool = 'get_generic_proto'; filter = 'smb || smb2'; fields = [...DEFAULT_FIELDS, 'smb2.cmd']; }
-  else if (l.includes('rdp')) { tool = 'get_generic_proto'; filter = 'tcp.dstport == 3389 || rdp'; }
-  else if (l.includes('ssh')) { tool = 'get_generic_proto'; filter = 'tcp.dstport == 22 || ssh'; }
-  else if (l.includes('ftp')) { tool = 'get_generic_proto'; filter = 'ftp'; fields = [...DEFAULT_FIELDS, 'ftp.request.command', 'ftp.request.arg']; }
-  else if (l.includes('smtp') || l.includes('email') || l.includes('mail')) { tool = 'get_generic_proto'; filter = 'smtp'; fields = [...DEFAULT_FIELDS, 'smtp.req.from', 'smtp.rcpt.to']; }
-  else if (l.includes('quic') || l.includes('http/3') || l.includes('http 3')) { tool = 'get_generic_proto'; filter = 'quic'; }
-  
-  // --- VULNERABILITIES ---
-  else if (l.includes('vulnerab') || l.includes('risk')) { tool = 'get_vuln_report'; }
-  
-  // --- TIMELINE ---
-  else if (l.includes('timeline') || l.includes('over time')) { tool = 'get_timeline'; }
-  
-  // --- EXPLICIT FILTERS ---
-  else if (portM) { tool = 'get_generic_proto'; filter = `tcp.port == ${portM[1]} || udp.port == ${portM[1]}`; }
-  else if (ipM) { tool = 'get_generic_proto'; filter = `ip.addr == ${ipM[1]}`; }
-  else if (l.includes('filter:') || l.includes('display:')) { tool = 'get_generic_proto'; filter = prompt.split(/(?:filter|:)/i)[1]?.trim() || ''; }
-  
-  // --- FALLBACK ---
-  else if (l.includes('summary') || l.includes('overview')) { tool = 'get_summary'; }
-  else { return { tool_called: 'none', parameters: {}, result: null, response: "I'm a TShark engine. Ask me about protocols, ports, DNS, ARP, TCP anomalies, HTTP methods, or use raw filters like 'filter: tcp.port == 80'.", followup: "Try: 'Show me protocol hierarchy'" }; }
+  if (l.includes('hierarchy')) return { tool: 'stat', stat: 'io,phs' };
+  if (l.includes('timeline')) return { tool: 'stat', stat: 'io,stat,1' };
+  if (l.includes('top talker') || l.includes('bandwidth') || l.includes('endpoint'))
+    return { tool: 'stat', stat: 'conv,ip' };
+  if (l.includes('expert') || l.includes('warning')) return { tool: 'stat', stat: 'expert' };
+  if (l.includes('summary') || l.includes('overview')) return { tool: 'stat', stat: 'io,stat,0' };
+  if (l.includes('vulnerab') || l.includes('risk')) return { tool: 'vuln' };
+  if (l.includes('retransmission')) return { tool: 'packets', filter: 'tcp.analysis.retransmission', fields: DEFAULT_FIELDS };
+  if (l.includes('out of order')) return { tool: 'packets', filter: 'tcp.analysis.out_of_order', fields: DEFAULT_FIELDS };
+  if (l.includes('zero window')) return { tool: 'packets', filter: 'tcp.analysis.zero_window', fields: DEFAULT_FIELDS };
+  if (l.includes('duplicate ack')) return { tool: 'packets', filter: 'tcp.analysis.duplicate_ack', fields: DEFAULT_FIELDS };
+  if (l.includes('rst') || l.includes('reset'))
+    return { tool: 'packets', filter: 'tcp.flags.reset == 1', fields: DEFAULT_FIELDS };
+  if (l.includes('syn flood') || l.includes('port scan'))
+    return { tool: 'packets', filter: 'tcp.flags.syn == 1 && tcp.flags.ack == 0', fields: DEFAULT_FIELDS };
+  if (l.includes('http method') || l.includes('http request'))
+    return { tool: 'packets', filter: 'http.request', fields: [...DEFAULT_FIELDS, 'http.request.method', 'http.request.uri', 'http.host'] };
+  if (l.includes('http status') || l.includes('404') || l.includes('500'))
+    return { tool: 'packets', filter: 'http.response', fields: [...DEFAULT_FIELDS, 'http.response.code', 'http.response.phrase'] };
+  if (l.includes('user agent'))
+    return { tool: 'packets', filter: 'http.user_agent', fields: [...DEFAULT_FIELDS, 'http.user_agent'] };
+  if (l.includes('tls') || l.includes('sni'))
+    return { tool: 'packets', filter: 'tls.handshake.type == 1', fields: [...DEFAULT_FIELDS, 'tls.handshake.extensions_server_name'] };
+  if (l.includes('certificate'))
+    return { tool: 'packets', filter: 'tls.handshake.type == 11', fields: ['frame.number', 'ip.src', 'ip.dst', 'x509ce.dNSName'] };
+  if (l.includes('dns') || l.includes('domain'))
+    return { tool: 'packets', filter: 'dns', fields: [...DEFAULT_FIELDS, 'dns.qry.name'] };
+  if (l.includes('credential') || l.includes('password'))
+    return { tool: 'packets', filter: 'ftp.request.command == "USER" || ftp.request.command == "PASS" || http.authorization', fields: DEFAULT_FIELDS };
+  if (l.includes('arp') || l.includes('spoof'))
+    return { tool: 'packets', filter: 'arp', fields: ['frame.number', 'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.proto_ipv4'] };
+  if (l.includes('dhcp'))
+    return { tool: 'packets', filter: 'dhcp', fields: [...DEFAULT_FIELDS, 'dhcp.option.hostname'] };
+  if (l.includes('icmp') || l.includes('ping'))
+    return { tool: 'packets', filter: 'icmp', fields: [...DEFAULT_FIELDS, 'icmp.type'] };
+  if (l.includes('broadcast'))
+    return { tool: 'packets', filter: 'eth.dst == ff:ff:ff:ff:ff:ff', fields: DEFAULT_FIELDS };
+  if (l.includes('smb'))
+    return { tool: 'packets', filter: 'smb || smb2', fields: [...DEFAULT_FIELDS, 'smb2.cmd'] };
+  if (l.includes('rdp'))
+    return { tool: 'packets', filter: 'tcp.dstport == 3389', fields: DEFAULT_FIELDS };
+  if (l.includes('ssh'))
+    return { tool: 'packets', filter: 'tcp.dstport == 22', fields: DEFAULT_FIELDS };
+  if (l.includes('smtp') || l.includes('email'))
+    return { tool: 'packets', filter: 'smtp', fields: [...DEFAULT_FIELDS, 'smtp.req.from'] };
+  if (l.includes('quic'))
+    return { tool: 'packets', filter: 'quic', fields: DEFAULT_FIELDS };
+  if (macM)
+    return { tool: 'packets', filter: `eth.src == ${macM[0]} || eth.dst == ${macM[0]}`, fields: ['frame.number', 'eth.src', 'eth.dst', 'ip.src', 'ip.dst', '_ws.col.Protocol'] };
+  if (portM)
+    return { tool: 'packets', filter: `tcp.port == ${portM[1]} || udp.port == ${portM[1]}`, fields: DEFAULT_FIELDS };
+  if (ipM)
+    return { tool: 'packets', filter: `ip.addr == ${ipM[1]}`, fields: DEFAULT_FIELDS };
+  if (l.includes('filter:'))
+    return { tool: 'packets', filter: prompt.split(/filter:/i)[1]?.trim() || '', fields: DEFAULT_FIELDS };
 
-  return { toolName: tool, tsharkFilter: filter, tsharkFields: fields };
+  return { tool: 'stat', stat: 'io,stat,0' };
 }
 
-// ── Tool Executor ────────────────────────────────────────────
-async function executeTool(toolName, filter, fields, sessionId) {
-  switch (toolName) {
-    case 'get_summary': return { result: { raw_text: await runTSharkStat(sessionId, 'io,stat,0') }, response: 'Capture summary generated by Wireshark engine.' };
-    case 'get_hierarchy': return { result: { raw_text: await runTSharkStat(sessionId, 'io,phs') }, response: 'Protocol hierarchy generated.' };
-    case 'get_expert_info': return { result: { raw_text: await runTSharkStat(sessionId, 'expert') }, response: 'Expert info (Errors/Warnings) generated.' };
-    case 'get_endpoints': return { result: { raw_text: await runTSharkStat(sessionId, 'conv,ip') }, response: 'IP Endpoints generated.' };
-    case 'get_timeline': return { result: { raw_text: await runTSharkStat(sessionId, 'io,stat,1') }, response: 'Timeline statistics generated.' };
-    case 'get_vuln_report': {
-      const portFields = ['tcp.dstport', 'udp.dstport'];
-      const packets = await runTshark(sessionId, "", portFields, 5000);
-      const portCounts = {}; packets.forEach(p => { const port = p.tcp_dstport || p.udp_dstport; if (port) portCounts[port] = (portCounts[port] || 0) + 1; });
-      const result = Object.entries(portCounts).filter(([port]) => VULN_PORTS[port]).map(([port, count]) => ({ port: parseInt(port), count, risk: VULN_PORTS[port] }));
-      return { result, response: `Found traffic on ${result.length} vulnerable ports.` };
-    }
-    case 'get_tls_certs': return { result: await runTshark(sessionId, filter, fields, 50), response: 'TLS Certificate details extracted.' };
-    // ALL OTHER PROTOCOL/ANALYSIS QUERIES FALL HERE
-    default: {
-      const packets = await runTShark(sessionId, filter, fields, 100);
-      return { result: packets, response: `Found ${packets.length} packets.` };
-    }
+async function executeTool(agentResult, sessionId) {
+  const { tool, stat, filter, fields } = agentResult;
+
+  if (tool === 'stat') {
+    const raw_text = await runTsharkStat(sessionId, stat);
+    return { result: { raw_text }, response: raw_text || 'No data.' };
   }
+
+  if (tool === 'vuln') {
+    const packets = await runTshark(sessionId, '', DEFAULT_FIELDS, 10000);
+    const portCounts = {};
+    for (const p of packets) {
+      const port = p.dst_port;
+      if (port) {
+        portCounts[port] = (portCounts[port] || 0) + 1;
+      }
+    }
+    
+    const portEntries = Object.entries(portCounts);
+    console.log(`[Vuln] Analyzing ${portEntries.length} ports with web search + CVE API...`);
+    
+    const vulnResults = await Promise.all(
+      portEntries.map(async ([port, count]) => {
+        const intel = await getPortIntelligence(parseInt(port));
+        return { port: parseInt(port), count, ...intel };
+      })
+    );
+    
+    return { result: vulnResults, response: `Analyzed ${vulnResults.length} ports using SearXNG Web Search + NVD CVE API (NO AI!).` };
+  }
+
+  const packets = await runTshark(sessionId, filter || '', fields || DEFAULT_FIELDS, 200);
+  return { result: packets, response: `Found ${packets.length} matching packets.` };
 }
 
-// ── Main Server ──────────────────────────────────────────────
+// ── Main server ────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  const url = req.url || '/'; const method = req.method || 'GET';
-  const origin = req.headers['origin'] || ''; const enc = req.headers['accept-encoding'] || '';
-  const respond = (data, status) => json(res, data, status, origin, enc);
+  const url = req.url || '/';
+  const method = req.method || 'GET';
+  const origin = req.headers['origin'] || '';
+  const enc = req.headers['accept-encoding'] || '';
+  const clientIp = req.headers['x-forwarded-for']?.split(',')[0].trim()
+    || req.socket.remoteAddress || 'unknown';
+
+  const respond = (data, status = 200) => json(res, data, status, origin, enc);
 
   if (method === 'OPTIONS') { res.writeHead(204, getCorsHeaders(origin)); return res.end(); }
-  if (url === '/ping' || url === '/pcap/ping') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('pong'); }
-  if (url === '/pcap/health') return respond({ status: 'ok', engine: 'TShark (Wireshark CLI)' });
 
+  if (url === '/ping' || url === '/pcap/ping') {
+    res.writeHead(200, { 'Content-Type': 'text/plain', ...getCorsHeaders(origin) });
+    return res.end('pong');
+  }
+
+  if (url === '/pcap/health') {
+    return respond({ status: 'ok', engine: 'TShark (Local) + SearXNG + NVD CVE API', sessions: sessions.size, note: 'NO AI - Pure dynamic code and logic!' });
+  }
+
+  // ── Upload ─────────────────────────────────────────────────
   if (url === '/pcap/upload' && method === 'POST') {
+    if (!checkRateLimit(clientIp, RATE_UPLOAD))
+      return respond({ error: 'Too many uploads. Limit: 10/min.' }, 429);
+
     try {
-      const ct = req.headers['content-type'] || ''; const bm = ct.match(/boundary=(?:"([^"]+)"|([^;,\s]+))/); const boundary = bm?.[1] ?? bm?.[2];
-      if (!boundary) return respond({ error: 'Missing boundary' }, 400);
-      const body = await parseBody(req); const parts = parseMultipart(body, boundary);
+      const ct = req.headers['content-type'] || '';
+      const bm = ct.match(/boundary=(?:"([^"]+)"|([^;,\s]+))/);
+      const boundary = bm?.[1] ?? bm?.[2];
+      if (!boundary) return respond({ error: 'Missing multipart boundary' }, 400);
+
+      const body = await parseBody(req);
+
+      const MAX_BYTES = 200 * 1024 * 1024;
+      if (body.length > MAX_BYTES)
+        return respond({ error: `File too large (${(body.length / 1024 / 1024).toFixed(0)} MB). Max 200 MB.` }, 413);
+
+      const parts = parseMultipart(body, boundary);
       let fileData = null, filename = 'upload.pcap';
-      for (const p of parts) { const m = p.headers.match(/filename\*?=(?:UTF-8''|")?([^";\r\n]+)/i); if (m) { filename = decodeURIComponent(m[1].replace(/"/g, '').trim()); fileData = p.data; } }
-      if (!fileData) return respond({ error: 'No file' }, 400);
+      for (const p of parts) {
+        const m = p.headers.match(/filename\*?=(?:UTF-8''|")?([^";\r\n]+)/i);
+        if (m) { filename = decodeURIComponent(m[1].replace(/"/g, '').trim()); fileData = p.data; }
+      }
+      if (!fileData) return respond({ error: 'No file found in upload' }, 400);
 
       const session_id = `session-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
       const pcapPath = path.join(PCAP_DIR, `${session_id}.pcap`);
-      fs.writeFileSync(pcapPath, fileData);
-
       const exportDir = path.join(EXPORT_DIR, session_id);
-      if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir, { recursive: true });
-      
-      // Extract HTTP objects in background (non-blocking)
-      exec(`tshark -r "${pcapPath}" --export-objects http,"${exportDir}"`, { timeout: 15000 }, (err) => {
-        if (err) return;
-        if (fs.existsSync(exportDir)) {
+
+      fs.writeFileSync(pcapPath, fileData);
+      console.log(`[Upload] ${filename} → ${pcapPath} (${(fileData.length / 1024 / 1024).toFixed(1)} MB)`);
+
+      fs.mkdirSync(exportDir, { recursive: true });
+      exec(`"${TSHARK_BIN}" -r "${pcapPath}" --export-objects http,"${exportDir}"`, { timeout: 120000 }, (err, _out, stderr) => {
+        if (err) { console.error(`[Export] Failed: ${err.message}`); if (stderr) console.error(stderr.slice(0, 300)); return; }
+        try {
+          const EXT_CT = {
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+            '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+            '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
+            '.json': 'application/json', '.pdf': 'application/pdf',
+          };
           const artifacts = new Map();
-          fs.readdirSync(exportDir).forEach(file => {
-            const fp = path.join(exportDir, file); const ext = path.extname(file).toLowerCase();
-            artifacts.set(encodeURIComponent(file), { buffer: fs.readFileSync(fp), contentType: ext === '.jpg' ? 'image/jpeg' : ext === '.png' ? 'image/png' : 'application/octet-stream', filename: file });
-          });
+          for (const file of fs.readdirSync(exportDir)) {
+            const fp = path.join(exportDir, file);
+            const ext = path.extname(file).toLowerCase();
+            artifacts.set(encodeURIComponent(file), {
+              buffer: fs.readFileSync(fp),
+              contentType: EXT_CT[ext] || 'application/octet-stream',
+              filename: file,
+            });
+          }
           imageStore.set(session_id, artifacts);
-        }
+          console.log(`[Export] ${artifacts.size} HTTP objects extracted`);
+        } catch (e) { console.error(`[Export] Read error: ${e.message}`); }
       });
 
       sessions.set(session_id, { session_id, filename, created_at: Date.now() });
-      const summaryText = await runTSharkStat(session_id, 'io,stat,0');
-      const totalMatch = summaryText.match(/(\d+)\s+packets/);
-      return respond({ session_id, summary: { total_packets: totalMatch ? parseInt(totalMatch[1]) : 0, raw_text: summaryText } });
-    } catch (e) { return respond({ error: e.message }, 500); }
+
+      if (sessions.size > 10) {
+        let evictKey = null, oldestAge = -1;
+        for (const [k, s] of sessions) {
+          if (k === session_id) continue;
+          const age = Date.now() - s.created_at;
+          if (age > oldestAge) { oldestAge = age; evictKey = k; }
+        }
+        if (evictKey) sessions.delete(evictKey);
+      }
+
+      const [summaryText, protoPkts, trueTotal] = await Promise.all([
+        runTsharkStat(session_id, 'io,stat,0'),
+        runTshark(session_id, '', DEFAULT_FIELDS, 5000),
+        getTruePacketCount(session_id),
+      ]);
+
+      const protocols = {};
+      let maxTime = 0;
+      for (const p of protoPkts) {
+        const proto = (p.protocol || 'UNKNOWN').toUpperCase();
+        protocols[proto] = (protocols[proto] || 0) + 1;
+        if (p.timestamp > maxTime) maxTime = p.timestamp;
+      }
+
+      const sampledCount = protoPkts.length;
+      const scaledProtocols = {};
+      if (sampledCount > 0 && trueTotal > sampledCount) {
+        const ratio = trueTotal / sampledCount;
+        for (const [proto, count] of Object.entries(protocols)) {
+          scaledProtocols[proto] = Math.round(count * ratio);
+        }
+      } else {
+        Object.assign(scaledProtocols, protocols);
+      }
+
+      const sessionData = sessions.get(session_id);
+      if (sessionData) {
+        sessionData.total_packets = trueTotal;
+        sessions.set(session_id, sessionData);
+      }
+
+      return respond({
+        session_id,
+        summary: {
+          total_packets: trueTotal,
+          protocols: scaledProtocols,
+          duration_seconds: Math.round(maxTime),
+          time_range: { start: 0, end: maxTime },
+          raw_text: summaryText,
+        },
+      });
+    } catch (e) {
+      console.error(`[Upload] Error: ${e.message}`);
+      return respond({ error: e.message }, 500);
+    }
   }
 
-  if (url === '/pcap/agent/query' && method === 'POST') {
-    try {
-      const body = await parseBody(req); const parsed = JSON.parse(body.toString());
-      const { prompt, session_id } = parsed || {};
-      if (!isValidSessionId(session_id)) return respond({ error: 'Invalid session_id' }, 400);
-      if (!fs.existsSync(path.join(PCAP_DIR, `${session_id}.pcap`))) return respond({ error: 'PCAP expired' }, 404);
-
-      const { toolName, tsharkFilter, tsharkFields } = localDynamicAgent(prompt);
-      const toolResult = await executeTool(toolName, tsharkFilter, tsharkFields, session_id);
-
-      let finalResponse = toolResult.response;
-      let followup = "Check for vulnerabilities.";
-
-      if (toolName === 'get_hierarchy') followup = "Show me TCP retransmissions.";
-      else if (toolName === 'get_expert_info') followup = "Extract HTTP objects.";
-      else if (toolName === 'get_creds' && toolResult.result?.length > 0) finalResponse = `🚨 WARNING: Found ${toolResult.result.length} plaintext credentials!`;
-      else if (toolName === 'get_tcp_anomalies' && toolResult.result?.length > 0) finalResponse = `Found ${toolResult.result.length} TCP anomalies.`;
-
-      return respond({ tool_called: toolName, parameters: {}, result: toolResult.result, response: finalResponse, followup });
-    } catch (e) { return respond({ error: e.message }, 500); }
-  }
-
+  // ── Packets ────────────────────────────────────────────────
   if (url.startsWith('/pcap/packets') && method === 'GET') {
-    const q = getQuery(url); if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid' }, 400);
-    const page = parseInt(q.page || '1'); const per_page = parseInt(q.per_page || '50'); const skip = (page - 1) * per_page;
-    const filter = `frame.number > ${skip} && frame.number <= ${skip + per_page}`;
-    return respond({ packets: await runTShark(q.session_id, filter, DEFAULT_FIELDS, per_page), total: 99999, page, per_page });
+    const q = getQuery(url);
+    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
+
+    const page = Math.max(1, parseInt(q.page || '1'));
+    const per_page = Math.min(200, parseInt(q.per_page || '50'));
+    const skip = (page - 1) * per_page;
+
+    const packets = await runTsharkPaged(q.session_id, skip, per_page);
+
+    const sessionData = sessions.get(q.session_id);
+    const realTotal = sessionData?.total_packets ?? 0;
+
+    return respond({ packets, total: realTotal, page, per_page });
   }
 
+  // ── Detailed Packet Dissection ────────────────────────────────
+  if (url.startsWith('/pcap/packet-detail') && method === 'GET') {
+    const q = getQuery(url);
+    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
+    
+    const packetNum = parseInt(q.packet_number);
+    if (!packetNum || packetNum < 1) return respond({ error: 'Invalid packet_number' }, 400);
+    
+    if (!fs.existsSync(path.join(PCAP_DIR, `${q.session_id}.pcap`)))
+      return respond({ error: 'Session expired or not found' }, 404);
+
+    const details = await getPacketDetails(q.session_id, packetNum);
+    return respond(details);
+  }
+
+  // ── Packets with Info column ────────────────────────────────
+  if (url.startsWith('/pcap/packets-detailed') && method === 'GET') {
+    const q = getQuery(url);
+    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
+
+    const page = Math.max(1, parseInt(q.page || '1'));
+    const per_page = Math.min(200, parseInt(q.per_page || '50'));
+    const skip = (page - 1) * per_page;
+
+    const extendedFields = [...DEFAULT_FIELDS, '_ws.col.Info', 'udp.srcport', 'udp.dstport'];
+    
+    const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
+    if (!fs.existsSync(pcapPath)) return respond({ packets: [], total: 0, page, per_page });
+
+    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t`;
+    for (const f of extendedFields) cmd += ` -e ${f}`;
+    cmd += ` -c ${skip + per_page}`;
+
+    exec(cmd, { timeout: 60000, maxBuffer: 100 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[TSharkDetailed] Error: ${err.message}`);
+        return respond({ packets: [], total: 0, page, per_page });
+      }
+
+      const lines = stdout.trim().split('\n').filter(l => l.trim());
+      const pageLines = lines.slice(skip);
+      
+      const packets = pageLines.map(line => {
+        const c = line.split('\t');
+        return {
+          id: parseInt(c[0]) || 0,
+          src_ip: c[1] || null,
+          dst_ip: c[2] || null,
+          length: parseInt(c[3]) || 0,
+          protocol: c[4] || 'UNKNOWN',
+          src_port: parseInt(c[5]) || parseInt(c[9]) || null,
+          dst_port: parseInt(c[6]) || parseInt(c[10]) || null,
+          timestamp: parseFloat(c[7]) || 0,
+          info: c[8] || '',
+        };
+      });
+
+      const sessionData = sessions.get(q.session_id);
+      const realTotal = sessionData?.total_packets ?? lines.length;
+
+      return respond({ packets, total: realTotal, page, per_page });
+    });
+    return;
+  }
+
+  // ── Port Intelligence with Web Search + CVE ────────────────────────
+  if (url.startsWith('/pcap/vulnerabilities') && method === 'GET') {
+    const q = getQuery(url);
+    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
+    if (!fs.existsSync(path.join(PCAP_DIR, `${q.session_id}.pcap`)))
+      return respond({ error: 'Session expired or not found' }, 404);
+
+    const packets = await runTshark(q.session_id, '', DEFAULT_FIELDS, 10000);
+    const portCounts = {};
+    for (const p of packets) {
+      const port = p.dst_port;
+      if (port) {
+        portCounts[port] = (portCounts[port] || 0) + 1;
+      }
+    }
+    
+    const portEntries = Object.entries(portCounts);
+    console.log(`[PortIntel] Analyzing ${portEntries.length} unique ports with Web Search + NVD API...`);
+    
+    // Process ports in parallel (but limit concurrency to avoid rate limits)
+    const BATCH_SIZE = 5;
+    const alerts = [];
+    
+    for (let i = 0; i < portEntries.length; i += BATCH_SIZE) {
+      const batch = portEntries.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(
+        batch.map(async ([port, count]) => {
+          const intel = await getPortIntelligence(parseInt(port));
+          return {
+            port: parseInt(port),
+            count,
+            risk: intel.risk,
+            reason: intel.reason,
+            cve_id: intel.cve_id,
+            cvss_score: intel.cvss_score,
+            source: intel.source,
+            cve_count: intel.cve_count,
+            all_cves: intel.all_cves,
+            service_name: intel.service_name,
+            description: intel.description,
+            secure_alternative: intel.secure_alternative,
+            common_uses: intel.common_uses,
+          };
+        })
+      );
+      alerts.push(...batchResults);
+      console.log(`[PortIntel] Processed ${Math.min(i + BATCH_SIZE, portEntries.length)}/${portEntries.length} ports`);
+    }
+    
+    const summary = { critical: 0, high: 0, medium: 0, low: 0, web_search: true, cve_api: true };
+    for (const a of alerts) {
+      const r = a.risk.toLowerCase();
+      if (summary[r] !== undefined) summary[r]++;
+    }
+    
+    return respond({ 
+      alerts, 
+      summary,
+      data_sources: {
+        port_info: 'Web Search API (real-time)',
+        vulnerabilities: 'NVD (National Vulnerability Database) API'
+      },
+      total_ports: portEntries.length,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // ── Single Port Intelligence ────────────────────────────────
+  if (url.startsWith('/pcap/port-intel') && method === 'GET') {
+    const q = getQuery(url);
+    const port = parseInt(q.port);
+    
+    if (!port || port < 1 || port > 65535) {
+      return respond({ error: 'Invalid port number (1-65535)' }, 400);
+    }
+    
+    console.log(`[PortIntel] Looking up port ${port}...`);
+    const intel = await getPortIntelligence(port);
+    
+    return respond({
+      port,
+      ...intel,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // ── Agent ──────────────────────────────────────────────────
+  if (url === '/pcap/agent/query' && method === 'POST') {
+    if (!checkRateLimit(clientIp, RATE_AGENT))
+      return respond({ error: 'Too many queries. Limit: 30/min.' }, 429);
+
+    try {
+      const body = await parseBody(req);
+      const parsed = JSON.parse(body.toString());
+      const { prompt, session_id } = parsed || {};
+
+      if (!isValidSessionId(session_id)) return respond({ error: 'Invalid session_id' }, 400);
+      if (!fs.existsSync(path.join(PCAP_DIR, `${session_id}.pcap`)))
+        return respond({ error: 'Session expired or PCAP not found' }, 404);
+      if (!prompt || typeof prompt !== 'string')
+        return respond({ error: 'Missing prompt' }, 400);
+
+      const agentResult = localDynamicAgent(prompt);
+      const toolResult = await executeTool(agentResult, session_id);
+
+      return respond({
+        tool_called: agentResult.tool,
+        parameters: { filter: agentResult.filter || '', stat: agentResult.stat || '' },
+        result: toolResult.result,
+        response: toolResult.response,
+      });
+    } catch (e) {
+      console.error(`[Agent] Error: ${e.message}`);
+      return respond({ error: e.message }, 500);
+    }
+  }
+
+  // ── HTTP Objects list ──────────────────────────────────────
   if (url.startsWith('/pcap/images') && method === 'GET') {
-    const q = getQuery(url); if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid' }, 400);
+    const q = getQuery(url);
+    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
+
     const artifacts = imageStore.get(q.session_id);
-    if (!artifacts) return respond({ error: 'No objects' }, 404);
-    return respond({ images: Array.from(artifacts.entries()).map(([k, v]) => ({ filename: v.filename, content_type: v.contentType, artifact_key: k })), total: artifacts.size });
+    if (!artifacts || artifacts.size === 0)
+      return respond({
+        images: [], total: 0,
+        message: 'No HTTP objects found yet. Extraction runs in the background after upload — wait a few seconds then retry.',
+      });
+
+    return respond({
+      images: Array.from(artifacts.entries()).map(([k, v]) => ({
+        filename: v.filename,
+        content_type: v.contentType,
+        artifact_key: k,
+        size: v.buffer.length,
+        is_image: v.contentType.startsWith('image/'),
+      })),
+      total: artifacts.size,
+    });
   }
 
+  // ── HTTP Object data ───────────────────────────────────────
   if (url.startsWith('/pcap/image-data') && method === 'GET') {
-    const q = getQuery(url); if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid' }, 400);
-    const art = imageStore.get(q.session_id)?.get(q.key || ''); if (!art) return respond({ error: 'Not found' }, 404);
-    res.writeHead(200, { 'Content-Type': art.contentType, 'Content-Length': art.buffer.length, 'Content-Disposition': `inline; filename="${art.filename}"`, ...getCorsHeaders(origin) });
+    const q = getQuery(url);
+    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
+    const art = imageStore.get(q.session_id)?.get(q.key || '');
+    if (!art) return respond({ error: 'Object not found' }, 404);
+
+    res.writeHead(200, {
+      'Content-Type': art.contentType,
+      'Content-Length': art.buffer.length,
+      'Content-Disposition': `inline; filename="${art.filename}"`,
+      ...getCorsHeaders(origin),
+    });
     return res.end(art.buffer);
   }
 
-  respond({ error: 'Not found' }, 404);
+  return respond({ error: 'Not found' }, 404);
 });
 
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => console.log(`🔥 Ultimate TShark Engine running on ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`✅ TShark PCAP Analyzer running on port ${PORT}`);
+  console.log(`🔧 TShark binary: ${TSHARK_BIN}`);
+  console.log(`🌐 SearXNG URL:   ${process.env.SEARXNG_URL || 'Not set (using fallbacks)'}`);
+  console.log(`🌐 Web Search:    SearXNG (Free, Open-Source)`);
+  console.log(`🛡️ CVE API:       NVD (National Vulnerability Database)`);
+  console.log(`🚫 NO AI:         Pure dynamic code and logic!`);
+  console.log(`📁 PCAP dir:      ${path.resolve(PCAP_DIR)}`);
+  console.log(`📁 Export dir:    ${path.resolve(EXPORT_DIR)}`);
+});
