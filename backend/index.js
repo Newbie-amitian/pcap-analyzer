@@ -155,15 +155,16 @@ const isValidSessionId = (id) =>
 // ── TShark core runner ─────────────────────────────────────────
 // Include both IPv4 and IPv6 fields, TCP and UDP ports
 const DEFAULT_FIELDS = [
-  'frame.number', 
+  'frame.number',
   'ip.src', 'ip.dst',           // IPv4 addresses
   'ipv6.src', 'ipv6.dst',       // IPv6 addresses
   'frame.len',
-  '_ws.col.Protocol', 
+  '_ws.col.Protocol',
   'tcp.srcport', 'tcp.dstport', // TCP ports
   'udp.srcport', 'udp.dstport', // UDP ports
   'frame.time_relative',
   'frame.time',                 // Absolute date/time
+  '_ws.col.Info',               // Info column (Wireshark-style)
 ];
 
 function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
@@ -190,7 +191,8 @@ function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
       const lines = stdout.trim().split('\n').filter(l => l.trim());
       const packets = lines.map(line => {
         const c = line.split('\t');
-        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative, frame.time
+        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, 
+        //               tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative, frame.time, info
         // Use IPv4 if available, else IPv6; Use TCP ports if available, else UDP ports
         return {
           id: parseInt(c[0]) || 0,
@@ -202,6 +204,7 @@ function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
           dst_port: parseInt(c[8]) || parseInt(c[10]) || null, // TCP dst or UDP dst
           timestamp: parseFloat(c[11]) || 0,
           datetime: c[12] || '',  // Absolute date/time
+          info: c[13] || null,    // Info column (Wireshark-style)
         };
       });
       console.log(`[TShark] Returned ${packets.length} packets`);
@@ -232,7 +235,8 @@ function runTsharkPaged(sessionId, skip, limit) {
       const pageLines = lines.slice(skip);
       const packets = pageLines.map(line => {
         const c = line.split('\t');
-        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol, tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative, frame.time
+        // Field order: frame.number, ip.src, ip.dst, ipv6.src, ipv6.dst, frame.len, protocol,
+        //               tcp.srcport, tcp.dstport, udp.srcport, udp.dstport, time_relative, frame.time, info
         return {
           id: parseInt(c[0]) || 0,
           src_ip: c[1] || c[3] || null,  // IPv4 src or IPv6 src
@@ -243,6 +247,7 @@ function runTsharkPaged(sessionId, skip, limit) {
           dst_port: parseInt(c[8]) || parseInt(c[10]) || null, // TCP dst or UDP dst
           timestamp: parseFloat(c[11]) || 0,
           datetime: c[12] || '',  // Absolute date/time
+          info: c[13] || null,    // Info column (Wireshark-style)
         };
       });
       console.log(`[TSharkPaged] → ${packets.length} packets returned`);
@@ -1610,7 +1615,29 @@ const server = http.createServer(async (req, res) => {
             const icmp = layers.icmp || layers.icmpv6;
             info = `Type=${icmp['icmp.type'] || icmp['icmpv6.type'] || ''}`;
           } else if (layers.arp) {
-            info = layers.arp['arp.opcode'] === '1' ? 'Who has ...?' : 'ARP reply';
+            const opcode = layers.arp['arp.opcode'];
+            const senderIP = layers.arp['arp.src.proto_ipv4'] || '';
+            const targetIP = layers.arp['arp.dst.proto_ipv4'] || '';
+            const senderMAC = layers.arp['arp.src.hw_mac'] || '';
+            
+            if (opcode === '1') {
+              // ARP Request - "Who has X? Tell Y"
+              if (targetIP) {
+                info = `Who has ${targetIP}?`;
+                if (senderIP) info += ` Tell ${senderIP}`;
+              } else {
+                info = 'ARP Request';
+              }
+            } else if (opcode === '2') {
+              // ARP Reply - "X is at Y"
+              if (senderIP && senderMAC) {
+                info = `${senderIP} is at ${senderMAC}`;
+              } else {
+                info = 'ARP Reply';
+              }
+            } else {
+              info = `ARP (opcode ${opcode || '?'})`;
+            }
           }
           
           // Build packet object
