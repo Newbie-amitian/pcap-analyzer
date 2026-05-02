@@ -10,7 +10,11 @@ const zlib = require('zlib');
 // REQUIRED ENVIRONMENT VARIABLES (Set these in Render dashboard!)
 // ═══════════════════════════════════════════════════════════════════
 const SEARXNG_URL = process.env.SEARXNG_URL;
-const HF_LLM_URL = process.env.HF_LLM_URL;
+
+// Cloudflare Workers AI credentials
+const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
+const CF_API_TOKEN = process.env.CF_API_TOKEN;
+
 // ALLOWED_ORIGIN: Your frontend URL (default: localhost for local dev)
 // Change this when deploying to Vercel: https://your-app.vercel.app
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
@@ -18,7 +22,8 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
 // Validate required env vars on startup
 const missingVars = [];
 if (!SEARXNG_URL) missingVars.push('SEARXNG_URL');
-if (!HF_LLM_URL) missingVars.push('HF_LLM_URL');
+if (!CF_ACCOUNT_ID) missingVars.push('CF_ACCOUNT_ID');
+if (!CF_API_TOKEN) missingVars.push('CF_API_TOKEN');
 
 if (missingVars.length > 0) {
   console.error('═══════════════════════════════════════════════════════════════');
@@ -28,7 +33,8 @@ if (missingVars.length > 0) {
   console.error('');
   console.error('Set these in your Render dashboard → Environment tab:');
   console.error('   SEARXNG_URL     = https://searxng-krq1.onrender.com');
-  console.error('   HF_LLM_URL      = https://dps5786-pcap-llm-agent.hf.space/chat');
+  console.error('   CF_ACCOUNT_ID   = your_cloudflare_account_id');
+  console.error('   CF_API_TOKEN    = your_cloudflare_api_token');
   console.error('   ALLOWED_ORIGIN  = http://localhost:3000 (or your Vercel URL)');
   console.error('═══════════════════════════════════════════════════════════════');
   process.exit(1); // Crash early with clear error
@@ -36,13 +42,17 @@ if (missingVars.length > 0) {
 
 console.log('✅ Environment variables loaded:');
 console.log(`   SEARXNG_URL    = ${SEARXNG_URL}`);
-console.log(`   HF_LLM_URL     = ${HF_LLM_URL}`);
+console.log(`   CF_ACCOUNT_ID  = ${CF_ACCOUNT_ID}`);
+console.log(`   CF_API_TOKEN   = ${CF_API_TOKEN ? CF_API_TOKEN.slice(0, 10) + '...' : 'NOT SET'}`);
 console.log(`   ALLOWED_ORIGIN = ${ALLOWED_ORIGIN}`);
 
 // ═══════════════════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════════════════
-const HF_LLM_TIMEOUT_MS = 25000; // 25 seconds (UptimeRobot keeps Space warm)
+// Cloudflare Workers AI - MUCH FASTER than HuggingFace Spaces!
+const CF_LLM_MODEL = '@cf/meta/llama-3-8b-instruct';
+const CF_LLM_TIMEOUT_MS = 10000; // 10 seconds (Cloudflare is FAST!)
+const HF_LLM_TIMEOUT_MS = 10000; // Kept for compatibility
 const SEARXNG_TIMEOUT_MS = 10000;
 const SEARXNG_MAX_RESULTS = 5;
 const SEARXNG_ENGINES = 'google,bing,duckduckgo,startpage';
@@ -308,6 +318,43 @@ function getTruePacketCount(sessionId) {
       const count = stdout.trim().split('\n').filter(l => l.trim()).length;
       console.log(`[TShark] True packet count: ${count}`);
       resolve(count);
+    });
+  });
+}
+
+// ── Get protocol counts efficiently (just protocols, no full packet data) ────────
+function getProtocolCounts(sessionId, limit = 2000) {
+  return new Promise((resolve) => {
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) return resolve({ protocols: {}, maxTime: 0 });
+    
+    // Only extract protocol and time - MUCH smaller output!
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e _ws.col.Protocol -e frame.time_relative -c ${limit}`;
+    
+    exec(cmd, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[TShark-Proto] Error: ${err.message}`);
+        return resolve({ protocols: {}, maxTime: 0 });
+      }
+      
+      const protocols = {};
+      let maxTime = 0;
+      const lines = stdout.trim().split('\n').filter(l => l.trim());
+      
+      for (const line of lines) {
+        const [proto, time] = line.split('\t');
+        if (proto) {
+          const p = proto.toUpperCase();
+          protocols[p] = (protocols[p] || 0) + 1;
+        }
+        if (time) {
+          const t = parseFloat(time);
+          if (t > maxTime) maxTime = t;
+        }
+      }
+      
+      console.log(`[TShark-Proto] Found ${Object.keys(protocols).length} protocols from ${lines.length} packets`);
+      resolve({ protocols, maxTime, sampledCount: lines.length });
     });
   });
 }
@@ -1342,19 +1389,10 @@ async function generateNaturalResponse(prompt) {
   
   // For more complex natural conversation, use LLM for dynamic response
   if (isCompliment(prompt) || isHowAreYou(prompt) || isAboutAgent(prompt) || isAskingTime(prompt) || isGreeting(prompt)) {
-    const llmPrompt = `You are a friendly, helpful PCAP Security Agent AI assistant. Respond naturally and conversationally.
+    // SHORT prompt for fast LLM response
+    const llmPrompt = `You are a PCAP Security Agent. User said: "${prompt}"
 
-User message: "${prompt}"
-
-Instructions:
-- Be warm, friendly, and helpful
-- Use bullet points (•) for lists
-- Keep response concise (2-4 sentences unless asked for details)
-- If user asks about capabilities, mention: PCAP analysis, protocol detection, vulnerability scanning, DNS/HTTP/TLS analysis
-- Use appropriate emojis
-- End with an offer to help or a follow-up question
-
-Respond as the PCAP Security Agent:`;
+Reply warmly with bullet points (•) and emojis. Keep it 2-3 sentences. Be helpful.`;
 
     const llmResponse = await callLLM(llmPrompt);
     if (llmResponse) {
@@ -1369,7 +1407,7 @@ Respond as the PCAP Security Agent:`;
       return { tool: 'chat', response: `🤖 I'm doing great, thank you for asking!\n\n• Ready to dig into your PCAP whenever you are\n• What would you like to discover?` };
     }
     if (isAboutAgent(prompt)) {
-      return { tool: 'chat', response: `🕵️‍♂️ I'm your PCAP Security Agent!\n\n• 📊 Summarize network captures\n• 🔍 Find specific packets by protocol/IP/port\n• 🛡️ Detect vulnerabilities and risks\n• 🌐 Analyze DNS, HTTP, TLS traffic\n• ⚠️ Detect suspicious activity\\n\nI use TShark (Wireshark's CLI) under the hood! 🦈` };
+      return { tool: 'chat', response: `🕵️‍♂️ I'm your PCAP Security Agent!\n\n• 📊 Summarize network captures\n• 🔍 Find specific packets by protocol/IP/port\n• 🛡️ Detect vulnerabilities and risks\n• 🌐 Analyze DNS, HTTP, TLS traffic\n• ⚠️ Detect suspicious activity\n\nI use TShark (Wireshark's CLI) under the hood! 🦈` };
     }
     if (isAskingTime(prompt)) {
       const now = new Date();
@@ -1584,25 +1622,31 @@ async function executeTool(agentResult, sessionId) {
   return { result: packets, response: formattedResponse };
 }
 
-// ── Call HuggingFace LLM for intelligent responses ────────────────────────────────
+// ── Call Cloudflare Workers AI for intelligent responses ────────────────────────────────
 async function callLLM(prompt) {
   return new Promise((resolve, reject) => {
-    const postData = JSON.stringify({ prompt });
+    // Use Cloudflare Workers AI - FAST edge inference!
+    const postData = JSON.stringify({
+      messages: [
+        { role: 'system', content: 'You are a helpful PCAP Security Agent. Always respond with bullet points (•) and emojis. Keep responses concise (3-4 sentences max). Be friendly and helpful.' },
+        { role: 'user', content: prompt }
+      ]
+    });
     
-    const url = new URL(HF_LLM_URL);
     const options = {
-      hostname: url.hostname,
+      hostname: 'api.cloudflare.com',
       port: 443,
-      path: url.pathname,
+      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_LLM_MODEL}`,
       method: 'POST',
       headers: {
+        'Authorization': `Bearer ${CF_API_TOKEN}`,
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(postData),
       },
-      timeout: HF_LLM_TIMEOUT_MS,
+      timeout: CF_LLM_TIMEOUT_MS,
     };
     
-    console.log(`[LLM] Calling HuggingFace Space: ${HF_LLM_URL}`);
+    console.log(`[LLM] Calling Cloudflare Workers AI: ${CF_LLM_MODEL}`);
     
     const req = https.request(options, (res) => {
       let data = '';
@@ -1610,14 +1654,22 @@ async function callLLM(prompt) {
       res.on('end', () => {
         try {
           if (res.statusCode !== 200) {
-            console.error(`[LLM] Error ${res.statusCode}: ${data.slice(0, 200)}`);
+            console.error(`[LLM] Error ${res.statusCode}: ${data.slice(0, 300)}`);
             return resolve(null);
           }
           const json = JSON.parse(data);
-          console.log(`[LLM] ✓ Got response (${json.response?.length || 0} chars)`);
-          resolve(json.response || null);
+          
+          // Cloudflare returns: { result: { response: "..." }, success: true }
+          if (json.success && json.result?.response) {
+            console.log(`[LLM] ✓ Got response (${json.result.response.length} chars)`);
+            resolve(json.result.response);
+          } else {
+            console.error(`[LLM] Unexpected response format: ${JSON.stringify(json).slice(0, 200)}`);
+            resolve(null);
+          }
         } catch (e) {
           console.error(`[LLM] Parse error: ${e.message}`);
+          console.error(`[LLM] Response preview: ${data.slice(0, 300)}`);
           resolve(null);
         }
       });
@@ -1630,7 +1682,7 @@ async function callLLM(prompt) {
     
     req.on('timeout', () => {
       req.destroy();
-      console.error(`[LLM] Timeout after ${HF_LLM_TIMEOUT_MS}ms`);
+      console.error(`[LLM] Timeout after ${CF_LLM_TIMEOUT_MS}ms`);
       resolve(null);
     });
     
@@ -1641,110 +1693,98 @@ async function callLLM(prompt) {
 
 // ── Format response with LLM for better readability ────────────────────────────────
 async function formatResponseWithLLM(userPrompt, agentResult, toolResult, sessionId) {
-  // Build context for LLM based on the tool type
+  // Build context for LLM based on the tool type - KEEP PROMPTS SHORT!
   let llmPrompt = '';
   
   // Handle unknown queries (llm tool)
   if (agentResult.tool === 'llm') {
-    llmPrompt = `You are a friendly PCAP Security Agent AI assistant. 
-The user said: "${userPrompt}"
+    llmPrompt = `You are a friendly PCAP Security Agent. User said: "${userPrompt}"
 
-Instructions:
-- Respond naturally and helpfully
-- If the user is asking about PCAP/network analysis, suggest they upload a PCAP file first
-- If it's a general question, answer conversationally
-- Use bullet points (•) for lists
-- Be warm, concise, and informative
-- Use appropriate emojis
-- End with an offer to help or a question
-
-Respond as the PCAP Security Agent:`;
+Reply warmly with bullet points (•) and emojis. Keep it short (2-3 sentences). End with a helpful question.`;
   }
-  // Handle statistics
+  // Handle statistics - EXTRACT KEY DATA, don't send raw output!
   else if (agentResult.tool === 'stat' && toolResult.result?.raw_text) {
-    const stats = toolResult.result.raw_text.slice(0, 2500);
-    llmPrompt = `You are an expert PCAP Security Agent AI. Analyze these network statistics.
+    const raw = toolResult.result.raw_text;
+    
+    // Extract key numbers from the raw output
+    const durationMatch = raw.match(/Duration:\s*([\d.]+)/);
+    const framesMatch = raw.match(/(\d+)\s+frames?\s+\|\s+(\d+)\s+bytes/i) || raw.match(/\|\s*(\d+)\s*\|\s*(\d+)/);
+    
+    const duration = durationMatch ? durationMatch[1] : 'unknown';
+    const frames = framesMatch ? framesMatch[1] : 'unknown';
+    const bytes = framesMatch ? framesMatch[2] : 'unknown';
+    
+    llmPrompt = `You are a PCAP Security Agent. The user asked: "${userPrompt}"
 
-User asked: "${userPrompt}"
+Key data from analysis:
+- Total packets: ${frames}
+- Total bytes: ${bytes}
+- Duration: ${duration} seconds
 
-TShark Statistics Output:
-\`\`\`
-${stats}
-\`\`\`
+Summarize this in 3-4 bullet points (•) with emojis. Be concise and helpful.`;
+  }
+  // Handle protocol hierarchy - PARSE IT!
+  else if (agentResult.tool === 'stat' && agentResult.stat === 'io,phs') {
+    const raw = toolResult.result?.raw_text || '';
+    
+    // Extract top protocols
+    const protoMatches = raw.match(/(\w+)\s+frames:(\d+)\s+bytes:(\d+)/g) || [];
+    const topProtos = protoMatches.slice(0, 8).map(m => {
+      const parts = m.match(/(\w+)\s+frames:(\d+)\s+bytes:(\d+)/);
+      return parts ? `${parts[1]}: ${parts[2]} packets` : '';
+    }).filter(Boolean);
+    
+    llmPrompt = `You are a PCAP Security Agent. User asked: "${userPrompt}"
 
-Instructions:
-- Provide a clear, well-organized summary
-- Use bullet points (•) for key findings
-- Mention total packets, protocols, duration if visible
-- Highlight anything unusual or notable
-- Be conversational and helpful
-- Keep it concise (3-5 key points)
-- Use appropriate emojis
+Top protocols found:
+${topProtos.join('\n')}
 
-Format your response with clear sections and bullet points:`;
+Summarize in 3-4 bullet points (•) with emojis. Mention the main protocols and their purpose.`;
+  }
+  // Handle top talkers - PARSE IT!
+  else if (agentResult.tool === 'stat' && agentResult.stat === 'conv,ip') {
+    const raw = toolResult.result?.raw_text || '';
+    
+    // Extract top IPs
+    const ipMatches = raw.match(/(\d+\.\d+\.\d+\.\d+)\s*<->\s*(\d+\.\d+\.\d+\.\d+)/g) || [];
+    const topIPs = ipMatches.slice(0, 5);
+    
+    llmPrompt = `You are a PCAP Security Agent. User asked: "${userPrompt}"
+
+Top communicating IPs:
+${topIPs.map(ip => `• ${ip}`).join('\n')}
+
+Summarize in 3-4 bullet points with emojis. Note any patterns or concerns.`;
   }
   // Handle packet results
   else if (agentResult.tool === 'packets' && Array.isArray(toolResult.result)) {
-    const packets = toolResult.result.slice(0, 15);
-    const packetSummary = packets.map(p => ({
-      frame: p.id,
-      src: p.src_ip,
-      dst: p.dst_ip,
-      proto: p.protocol,
-      ports: p.src_port && p.dst_port ? `${p.src_port} → ${p.dst_port}` : '',
-      info: p.info?.slice(0, 50)
-    }));
-    llmPrompt = `You are an expert PCAP Security Agent AI. Summarize these network packets.
+    const count = toolResult.result.length;
+    const protocols = [...new Set(toolResult.result.map(p => p.protocol))].slice(0, 5);
+    
+    llmPrompt = `You are a PCAP Security Agent. User asked: "${userPrompt}"
 
-User asked: "${userPrompt}"
+Found ${count} packets. Protocols: ${protocols.join(', ')}
 
-Found ${toolResult.result.length} packets. Sample:
-\`\`\`json
-${JSON.stringify(packetSummary, null, 2).slice(0, 2000)}
-\`\`\`
-
-Instructions:
-- Summarize what these packets show
-- Use bullet points (•) for findings
-- Highlight key patterns (protocols, IPs, ports)
-- Note any security-relevant patterns (unusual ports, suspicious IPs, etc.)
-- Be concise and informative
-- Use appropriate emojis
-
-Format your response with bullet points:`;
+Summarize in 3-4 bullet points (•) with emojis. Be concise.`;
   }
   // Handle vulnerability analysis
   else if (agentResult.tool === 'vuln' && Array.isArray(toolResult.result)) {
-    const vulns = toolResult.result.slice(0, 10).map(v => ({
-      port: v.port,
-      service: v.service_name,
-      risk: v.risk,
-      count: v.count
-    }));
-    llmPrompt = `You are a security expert PCAP Agent AI. Analyze these vulnerability findings.
+    const highRisk = toolResult.result.filter(v => v.risk === 'HIGH' || v.risk === 'CRITICAL').length;
+    const totalPorts = toolResult.result.length;
+    
+    llmPrompt = `You are a PCAP Security Agent. User asked: "${userPrompt}"
 
-User asked: "${userPrompt}"
+Security scan results:
+- ${totalPorts} unique ports found
+- ${highRisk} high/critical risk ports
 
-Vulnerability Analysis Results:
-\`\`\`json
-${JSON.stringify(vulns, null, 2)}
-\`\`\`
-
-Instructions:
-- Summarize security findings professionally
-- Highlight HIGH and CRITICAL risks first
-- Use bullet points (•) for each risk
-- Suggest remediation steps for risky ports
-- Be professional but accessible
-- Use security-related emojis (🛡️ ⚠️ 🔒)
-
-Format as a security summary with bullet points:`;
+Summarize security findings in 3-4 bullet points (•) with 🛡️⚠️ emojis. Suggest actions for risky ports.`;
   }
   // Default case
   else {
-    llmPrompt = `You are a helpful PCAP Security Agent AI. The user asked: "${userPrompt}"
+    llmPrompt = `You are a PCAP Security Agent. User asked: "${userPrompt}"
 
-Provide a helpful response with bullet points (•). Be conversational and concise.`;
+Provide a helpful 2-3 sentence response with bullet points (•) and emojis.`;
   }
 
   const llmResponse = await callLLM(llmPrompt);
@@ -1770,7 +1810,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url === '/pcap/health') {
-    return respond({ status: 'ok', engine: 'TShark + IANA Port DB + SearXNG + NVD CVE + Qwen LLM', sessions: sessions.size, note: 'AI-powered by Qwen2.5-1.5B via HuggingFace Spaces!' });
+    return respond({ status: 'ok', engine: 'TShark + IANA Port DB + SearXNG + NVD CVE + Llama-3-8B', sessions: sessions.size, note: 'AI-powered by Llama-3-8B via Cloudflare Workers AI!' });
   }
 
   // ── Upload ─────────────────────────────────────────────────
@@ -1842,21 +1882,17 @@ const server = http.createServer(async (req, res) => {
         if (evictKey) sessions.delete(evictKey);
       }
 
-      const [summaryText, protoPkts, trueTotal] = await Promise.all([
+      const [summaryText, protoData, trueTotal] = await Promise.all([
         runTsharkStat(session_id, 'io,stat,0'),
-        runTshark(session_id, '', DEFAULT_FIELDS, 5000),
+        getProtocolCounts(session_id, 2000),  // Efficient! Only protocol & time
         getTruePacketCount(session_id),
       ]);
 
-      const protocols = {};
-      let maxTime = 0;
-      for (const p of protoPkts) {
-        const proto = (p.protocol || 'UNKNOWN').toUpperCase();
-        protocols[proto] = (protocols[proto] || 0) + 1;
-        if (p.timestamp > maxTime) maxTime = p.timestamp;
-      }
+      const protocols = protoData.protocols;
+      const maxTime = protoData.maxTime;
+      const sampledCount = protoData.sampledCount;
 
-      const sampledCount = protoPkts.length;
+      // Scale protocol counts if we sampled
       const scaledProtocols = {};
       if (sampledCount > 0 && trueTotal > sampledCount) {
         const ratio = trueTotal / sampledCount;
@@ -2316,7 +2352,7 @@ server.listen(PORT, () => {
   console.log(`🌐 SearXNG URL:   ${SEARXNG_URL}`);
   console.log(`📚 Port DB:       IANA Registry (40+ well-known ports)`);
   console.log(`🛡️ CVE API:       NVD (only for risky services)`);
-  console.log(`🧠 AI Agent:      Qwen2.5-1.5B via HuggingFace Spaces!`);
+  console.log(`🧠 AI Agent:      Llama-3-8B via Cloudflare Workers AI!`);
   console.log(`📁 PCAP dir:      ${path.resolve(PCAP_DIR)}`);
   console.log(`📁 Export dir:    ${path.resolve(EXPORT_DIR)}`);
 });
