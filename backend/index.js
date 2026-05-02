@@ -552,8 +552,8 @@ function parsePdmlOutput(pdmlXml, targetPacket) {
       info: ''
     };
     
-    // Extract all protocol elements
-    const protoMatches = packetXml.match(/<proto[^>]*name="[^"]+"[^>]*>[\s\S]*?<\/proto>/g) || [];
+    // Extract all protocol elements - handle both self-closing and with content
+    const protoMatches = packetXml.match(/<proto[^>]*>[\s\S]*?<\/proto>/g) || [];
     
     for (const protoXml of protoMatches) {
       // Get protocol name
@@ -562,31 +562,25 @@ function parsePdmlOutput(pdmlXml, targetPacket) {
       const shownameMatch = protoXml.match(/showname="([^"]+)"/);
       const protoShowName = shownameMatch ? shownameMatch[1] : protoName;
       
-      // Skip frame protocol - handle separately
-      if (protoName === 'frame' || protoName === 'geninfo') {
-        // Extract frame fields
-        const fieldMatches = protoXml.match(/<field[^>]*showname="[^"]+"[^>]*\/>/g) || [];
+      // Skip geninfo - frame protocol has the real data
+      if (protoName === 'geninfo') {
+        continue;
+      }
+      
+      // Extract ALL fields recursively from this protocol
+      const fields = extractAllFields(protoXml);
+      
+      // Handle frame protocol specially
+      if (protoName === 'frame') {
         const frameFields = [];
-        
-        for (const fieldXml of fieldMatches) {
-          const fieldShowname = fieldXml.match(/showname="([^"]+)"/);
-          const fieldShow = fieldXml.match(/show="([^"]+)"/);
+        for (const field of fields) {
+          frameFields.push({ key: field.key, value: field.value });
           
-          if (fieldShowname) {
-            const parts = fieldShowname[1].split(': ');
-            const key = parts[0].trim();
-            const value = fieldShow ? fieldShow[1] : (parts.slice(1).join(': ') || '');
-            
-            if (key && value) {
-              frameFields.push({ key, value });
-              
-              // Store important frame fields
-              if (key === 'Frame Number') packet.frame.number = value;
-              if (key === 'Arrival Time') packet.frame.time = value;
-              if (key === 'Time since reference') packet.frame.time_relative = value;
-              if (key === 'Frame Length') packet.frame.length = value;
-            }
-          }
+          // Store important frame fields
+          if (field.key === 'Frame Number') packet.frame.number = field.value;
+          if (field.key === 'Arrival Time') packet.frame.time = field.value;
+          if (field.key === 'Time since reference') packet.frame.time_relative = field.value;
+          if (field.key === 'Frame Length') packet.frame.length = field.value;
         }
         
         if (frameFields.length > 0) {
@@ -599,53 +593,12 @@ function parsePdmlOutput(pdmlXml, targetPacket) {
         continue;
       }
       
-      // Extract fields from this protocol
-      const fields = [];
-      const fieldMatches = protoXml.match(/<field[^>]*showname="[^"]+"[^>]*\/>/g) || [];
-      
-      for (const fieldXml of fieldMatches) {
-        const fieldShowname = fieldXml.match(/showname="([^"]+)"/);
-        const fieldShow = fieldXml.match(/show="([^"]+)"/);
-        
-        if (fieldShowname) {
-          const parts = fieldShowname[1].split(': ');
-          const key = parts[0].trim();
-          const value = fieldShow ? fieldShow[1] : (parts.slice(1).join(': ') || '');
-          
-          // Filter out empty or very long values
-          if (key && value && value.length < 500) {
-            fields.push({ key, value });
-          }
-        }
-      }
-      
-      // Also extract nested fields
-      const nestedFieldMatches = protoXml.match(/<field[^>]*name="[^"]+"[^>]*show="[^"]+"[^>]*\/>/g) || [];
-      for (const fieldXml of nestedFieldMatches) {
-        const nameMatch = fieldXml.match(/name="([^"]+)"/);
-        const showMatch = fieldXml.match(/show="([^"]+)"/);
-        const shownameMatch = fieldXml.match(/showname="([^"]+)"/);
-        
-        if (shownameMatch) {
-          const parts = shownameMatch[1].split(': ');
-          const key = parts[0].trim();
-          const value = showMatch ? showMatch[1] : (parts.slice(1).join(': ') || '');
-          
-          if (key && value && value.length < 500 && !fields.find(f => f.key === key)) {
-            fields.push({ key, value });
-          }
-        } else if (nameMatch && showMatch) {
-          const key = nameMatch[1].split('.').pop().replace(/_/g, ' ');
-          const value = showMatch[1];
-          
-          if (key && value && value.length < 500 && !fields.find(f => f.key === key)) {
-            fields.push({ key, value });
-          }
-        }
-      }
-      
       // Only add layer if it has fields or is a known protocol
-      if (fields.length > 0 || ['eth', 'ip', 'ipv6', 'tcp', 'udp', 'dns', 'http', 'tls', 'dhcp', 'dhcpv6', 'mdns', 'ssdp', 'icmp', 'arp', 'ssdp', 'snmp', 'smb', 'ftp', 'ssh', 'smtp', 'ntp', 'igmp'].includes(protoName)) {
+      const knownProtocols = ['eth', 'ip', 'ipv6', 'tcp', 'udp', 'dns', 'http', 'tls', 'dhcp', 
+        'dhcpv6', 'mdns', 'ssdp', 'icmp', 'icmpv6', 'arp', 'snmp', 'smb', 'ftp', 'ssh', 'smtp', 
+        'ntp', 'igmp', 'stp', 'lldp', 'cdp', 'quic', 'sctp', 'gre', 'vlan', 'ppp', 'wlan'];
+      
+      if (fields.length > 0 || knownProtocols.includes(protoName)) {
         packet.layers.push({
           name: protoShowName || protoName.toUpperCase(),
           protocol: protoName.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10),
@@ -654,8 +607,11 @@ function parsePdmlOutput(pdmlXml, targetPacket) {
       }
     }
     
-    // Extract Info column if present
-    const infoMatch = packetXml.match(/<field[^>]*name="_ws\.col\.Info"[^>]*show="([^"]+)"/);
+    // Extract Info column if present (multiple patterns)
+    let infoMatch = packetXml.match(/<field[^>]*name="_ws\.col\.Info"[^>]*show="([^"]+)"/);
+    if (!infoMatch) {
+      infoMatch = packetXml.match(/showname="Info[^"]*"[^>]*show="([^"]+)"/);
+    }
     if (infoMatch) {
       packet.info = infoMatch[1];
     }
@@ -670,6 +626,69 @@ function parsePdmlOutput(pdmlXml, targetPacket) {
   }
   
   return target || { frame: {}, layers: [], info: '' };
+}
+
+// Recursively extract all fields from a protocol XML block
+function extractAllFields(protoXml) {
+  const fields = [];
+  const seen = new Set();
+  
+  // Pattern to match field elements (both self-closing and nested)
+  const fieldPattern = /<field[^>]*(?:\/>|>[\s\S]*?<\/field>)/g;
+  const fieldMatches = protoXml.match(fieldPattern) || [];
+  
+  for (const fieldXml of fieldMatches) {
+    // Extract showname (human readable) and show (value)
+    const shownameMatch = fieldXml.match(/showname="([^"]+)"/);
+    const showMatch = fieldXml.match(/show="([^"]+)"/);
+    const nameMatch = fieldXml.match(/name="([^"]+)"/);
+    
+    let key = '';
+    let value = '';
+    
+    if (shownameMatch) {
+      // Parse "Key: Value" format from showname
+      const parts = shownameMatch[1].split(': ');
+      key = parts[0].trim();
+      value = showMatch ? showMatch[1] : parts.slice(1).join(': ');
+    } else if (nameMatch && showMatch) {
+      // Fallback to name attribute
+      key = nameMatch[1].split('.').pop().replace(/_/g, ' ');
+      value = showMatch[1];
+    }
+    
+    // Clean up the key - capitalize first letter
+    if (key && key.length > 0) {
+      key = key.charAt(0).toUpperCase() + key.slice(1);
+    }
+    
+    // Filter out empty, duplicate, or very long values
+    if (key && value && value.length < 500 && !seen.has(key + ':' + value)) {
+      seen.add(key + ':' + value);
+      fields.push({ key, value });
+    }
+    
+    // Also check for nested fields within this field
+    const nestedPattern = /<field[^>]*showname="[^"]+"[^>]*\/>/g;
+    const nestedMatches = fieldXml.match(nestedPattern) || [];
+    for (const nestedXml of nestedMatches) {
+      const nestedShowname = nestedXml.match(/showname="([^"]+)"/);
+      const nestedShow = nestedXml.match(/show="([^"]+)"/);
+      
+      if (nestedShowname) {
+        const parts = nestedShowname[1].split(': ');
+        const nKey = parts[0].trim();
+        const nValue = nestedShow ? nestedShow[1] : parts.slice(1).join(': ');
+        
+        if (nKey && nValue && nValue.length < 500 && !seen.has(nKey + ':' + nValue)) {
+          seen.add(nKey + ':' + nValue);
+          fields.push({ key: nKey, value: nValue });
+        }
+      }
+    }
+  }
+  
+  return fields;
 }
 
 // ── SEARXNG WEB SEARCH FOR PORT INFO ─────────────────────────────────
