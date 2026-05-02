@@ -10,6 +10,11 @@ const zlib = require('zlib');
 // ============================
 const SEARXNG_URL = process.env.SEARXNG_URL || 'https://searxng-krq1.onrender.com';
 
+// HuggingFace LLM Space Configuration
+// ============================
+const HF_LLM_URL = process.env.HF_LLM_URL || 'https://dps5786-pcap-llm-agent.hf.space/chat';
+const HF_LLM_TIMEOUT_MS = 25000; // 25 seconds (UptimeRobot keeps Space warm, so no cold start)
+
 // Search settings
 const SEARXNG_TIMEOUT_MS = 10000;
 const SEARXNG_MAX_RESULTS = 5;
@@ -1260,12 +1265,12 @@ function isHowAreYou(text) {
   return phrases.some(p => lower.includes(p));
 }
 
-// ── Generate natural response ──────────────────────────────────────────
-function generateNaturalResponse(prompt) {
+// ── Generate natural response using LLM for dynamic conversation ────────
+async function generateNaturalResponse(prompt) {
   const lower = prompt.toLowerCase().trim();
   
-  // Greetings with time-based response
-  if (isGreeting(prompt)) {
+  // For simple greetings, use quick local response (no LLM needed)
+  if (isGreeting(prompt) && lower.split(' ').length <= 3) {
     const greeting = getTimeBasedGreeting();
     return {
       tool: 'chat',
@@ -1273,39 +1278,41 @@ function generateNaturalResponse(prompt) {
     };
   }
   
-  // Compliments
-  if (isCompliment(prompt)) {
-    const responses = [
-      `😊 Thank you so much!\n\n• I'm glad I could help\n• Let me know if you need anything else\n• I'm always here to analyze your PCAP files!`,
-      `✨ That's very kind of you!\n\n• I appreciate the feedback\n• Feel free to ask me anything about your network traffic\n• Happy analyzing! 🕵️‍♂️`,
-      `🎉 Thanks!\n\n• Your feedback motivates me to do better\n• Got more packets to analyze? Let's go!`
-    ];
-    return { tool: 'chat', response: responses[Math.floor(Math.random() * responses.length)] };
-  }
-  
-  // How are you
-  if (isHowAreYou(prompt)) {
-    return {
-      tool: 'chat',
-      response: `🤖 I'm doing great, thank you for asking!\n\n• I've analyzed quite a few packets today\n• Ready to dig into your PCAP whenever you are\n• What would you like to discover?`
-    };
-  }
-  
-  // Asking time
-  if (isAskingTime(prompt)) {
-    const now = new Date();
-    return {
-      tool: 'chat',
-      response: `🕐 Current time: ${now.toLocaleTimeString()}\n\n• Date: ${now.toLocaleDateString()}\n• Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}\n\nNeed me to analyze some network traffic?`
-    };
-  }
-  
-  // About agent
-  if (isAboutAgent(prompt)) {
-    return {
-      tool: 'chat',
-      response: `🕵️‍♂️ I'm your PCAP Security Agent!\n\n**My Capabilities:**\n• 📊 Summarize network captures\n• 🔍 Find specific packets by protocol/IP/port\n• 🛡️ Detect vulnerabilities and risks\n• 🔐 Find credentials in plaintext\n• 🌐 Analyze DNS, HTTP, TLS traffic\n• ⚠️ Detect suspicious activity like port scans\n\n**Try asking:**\n• "Show me DNS queries"\n• "Find all HTTP requests"\n• "Detect port scanning"\n• "What protocols are used?"\n\nI use TShark (Wireshark's CLI) under the hood! 🦈`
-    };
+  // For more complex natural conversation, use LLM for dynamic response
+  if (isCompliment(prompt) || isHowAreYou(prompt) || isAboutAgent(prompt) || isAskingTime(prompt) || isGreeting(prompt)) {
+    const llmPrompt = `You are a friendly, helpful PCAP Security Agent AI assistant. Respond naturally and conversationally.
+
+User message: "${prompt}"
+
+Instructions:
+- Be warm, friendly, and helpful
+- Use bullet points (•) for lists
+- Keep response concise (2-4 sentences unless asked for details)
+- If user asks about capabilities, mention: PCAP analysis, protocol detection, vulnerability scanning, DNS/HTTP/TLS analysis
+- Use appropriate emojis
+- End with an offer to help or a follow-up question
+
+Respond as the PCAP Security Agent:`;
+
+    const llmResponse = await callLLM(llmPrompt);
+    if (llmResponse) {
+      return { tool: 'chat', response: llmResponse };
+    }
+    
+    // Fallback to local responses if LLM fails
+    if (isCompliment(prompt)) {
+      return { tool: 'chat', response: `😊 Thank you so much!\n\n• I'm glad I could help\n• Let me know if you need anything else\n• I'm always here to analyze your PCAP files!` };
+    }
+    if (isHowAreYou(prompt)) {
+      return { tool: 'chat', response: `🤖 I'm doing great, thank you for asking!\n\n• Ready to dig into your PCAP whenever you are\n• What would you like to discover?` };
+    }
+    if (isAboutAgent(prompt)) {
+      return { tool: 'chat', response: `🕵️‍♂️ I'm your PCAP Security Agent!\n\n• 📊 Summarize network captures\n• 🔍 Find specific packets by protocol/IP/port\n• 🛡️ Detect vulnerabilities and risks\n• 🌐 Analyze DNS, HTTP, TLS traffic\n• ⚠️ Detect suspicious activity\\n\nI use TShark (Wireshark's CLI) under the hood! 🦈` };
+    }
+    if (isAskingTime(prompt)) {
+      const now = new Date();
+      return { tool: 'chat', response: `🕐 Current time: ${now.toLocaleTimeString()}\n\n• Date: ${now.toLocaleDateString()}\n• Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}` };
+    }
   }
   
   return null; // Not a natural conversation, fall through to PCAP analysis
@@ -1316,12 +1323,9 @@ function localDynamicAgent(prompt) {
   const l = prompt.toLowerCase();
   
   // ═══════════════════════════════════════════════════════════════
-  // FIRST: Check for natural conversation (greetings, compliments, etc.)
+  // Note: Natural conversation is handled separately in generateNaturalResponse
+  // This function handles PCAP analysis queries
   // ═══════════════════════════════════════════════════════════════
-  const naturalResponse = generateNaturalResponse(prompt);
-  if (naturalResponse) {
-    return naturalResponse;
-  }
   
   // ═══════════════════════════════════════════════════════════════
   // PCAP ANALYSIS TOOLS
@@ -1446,8 +1450,10 @@ function localDynamicAgent(prompt) {
   if (l.includes('filter:'))
     return { tool: 'packets', filter: prompt.split(/filter:/i)[1]?.trim() || '', fields: DEFAULT_FIELDS, response: '🔍 **Custom Filter Results**' };
 
-  // Default: show summary
-  return { tool: 'stat', stat: 'io,stat,0', response: '📊 **PCAP Overview**\n\nHere\'s a summary of your capture:' };
+  // ═══════════════════════════════════════════════════════════════
+  // DEFAULT: Unknown query - mark for LLM processing
+  // ═══════════════════════════════════════════════════════════════
+  return { tool: 'llm', response: '🤔 Let me think about that...' };
 }
 
 async function executeTool(agentResult, sessionId) {
@@ -1458,6 +1464,13 @@ async function executeTool(agentResult, sessionId) {
   // ═══════════════════════════════════════════════════════════════
   if (tool === 'chat') {
     return { result: null, response: customResponse || 'Hello! How can I help you?' };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // LLM TOOL - Unknown query, use LLM to understand and respond
+  // ═══════════════════════════════════════════════════════════════
+  if (tool === 'llm') {
+    return { result: null, response: customResponse || 'Thinking...', needsLLM: true };
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -1515,6 +1528,173 @@ async function executeTool(agentResult, sessionId) {
   return { result: packets, response: formattedResponse };
 }
 
+// ── Call HuggingFace LLM for intelligent responses ────────────────────────────────
+async function callLLM(prompt) {
+  return new Promise((resolve, reject) => {
+    const postData = JSON.stringify({ prompt });
+    
+    const url = new URL(HF_LLM_URL);
+    const options = {
+      hostname: url.hostname,
+      port: 443,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+      },
+      timeout: HF_LLM_TIMEOUT_MS,
+    };
+    
+    console.log(`[LLM] Calling HuggingFace Space: ${HF_LLM_URL}`);
+    
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) {
+            console.error(`[LLM] Error ${res.statusCode}: ${data.slice(0, 200)}`);
+            return resolve(null);
+          }
+          const json = JSON.parse(data);
+          console.log(`[LLM] ✓ Got response (${json.response?.length || 0} chars)`);
+          resolve(json.response || null);
+        } catch (e) {
+          console.error(`[LLM] Parse error: ${e.message}`);
+          resolve(null);
+        }
+      });
+    });
+    
+    req.on('error', (e) => {
+      console.error(`[LLM] Request error: ${e.message}`);
+      resolve(null);
+    });
+    
+    req.on('timeout', () => {
+      req.destroy();
+      console.error(`[LLM] Timeout after ${HF_LLM_TIMEOUT_MS}ms`);
+      resolve(null);
+    });
+    
+    req.write(postData);
+    req.end();
+  });
+}
+
+// ── Format response with LLM for better readability ────────────────────────────────
+async function formatResponseWithLLM(userPrompt, agentResult, toolResult, sessionId) {
+  // Build context for LLM based on the tool type
+  let llmPrompt = '';
+  
+  // Handle unknown queries (llm tool)
+  if (agentResult.tool === 'llm') {
+    llmPrompt = `You are a friendly PCAP Security Agent AI assistant. 
+The user said: "${userPrompt}"
+
+Instructions:
+- Respond naturally and helpfully
+- If the user is asking about PCAP/network analysis, suggest they upload a PCAP file first
+- If it's a general question, answer conversationally
+- Use bullet points (•) for lists
+- Be warm, concise, and informative
+- Use appropriate emojis
+- End with an offer to help or a question
+
+Respond as the PCAP Security Agent:`;
+  }
+  // Handle statistics
+  else if (agentResult.tool === 'stat' && toolResult.result?.raw_text) {
+    const stats = toolResult.result.raw_text.slice(0, 2500);
+    llmPrompt = `You are an expert PCAP Security Agent AI. Analyze these network statistics.
+
+User asked: "${userPrompt}"
+
+TShark Statistics Output:
+\`\`\`
+${stats}
+\`\`\`
+
+Instructions:
+- Provide a clear, well-organized summary
+- Use bullet points (•) for key findings
+- Mention total packets, protocols, duration if visible
+- Highlight anything unusual or notable
+- Be conversational and helpful
+- Keep it concise (3-5 key points)
+- Use appropriate emojis
+
+Format your response with clear sections and bullet points:`;
+  }
+  // Handle packet results
+  else if (agentResult.tool === 'packets' && Array.isArray(toolResult.result)) {
+    const packets = toolResult.result.slice(0, 15);
+    const packetSummary = packets.map(p => ({
+      frame: p.id,
+      src: p.src_ip,
+      dst: p.dst_ip,
+      proto: p.protocol,
+      ports: p.src_port && p.dst_port ? `${p.src_port} → ${p.dst_port}` : '',
+      info: p.info?.slice(0, 50)
+    }));
+    llmPrompt = `You are an expert PCAP Security Agent AI. Summarize these network packets.
+
+User asked: "${userPrompt}"
+
+Found ${toolResult.result.length} packets. Sample:
+\`\`\`json
+${JSON.stringify(packetSummary, null, 2).slice(0, 2000)}
+\`\`\`
+
+Instructions:
+- Summarize what these packets show
+- Use bullet points (•) for findings
+- Highlight key patterns (protocols, IPs, ports)
+- Note any security-relevant patterns (unusual ports, suspicious IPs, etc.)
+- Be concise and informative
+- Use appropriate emojis
+
+Format your response with bullet points:`;
+  }
+  // Handle vulnerability analysis
+  else if (agentResult.tool === 'vuln' && Array.isArray(toolResult.result)) {
+    const vulns = toolResult.result.slice(0, 10).map(v => ({
+      port: v.port,
+      service: v.service_name,
+      risk: v.risk,
+      count: v.count
+    }));
+    llmPrompt = `You are a security expert PCAP Agent AI. Analyze these vulnerability findings.
+
+User asked: "${userPrompt}"
+
+Vulnerability Analysis Results:
+\`\`\`json
+${JSON.stringify(vulns, null, 2)}
+\`\`\`
+
+Instructions:
+- Summarize security findings professionally
+- Highlight HIGH and CRITICAL risks first
+- Use bullet points (•) for each risk
+- Suggest remediation steps for risky ports
+- Be professional but accessible
+- Use security-related emojis (🛡️ ⚠️ 🔒)
+
+Format as a security summary with bullet points:`;
+  }
+  // Default case
+  else {
+    llmPrompt = `You are a helpful PCAP Security Agent AI. The user asked: "${userPrompt}"
+
+Provide a helpful response with bullet points (•). Be conversational and concise.`;
+  }
+
+  const llmResponse = await callLLM(llmPrompt);
+  return llmResponse || toolResult.response;
+}
+
 // ── Main server ────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   const url = req.url || '/';
@@ -1534,7 +1714,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url === '/pcap/health') {
-    return respond({ status: 'ok', engine: 'TShark + IANA Port DB + SearXNG + NVD CVE', sessions: sessions.size, note: 'NO AI - Pure dynamic code and logic!' });
+    return respond({ status: 'ok', engine: 'TShark + IANA Port DB + SearXNG + NVD CVE + Qwen LLM', sessions: sessions.size, note: 'AI-powered by Qwen2.5-1.5B via HuggingFace Spaces!' });
   }
 
   // ── Upload ─────────────────────────────────────────────────
@@ -1983,14 +2163,52 @@ const server = http.createServer(async (req, res) => {
       if (!prompt || typeof prompt !== 'string')
         return respond({ error: 'Missing prompt' }, 400);
 
+      // First try LLM-powered natural conversation (greetings, compliments, etc.)
+      const naturalResponse = await generateNaturalResponse(prompt);
+      if (naturalResponse) {
+        return respond({
+          tool_called: 'chat',
+          parameters: {},
+          result: null,
+          response: naturalResponse.response,
+        });
+      }
+      
+      // Then try local PCAP analysis rules
       const agentResult = localDynamicAgent(prompt);
+      
+      // If it's a chat response, return directly
+      if (agentResult.tool === 'chat') {
+        return respond({
+          tool_called: 'chat',
+          parameters: {},
+          result: null,
+          response: agentResult.response,
+        });
+      }
+      
+      // If it's an LLM query (unknown), use LLM directly
+      if (agentResult.tool === 'llm') {
+        const llmResponse = await formatResponseWithLLM(prompt, agentResult, { result: null, response: '' }, session_id);
+        return respond({
+          tool_called: 'llm',
+          parameters: {},
+          result: null,
+          response: llmResponse || agentResult.response,
+        });
+      }
+      
+      // For PCAP analysis, execute the tool and use LLM to format response
       const toolResult = await executeTool(agentResult, session_id);
+      
+      // Use LLM to format the response nicely
+      const llmResponse = await formatResponseWithLLM(prompt, agentResult, toolResult, session_id);
 
       return respond({
         tool_called: agentResult.tool,
         parameters: { filter: agentResult.filter || '', stat: agentResult.stat || '' },
         result: toolResult.result,
-        response: toolResult.response,
+        response: llmResponse || toolResult.response,
       });
     } catch (e) {
       console.error(`[Agent] Error: ${e.message}`);
@@ -2048,7 +2266,7 @@ server.listen(PORT, () => {
   console.log(`🌐 SearXNG URL:   ${SEARXNG_URL}`);
   console.log(`📚 Port DB:       IANA Registry (40+ well-known ports)`);
   console.log(`🛡️ CVE API:       NVD (only for risky services)`);
-  console.log(`🚫 NO AI:         Pure dynamic code and logic!`);
+  console.log(`🧠 AI Agent:      Qwen2.5-1.5B via HuggingFace Spaces!`);
   console.log(`📁 PCAP dir:      ${path.resolve(PCAP_DIR)}`);
   console.log(`📁 Export dir:    ${path.resolve(EXPORT_DIR)}`);
 });
