@@ -49,9 +49,10 @@ console.log(`   ALLOWED_ORIGIN = ${ALLOWED_ORIGIN}`);
 // ═══════════════════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════════════════
-// Cloudflare Workers AI - MUCH FASTER than HuggingFace Spaces!
-const CF_LLM_MODEL = '@cf/meta/llama-3-8b-instruct';
-const CF_LLM_TIMEOUT_MS = 8000; // 8 seconds (Cloudflare is FAST!)
+// Cloudflare Workers AI - Qwen 2.5 14B is SMARTER than Llama 3 8B!
+// Options: @cf/qwen/qwen2.5-14b-instruct (smartest) or @cf/meta/llama-3-8b-instruct (faster)
+const CF_LLM_MODEL = '@cf/qwen/qwen2.5-14b-instruct';
+const CF_LLM_TIMEOUT_MS = 15000; // 15 seconds for smarter model
 const HF_LLM_TIMEOUT_MS = 8000; // Kept for compatibility
 const SEARXNG_TIMEOUT_MS = 10000;
 const SEARXNG_MAX_RESULTS = 5;
@@ -85,6 +86,9 @@ const sessions = new Map();
 const imageStore = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
+// Pre-computed data store (cached analysis results)
+const precomputedData = new Map();
+
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of sessions) {
@@ -93,6 +97,7 @@ setInterval(() => {
       try { const p = path.join(EXPORT_DIR, id); if (fs.existsSync(p)) fs.rmSync(p, { recursive: true }); } catch (_) { }
       sessions.delete(id);
       imageStore.delete(id);
+      precomputedData.delete(id);
       console.log(`[Session] Expired: ${id}`);
     }
   }
@@ -408,6 +413,223 @@ function runTsharkStat(sessionId, statCommand) {
       resolve(stdout || '');
     });
   });
+}
+
+// ── PRE-COMPUTE EVERYTHING ON UPLOAD ─────────────────────────────────────
+// This runs ONCE during upload, so queries are INSTANT later!
+async function precomputeAllData(sessionId) {
+  console.log(`[PreCompute] Starting for session ${sessionId}...`);
+  const startTime = Date.now();
+  const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+  
+  if (!fs.existsSync(pcapPath)) {
+    console.error(`[PreCompute] PCAP not found: ${pcapPath}`);
+    return null;
+  }
+
+  const data = {
+    // Basic stats
+    total_packets: 0,
+    total_bytes: 0,
+    duration_seconds: 0,
+    
+    // Protocols
+    protocols: {},
+    
+    // Ports
+    ports: {},
+    
+    // IPs (top talkers)
+    top_src_ips: {},
+    top_dst_ips: {},
+    unique_src_ips: [],
+    unique_dst_ips: [],
+    
+    // DNS
+    dns_queries: [],
+    dns_responses: [],
+    top_domains: {},
+    
+    // HTTP
+    http_hosts: [],
+    http_requests: [],
+    http_responses: [],
+    
+    // TLS/HTTPS
+    tls_sni: [],
+    https_sites: [],
+    
+    // HTTP Objects (files)
+    http_objects: [],
+    
+    // Conversation stats
+    ip_conversations: [],
+    
+    // Raw stats text
+    raw_stats: '',
+    raw_hierarchy: '',
+    
+    // Computed at timestamp
+    computed_at: new Date().toISOString(),
+  };
+
+  try {
+    // Run all TShark commands in parallel for speed
+    console.log(`[PreCompute] Running TShark commands in parallel...`);
+    
+    const [
+      statsText,
+      hierarchyText,
+      portCounts,
+      protoData,
+      trueTotal,
+      dnsData,
+      httpHostsData,
+      tlsSniData,
+      ipConversationsData,
+    ] = await Promise.all([
+      runTsharkStat(sessionId, 'io,stat,0'),
+      runTsharkStat(sessionId, 'io,phs'),
+      getAllPorts(sessionId),
+      getProtocolCounts(sessionId, 5000),
+      getTruePacketCount(sessionId),
+      // DNS queries
+      new Promise((resolve) => {
+        const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e dns.qry.name -e dns.flags.response -e dns.a -e dns.aaaa 2>/dev/null | head -500`;
+        exec(cmd, { timeout: 30000 }, (err, stdout) => {
+          if (err || !stdout.trim()) return resolve({ queries: [], responses: [], domains: {} });
+          const lines = stdout.trim().split('\n').filter(l => l.trim());
+          const queries = [];
+          const responses = [];
+          const domains = {};
+          lines.forEach(line => {
+            const [qry, isResp, a, aaaa] = line.split('\t');
+            if (qry) {
+              domains[qry] = (domains[qry] || 0) + 1;
+              if (isResp === '1') {
+                responses.push({ query: qry, a, aaaa });
+              } else {
+                queries.push(qry);
+              }
+            }
+          });
+          resolve({ queries: [...new Set(queries)], responses, domains });
+        });
+      }),
+      // HTTP hosts
+      new Promise((resolve) => {
+        const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e http.host -e http.request.method -e http.request.uri 2>/dev/null | head -200`;
+        exec(cmd, { timeout: 30000 }, (err, stdout) => {
+          if (err || !stdout.trim()) return resolve({ hosts: [], requests: [] });
+          const lines = stdout.trim().split('\n').filter(l => l.trim());
+          const hosts = new Set();
+          const requests = [];
+          lines.forEach(line => {
+            const [host, method, uri] = line.split('\t');
+            if (host) hosts.add(host);
+            if (method && uri) requests.push({ method, uri, host });
+          });
+          resolve({ hosts: [...hosts], requests });
+        });
+      }),
+      // TLS SNI
+      new Promise((resolve) => {
+        const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e tls.handshake.extensions_server_name 2>/dev/null | head -200`;
+        exec(cmd, { timeout: 30000 }, (err, stdout) => {
+          if (err || !stdout.trim()) return resolve([]);
+          const lines = stdout.trim().split('\n').filter(l => l.trim());
+          resolve([...new Set(lines)]);
+        });
+      }),
+      // IP conversations (top talkers)
+      new Promise((resolve) => {
+        const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -q -z conv,ip 2>/dev/null`;
+        exec(cmd, { timeout: 60000 }, (err, stdout) => {
+          if (err || !stdout.trim()) return resolve([]);
+          const lines = stdout.trim().split('\n');
+          const convs = [];
+          let inData = false;
+          for (const line of lines) {
+            if (line.includes('<->')) {
+              inData = true;
+              const match = line.match(/(\d+\.\d+\.\d+\.\d+)\s*<->\s*(\d+\.\d+\.\d+\.\d+)/);
+              if (match) {
+                const parts = line.trim().split(/\s+/);
+                const bytes = parseInt(parts[parts.length - 2]) || 0;
+                convs.push({ src: match[1], dst: match[2], bytes });
+              }
+            }
+          }
+          // Sort by bytes and take top 20
+          convs.sort((a, b) => b.bytes - a.bytes);
+          resolve(convs.slice(0, 20));
+        });
+      }),
+    ]);
+
+    // Parse stats text
+    data.raw_stats = statsText;
+    data.raw_hierarchy = hierarchyText;
+    data.total_packets = trueTotal;
+    data.protocols = protoData.protocols;
+    data.duration_seconds = Math.round(protoData.maxTime);
+    
+    // Parse bytes from stats
+    const bytesMatch = statsText.match(/(\d+)\s+bytes/i);
+    if (bytesMatch) data.total_bytes = parseInt(bytesMatch[1]);
+
+    // Ports
+    data.ports = portCounts;
+
+    // DNS
+    data.dns_queries = dnsData.queries;
+    data.dns_responses = dnsData.responses;
+    data.top_domains = dnsData.domains;
+
+    // HTTP
+    data.http_hosts = httpHostsData.hosts;
+    data.http_requests = httpHostsData.requests;
+
+    // TLS
+    data.tls_sni = tlsSniData;
+    data.https_sites = tlsSniData.filter(s => s && !s.includes('undefined'));
+
+    // IP conversations
+    data.ip_conversations = ipConversationsData;
+    
+    // Extract unique IPs
+    const srcIPs = {};
+    const dstIPs = {};
+    ipConversationsData.forEach(c => {
+      srcIPs[c.src] = (srcIPs[c.src] || 0) + c.bytes;
+      dstIPs[c.dst] = (dstIPs[c.dst] || 0) + c.bytes;
+    });
+    data.top_src_ips = srcIPs;
+    data.top_dst_ips = dstIPs;
+    data.unique_src_ips = Object.keys(srcIPs);
+    data.unique_dst_ips = Object.keys(dstIPs);
+
+    // HTTP Objects from imageStore (already extracted during upload)
+    const artifacts = imageStore.get(sessionId);
+    if (artifacts && artifacts.size > 0) {
+      data.http_objects = Array.from(artifacts.entries()).map(([k, v]) => ({
+        filename: v.filename,
+        content_type: v.contentType,
+        size: v.buffer.length,
+        is_image: v.contentType.startsWith('image/'),
+      }));
+    }
+
+    const elapsed = Date.now() - startTime;
+    console.log(`[PreCompute] ✓ Complete in ${elapsed}ms`);
+    console.log(`[PreCompute] Stats: ${data.total_packets} packets, ${Object.keys(data.protocols).length} protocols, ${Object.keys(data.ports).length} ports`);
+    console.log(`[PreCompute] DNS: ${data.dns_queries.length} queries, HTTP: ${data.http_hosts.length} hosts, TLS: ${data.https_sites.length} SNI`);
+    
+    return data;
+  } catch (e) {
+    console.error(`[PreCompute] Error: ${e.message}`);
+    return null;
+  }
 }
 
 // ── Detailed packet dissection ──────────────────────────────────
@@ -1488,6 +1710,14 @@ function localDynamicAgent(prompt) {
   if (l.includes('credential') || l.includes('password') || l.includes('auth'))
     return { tool: 'packets', filter: 'ftp.request.command == "USER" || ftp.request.command == "PASS" || http.authorization', fields: DEFAULT_FIELDS, response: '🔐 **Credential Detection**\n\n⚠️ Checking for plaintext credentials...' };
   
+  // HTTP Objects and Files
+  if (l.includes('http object') || l.includes('file') || l.includes('image') || l.includes('jpg') || l.includes('png') || l.includes('gif') || l.includes('downloaded') || l.includes('received file') || l.includes('extracted'))
+    return { tool: 'http_objects', response: '📁 **HTTP Objects / Extracted Files**\n\nChecking for files extracted from HTTP traffic...' };
+  
+  // Websites visited
+  if (l.includes('website') || l.includes('visited') || l.includes('domain') || l.includes('host'))
+    return { tool: 'packets', filter: 'http.host || tls.handshake.extensions_server_name', fields: [...DEFAULT_FIELDS, 'http.host', 'tls.handshake.extensions_server_name'], response: '🌐 **Websites & Domains Visited**\n\nShowing HTTP hosts and TLS SNI:' };
+  
   // ARP
   if (l.includes('arp') || l.includes('spoof'))
     return { tool: 'packets', filter: 'arp', fields: ['frame.number', 'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.proto_ipv4'], response: '🔗 **ARP Traffic**\n\nChecking for ARP spoofing or anomalies:' };
@@ -1572,6 +1802,50 @@ async function executeTool(agentResult, sessionId) {
   }
 
   // ═══════════════════════════════════════════════════════════════
+  // HTTP OBJECTS TOOL - List extracted files from HTTP traffic
+  // ═══════════════════════════════════════════════════════════════
+  if (tool === 'http_objects') {
+    const artifacts = imageStore.get(sessionId);
+    if (!artifacts || artifacts.size === 0) {
+      return { 
+        result: [], 
+        response: '📁 No HTTP objects found in this capture.\n\n• No files were extracted from HTTP traffic\n• This could mean:\n  - No HTTP file downloads in the capture\n  - Files were transmitted over HTTPS (encrypted)\n  - The capture only contains headers, not full file content\n\nTry checking the "Images" tab to see if extraction is still running.' 
+      };
+    }
+    
+    const files = Array.from(artifacts.entries()).map(([k, v]) => ({
+      filename: v.filename,
+      content_type: v.contentType,
+      size: v.buffer.length,
+      is_image: v.contentType.startsWith('image/'),
+    }));
+    
+    const images = files.filter(f => f.is_image);
+    const otherFiles = files.filter(f => !f.is_image);
+    
+    let response = customResponse || '📁 **HTTP Objects Found**\n\n';
+    response += `• **Total files extracted:** ${files.length}\n`;
+    response += `• **Images:** ${images.length}\n`;
+    response += `• **Other files:** ${otherFiles.length}\n\n`;
+    
+    if (images.length > 0) {
+      response += `**Images found:**\n`;
+      images.slice(0, 10).forEach(f => {
+        response += `• ${f.filename} (${(f.size / 1024).toFixed(1)} KB, ${f.content_type})\n`;
+      });
+    }
+    
+    if (otherFiles.length > 0) {
+      response += `\n**Other files:**\n`;
+      otherFiles.slice(0, 5).forEach(f => {
+        response += `• ${f.filename} (${(f.size / 1024).toFixed(1)} KB, ${f.content_type})\n`;
+      });
+    }
+    
+    return { result: files, response };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
   // STAT TOOL - TShark statistics
   // ═══════════════════════════════════════════════════════════════
   if (tool === 'stat') {
@@ -1621,15 +1895,27 @@ async function executeTool(agentResult, sessionId) {
 }
 
 // ── Call Cloudflare Workers AI for intelligent responses ────────────────────────────────
-async function callLLM(prompt) {
+async function callLLM(prompt, systemOverride = null) {
   return new Promise((resolve, reject) => {
     // Use Cloudflare Workers AI - FAST edge inference!
+    const defaultSystem = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
+
+RULES:
+• Give DETAILED, INTELLIGENT responses (5-8 bullet points when analyzing data)
+• Use emojis sparingly (1-2 per response, not every bullet)
+• If user asks multiple questions, answer ALL of them separately
+• When analyzing packets, provide specific details: IPs, ports, protocols, packet counts
+• Be technical but clear - you're talking to security professionals
+• If you see suspicious patterns, explain WHY they're suspicious
+• For files/HTTP objects, list them with sizes and types
+• Format numbers with commas (e.g., "5,110 packets" not "5110")`;
+    
     const postData = JSON.stringify({
       messages: [
-        { role: 'system', content: 'You are a PCAP Security Agent. Respond with 3-4 bullet points (•) and emojis. Be concise.' },
+        { role: 'system', content: systemOverride || defaultSystem },
         { role: 'user', content: prompt }
       ],
-      max_tokens: 256  // Limit tokens for faster response
+      max_tokens: 600  // Longer, more detailed responses
     });
     
     const options = {
@@ -1692,14 +1978,25 @@ async function callLLM(prompt) {
 
 // ── Format response with LLM for better readability ────────────────────────────────
 async function formatResponseWithLLM(userPrompt, agentResult, toolResult, sessionId) {
-  // Build context for LLM based on the tool type - KEEP PROMPTS SHORT!
+  // Build context for LLM based on the tool type - MORE CONTEXT FOR BETTER RESPONSES
   let llmPrompt = '';
   
-  // Handle unknown queries (llm tool) - SHORT PROMPT FOR SPEED
+  // Handle unknown queries (llm tool) - GIVE MORE CONTEXT
   if (agentResult.tool === 'llm') {
-    llmPrompt = `User: "${userPrompt}"\nReply with 3 bullets (•) + emojis. Be brief.`;
+    // Get session context for smarter responses
+    const sessionData = sessions.get(sessionId);
+    const httpObjects = imageStore.get(sessionId);
+    const httpFiles = httpObjects ? [...httpObjects.keys()] : [];
+    
+    llmPrompt = `You have access to a PCAP file with network traffic data.
+${sessionData ? `PCAP File: ${sessionData.filename}` : ''}
+${httpFiles.length > 0 ? `HTTP Objects Found: ${httpFiles.slice(0, 10).join(', ')}${httpFiles.length > 10 ? ` (${httpFiles.length} total)` : ''}` : 'No HTTP objects extracted yet.'}
+
+User Question: "${userPrompt}"
+
+Answer in detail. If they ask about files/images, check the HTTP Objects list above. If they ask multiple questions, answer ALL of them.`;
   }
-  // Handle statistics - SHORT PROMPT FOR SPEED
+  // Handle statistics - MORE DETAIL
   else if (agentResult.tool === 'stat' && toolResult.result?.raw_text) {
     const raw = toolResult.result.raw_text;
     const durationMatch = raw.match(/Duration:\s*([\d.]+)/);
@@ -1708,48 +2005,233 @@ async function formatResponseWithLLM(userPrompt, agentResult, toolResult, sessio
     const frames = framesMatch ? framesMatch[1] : '?';
     const bytes = framesMatch ? framesMatch[2] : '?';
     
-    llmPrompt = `PCAP: ${frames} packets, ${bytes} bytes, ${duration}s.\n3 bullets + emojis.`;
+    llmPrompt = `PCAP Summary Analysis:
+• Total Packets: ${parseInt(frames).toLocaleString()}
+• Total Bytes: ${parseInt(bytes).toLocaleString()}
+• Duration: ${duration} seconds
+
+Provide a detailed analysis of this network capture. Mention packet rate (packets/sec), data rate, and what kind of traffic this might be.`;
   }
-  // Handle protocol hierarchy - SHORT PROMPT FOR SPEED
+  // Handle protocol hierarchy - MORE DETAIL
   else if (agentResult.tool === 'stat' && agentResult.stat === 'io,phs') {
     const raw = toolResult.result?.raw_text || '';
     const protoMatches = raw.match(/(\w+)\s+frames:(\d+)/g) || [];
-    const topProtos = protoMatches.slice(0, 5).map(m => {
+    const allProtos = protoMatches.slice(0, 10).map(m => {
       const parts = m.match(/(\w+)\s+frames:(\d+)/);
-      return parts ? `${parts[1]}(${parts[2]})` : '';
-    }).filter(Boolean).join(', ');
+      return parts ? { proto: parts[1], count: parseInt(parts[2]) } : null;
+    }).filter(Boolean);
     
-    llmPrompt = `Protocols: ${topProtos}\n3 bullets + emojis.`;
+    const totalFrames = allProtos.reduce((sum, p) => sum + p.count, 0);
+    const protoList = allProtos.map(p => `${p.proto}: ${p.count.toLocaleString()} packets`).join('\n');
+    
+    llmPrompt = `Protocol Hierarchy Analysis:
+${protoList}
+
+Total analyzed: ${totalFrames.toLocaleString()} packets
+
+Explain what each protocol means and what kind of network activity this represents. Are there any unusual protocols?`;
   }
-  // Handle top talkers - SHORT PROMPT FOR SPEED
+  // Handle top talkers - MORE DETAIL
   else if (agentResult.tool === 'stat' && agentResult.stat === 'conv,ip') {
     const raw = toolResult.result?.raw_text || '';
     const ipMatches = raw.match(/(\d+\.\d+\.\d+\.\d+)\s*<->\s*(\d+\.\d+\.\d+\.\d+)/g) || [];
-    const topIPs = ipMatches.slice(0, 3).join(', ');
+    const topIPs = ipMatches.slice(0, 5);
     
-    llmPrompt = `Top IPs: ${topIPs}\n3 bullets + emojis.`;
+    llmPrompt = `Top Talkers (IPs with most traffic):
+${topIPs.join('\n')}
+
+Analyze these IP conversations. Which IPs are most active? Could any be suspicious?`;
   }
-  // Handle packet results - SHORT PROMPT FOR SPEED
+  // Handle packet results - MORE DETAIL
   else if (agentResult.tool === 'packets' && Array.isArray(toolResult.result)) {
     const count = toolResult.result.length;
-    const protocols = [...new Set(toolResult.result.map(p => p.protocol))].slice(0, 3).join(', ');
+    const protocols = [...new Set(toolResult.result.map(p => p.protocol))];
+    const protoCounts = {};
+    toolResult.result.forEach(p => { protoCounts[p.protocol] = (protoCounts[p.protocol] || 0) + 1; });
+    const protoSummary = Object.entries(protoCounts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([p, c]) => `${p}: ${c}`).join(', ');
     
-    llmPrompt = `${count} packets. Protocols: ${protocols}\n3 bullets + emojis.`;
+    // Get unique IPs
+    const srcIPs = [...new Set(toolResult.result.map(p => p.src_ip).filter(Boolean))].slice(0, 5);
+    const dstIPs = [...new Set(toolResult.result.map(p => p.dst_ip).filter(Boolean))].slice(0, 5);
+    
+    // Get unique ports
+    const ports = [...new Set([...toolResult.result.map(p => p.dst_port), ...toolResult.result.map(p => p.src_port)].filter(Boolean))].slice(0, 10);
+    
+    llmPrompt = `Packet Analysis Results:
+• Total matching packets: ${count.toLocaleString()}
+• Protocols: ${protoSummary}
+• Source IPs: ${srcIPs.join(', ') || 'N/A'}
+• Destination IPs: ${dstIPs.join(', ') || 'N/A'}
+• Ports seen: ${ports.join(', ') || 'N/A'}
+
+Summarize this traffic. What's happening? Any patterns or anomalies?`;
   }
-  // Handle vulnerability analysis - SHORT PROMPT FOR SPEED
+  // Handle vulnerability analysis - MORE DETAIL
   else if (agentResult.tool === 'vuln' && Array.isArray(toolResult.result)) {
-    const highRisk = toolResult.result.filter(v => v.risk === 'HIGH' || v.risk === 'CRITICAL').length;
-    const totalPorts = toolResult.result.length;
+    const highRisk = toolResult.result.filter(v => v.risk === 'HIGH' || v.risk === 'CRITICAL');
+    const mediumRisk = toolResult.result.filter(v => v.risk === 'MEDIUM');
+    const lowRisk = toolResult.result.filter(v => v.risk === 'LOW');
     
-    llmPrompt = `Security: ${totalPorts} ports, ${highRisk} risky.\n3 bullets with 🛡️⚠️.`;
+    const riskyPorts = highRisk.map(v => `Port ${v.port} (${v.service_name}): ${v.reason}`).join('\n');
+    
+    llmPrompt = `Security Analysis Results:
+• Total ports analyzed: ${toolResult.result.length}
+• HIGH/CRITICAL risk: ${highRisk.length}
+• MEDIUM risk: ${mediumRisk.length}
+• LOW risk: ${lowRisk.length}
+
+${highRisk.length > 0 ? `High-risk ports:\n${riskyPorts}` : 'No high-risk ports found.'}
+
+Provide a security assessment. What are the main risks? What should be investigated?`;
   }
-  // Default case - SHORT PROMPT FOR SPEED
+  // Default case - MORE CONTEXT
   else {
-    llmPrompt = `User: "${userPrompt}"\n3 bullets + emojis.`;
+    llmPrompt = `User asked: "${userPrompt}"
+
+Provide a helpful, detailed response. If this is about the PCAP file, explain what you found.`;
   }
 
   const llmResponse = await callLLM(llmPrompt);
   return llmResponse || toolResult.response;
+}
+
+// ── INSTANT QUERY - Get data from pre-computed memory (NO TShark!) ────────
+function getInstantQueryResult(prompt, data, sessionId) {
+  const l = prompt.toLowerCase();
+  
+  // Summary
+  if (l.includes('summary') || l.includes('overview') || l.includes('summarize') || l.includes('what') && l.includes('pcap')) {
+    return {
+      tool: 'summary',
+      response: `📊 PCAP Summary: ${data.total_packets.toLocaleString()} packets, ${(data.total_bytes / 1024 / 1024).toFixed(2)} MB, ${data.duration_seconds}s duration`,
+      data: {
+        total_packets: data.total_packets,
+        total_bytes: data.total_bytes,
+        duration_seconds: data.duration_seconds,
+        protocols: data.protocols,
+      }
+    };
+  }
+  
+  // Protocols
+  if (l.includes('protocol') || l.includes('hierarchy')) {
+    return {
+      tool: 'protocols',
+      response: `📋 Found ${Object.keys(data.protocols).length} protocols`,
+      data: data.protocols
+    };
+  }
+  
+  // DNS
+  if (l.includes('dns') || l.includes('domain')) {
+    return {
+      tool: 'dns',
+      response: `🔍 Found ${data.dns_queries.length} DNS queries`,
+      data: {
+        queries: data.dns_queries,
+        top_domains: Object.entries(data.top_domains).sort((a, b) => b[1] - a[1]).slice(0, 10),
+      }
+    };
+  }
+  
+  // HTTP
+  if (l.includes('http') && !l.includes('https')) {
+    return {
+      tool: 'http',
+      response: `🌐 Found ${data.http_hosts.length} HTTP hosts`,
+      data: {
+        hosts: data.http_hosts,
+        requests: data.http_requests,
+      }
+    };
+  }
+  
+  // HTTPS / TLS / Websites visited
+  if (l.includes('https') || l.includes('tls') || l.includes('website') || l.includes('visited') || l.includes('sni')) {
+    return {
+      tool: 'https',
+      response: `🔒 Found ${data.https_sites.length} HTTPS destinations`,
+      data: data.https_sites.filter(s => s)
+    };
+  }
+  
+  // Files / HTTP Objects / Images
+  if (l.includes('file') || l.includes('image') || l.includes('jpg') || l.includes('object') || l.includes('downloaded')) {
+    return {
+      tool: 'files',
+      response: `📁 Found ${data.http_objects.length} HTTP objects`,
+      data: data.http_objects
+    };
+  }
+  
+  // Ports
+  if (l.includes('port')) {
+    const portList = Object.entries(data.ports).sort((a, b) => b[1] - a[1]).slice(0, 20);
+    return {
+      tool: 'ports',
+      response: `🔌 Found ${Object.keys(data.ports).length} unique ports`,
+      data: portList
+    };
+  }
+  
+  // IPs / Top talkers
+  if (l.includes('ip') || l.includes('talker') || l.includes('endpoint') || l.includes('source') || l.includes('destination')) {
+    return {
+      tool: 'ips',
+      response: `🌐 Found ${data.unique_src_ips.length} source IPs and ${data.unique_dst_ips.length} destination IPs`,
+      data: {
+        conversations: data.ip_conversations,
+        top_src: Object.entries(data.top_src_ips).sort((a, b) => b[1] - a[1]).slice(0, 10),
+        top_dst: Object.entries(data.top_dst_ips).sort((a, b) => b[1] - a[1]).slice(0, 10),
+      }
+    };
+  }
+  
+  // Default - use LLM with full context
+  return {
+    tool: 'llm',
+    response: 'Analyzing...',
+    data: null
+  };
+}
+
+// ── Build LLM prompt from pre-computed data ────────────────────────────────
+function buildLLMPromptFromPrecomputed(prompt, instantResult, data) {
+  // Build rich context for LLM
+  let context = `PCAP Analysis Data (pre-computed):
+
+📊 BASIC STATS:
+• Total Packets: ${data.total_packets.toLocaleString()}
+• Total Bytes: ${(data.total_bytes / 1024 / 1024).toFixed(2)} MB
+• Duration: ${data.duration_seconds} seconds
+• Packet Rate: ${data.duration_seconds > 0 ? (data.total_packets / data.duration_seconds).toFixed(1) : 'N/A'} packets/sec
+
+📋 PROTOCOLS:
+${Object.entries(data.protocols).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([p, c]) => `• ${p}: ${c.toLocaleString()} packets`).join('\n')}
+
+🔌 TOP PORTS:
+${Object.entries(data.ports).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([p, c]) => `• Port ${p}: ${c} packets`).join('\n')}
+
+🌐 TOP IPs:
+${data.ip_conversations.slice(0, 5).map(c => `• ${c.src} → ${c.dst} (${(c.bytes / 1024).toFixed(1)} KB)`).join('\n')}
+
+🔍 DNS QUERIES (${data.dns_queries.length} total):
+${data.dns_queries.slice(0, 5).join('\n')}
+
+🌐 HTTP HOSTS (${data.http_hosts.length} total):
+${data.http_hosts.slice(0, 5).join('\n')}
+
+🔒 HTTPS SITES (${data.https_sites.length} total):
+${data.https_sites.slice(0, 5).join('\n')}
+
+📁 HTTP OBJECTS (${data.http_objects.length} total):
+${data.http_objects.slice(0, 5).map(f => `• ${f.filename} (${(f.size / 1024).toFixed(1)} KB, ${f.content_type})`).join('\n')}
+
+User Question: "${prompt}"
+
+Answer in a friendly, detailed way. Use the data above to provide specific numbers and insights.`;
+
+  return context;
 }
 
 // ── Main server ────────────────────────────────────────────────
@@ -1843,41 +2325,44 @@ const server = http.createServer(async (req, res) => {
         if (evictKey) sessions.delete(evictKey);
       }
 
-      const [summaryText, protoData, trueTotal] = await Promise.all([
-        runTsharkStat(session_id, 'io,stat,0'),
-        getProtocolCounts(session_id, 2000),  // Efficient! Only protocol & time
-        getTruePacketCount(session_id),
-      ]);
-
-      const protocols = protoData.protocols;
-      const maxTime = protoData.maxTime;
-      const sampledCount = protoData.sampledCount;
-
-      // Scale protocol counts if we sampled
-      const scaledProtocols = {};
-      if (sampledCount > 0 && trueTotal > sampledCount) {
-        const ratio = trueTotal / sampledCount;
-        for (const [proto, count] of Object.entries(protocols)) {
-          scaledProtocols[proto] = Math.round(count * ratio);
-        }
+      // ═══════════════════════════════════════════════════════════════
+      // PRE-COMPUTE EVERYTHING - Runs ONCE, queries are INSTANT later!
+      // ═══════════════════════════════════════════════════════════════
+      console.log(`[Upload] Starting pre-computation for ${session_id}...`);
+      const precomputed = await precomputeAllData(session_id);
+      
+      if (precomputed) {
+        // Store pre-computed data for instant queries
+        precomputedData.set(session_id, precomputed);
+        console.log(`[Upload] ✓ Pre-computation complete! Data cached for instant queries.`);
       } else {
-        Object.assign(scaledProtocols, protocols);
+        console.warn(`[Upload] ⚠ Pre-computation had issues, queries may be slower.`);
       }
 
       const sessionData = sessions.get(session_id);
       if (sessionData) {
-        sessionData.total_packets = trueTotal;
+        sessionData.total_packets = precomputed?.total_packets || 0;
+        sessionData.precomputed = true;
         sessions.set(session_id, sessionData);
       }
 
       return respond({
         session_id,
         summary: {
-          total_packets: trueTotal,
-          protocols: scaledProtocols,
-          duration_seconds: Math.round(maxTime),
-          time_range: { start: 0, end: maxTime },
-          raw_text: summaryText,
+          total_packets: precomputed?.total_packets || 0,
+          protocols: precomputed?.protocols || {},
+          duration_seconds: precomputed?.duration_seconds || 0,
+          time_range: { start: 0, end: precomputed?.duration_seconds || 0 },
+          raw_text: precomputed?.raw_stats || '',
+        },
+        // Include pre-computed data so frontend can use it immediately
+        precomputed: {
+          dns_queries: precomputed?.dns_queries?.length || 0,
+          http_hosts: precomputed?.http_hosts?.length || 0,
+          https_sites: precomputed?.https_sites?.length || 0,
+          http_objects: precomputed?.http_objects?.length || 0,
+          unique_ips: (precomputed?.unique_src_ips?.length || 0) + (precomputed?.unique_dst_ips?.length || 0),
+          ports: Object.keys(precomputed?.ports || {}).length,
         },
       });
     } catch (e) {
@@ -2210,6 +2695,9 @@ const server = http.createServer(async (req, res) => {
       if (!prompt || typeof prompt !== 'string')
         return respond({ error: 'Missing prompt' }, 400);
 
+      // Check if we have pre-computed data (INSTANT queries!)
+      const precomputed = precomputedData.get(session_id);
+      
       // First try LLM-powered natural conversation (greetings, compliments, etc.)
       const naturalResponse = await generateNaturalResponse(prompt);
       if (naturalResponse) {
@@ -2221,10 +2709,34 @@ const server = http.createServer(async (req, res) => {
         });
       }
       
-      // Then try local PCAP analysis rules
+      // ═══════════════════════════════════════════════════════════════
+      // INSTANT QUERY - Read from pre-computed memory (NO TShark!)
+      // ═══════════════════════════════════════════════════════════════
+      if (precomputed) {
+        console.log(`[Agent] ✓ Using pre-computed data (INSTANT query)`);
+        
+        // Build context from pre-computed data
+        const instantResult = getInstantQueryResult(prompt, precomputed, session_id);
+        
+        // Format with AI for human-friendly response
+        const llmPrompt = buildLLMPromptFromPrecomputed(prompt, instantResult, precomputed);
+        const llmResponse = await callLLM(llmPrompt);
+        
+        return respond({
+          tool_called: instantResult.tool,
+          parameters: instantResult.params || {},
+          result: null,  // Don't send raw data, LLM formatted it
+          response: llmResponse || instantResult.response,
+        });
+      }
+      
+      // ═══════════════════════════════════════════════════════════════
+      // FALLBACK - No pre-computed data, run TShark (slower)
+      // ═══════════════════════════════════════════════════════════════
+      console.log(`[Agent] ⚠ No pre-computed data, running TShark (slower)...`);
+      
       const agentResult = localDynamicAgent(prompt);
       
-      // If it's a chat response, return directly
       if (agentResult.tool === 'chat') {
         return respond({
           tool_called: 'chat',
@@ -2234,7 +2746,6 @@ const server = http.createServer(async (req, res) => {
         });
       }
       
-      // If it's an LLM query (unknown), use LLM directly
       if (agentResult.tool === 'llm') {
         const llmResponse = await formatResponseWithLLM(prompt, agentResult, { result: null, response: '' }, session_id);
         return respond({
@@ -2245,24 +2756,18 @@ const server = http.createServer(async (req, res) => {
         });
       }
       
-      // For PCAP analysis, execute the tool and use LLM to format response
       const toolResult = await executeTool(agentResult, session_id);
-      
-      // Use LLM to format the response nicely
       const llmResponse = await formatResponseWithLLM(prompt, agentResult, toolResult, session_id);
 
-      // If LLM formatted the response, return ONLY the LLM response (no raw data)
-      // This makes the output clean and AI-like instead of showing raw TShark output
       if (llmResponse) {
         return respond({
           tool_called: agentResult.tool,
           parameters: { filter: agentResult.filter || '', stat: agentResult.stat || '' },
-          result: null,  // Don't return raw data - LLM already formatted it!
+          result: null,
           response: llmResponse,
         });
       }
 
-      // Fallback: return raw result if LLM failed
       return respond({
         tool_called: agentResult.tool,
         parameters: { filter: agentResult.filter || '', stat: agentResult.stat || '' },
@@ -2325,7 +2830,7 @@ server.listen(PORT, () => {
   console.log(`🌐 SearXNG URL:   ${SEARXNG_URL}`);
   console.log(`📚 Port DB:       IANA Registry (40+ well-known ports)`);
   console.log(`🛡️ CVE API:       NVD (only for risky services)`);
-  console.log(`🧠 AI Agent:      Llama-3-8B via Cloudflare Workers AI!`);
+  console.log(`🧠 AI Agent:      Qwen 2.5 14B via Cloudflare Workers AI!`);
   console.log(`📁 PCAP dir:      ${path.resolve(PCAP_DIR)}`);
   console.log(`📁 Export dir:    ${path.resolve(EXPORT_DIR)}`);
 });
