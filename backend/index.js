@@ -535,6 +535,162 @@ function getTlsHandshakeType(type) {
   return types[type] || `Type ${type}`;
 }
 
+// ── Parse TShark Verbose Output (Wireshark-style) ─────────────────────────────
+function parseVerboseOutput(output, targetPacket) {
+  const lines = output.split('\n');
+  const packets = [];
+  let currentPacket = null;
+  let currentLayer = null;
+  let currentSubLayer = null;
+  let lastIndent = 0;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    
+    // Calculate indentation level
+    const trimmedLine = line.trimStart();
+    const indent = line.length - trimmedLine.length;
+    
+    // Detect new packet (starts with "Frame X:")
+    if (trimmedLine.match(/^Frame \d+:/)) {
+      if (currentPacket) packets.push(currentPacket);
+      currentPacket = {
+        frame: {},
+        layers: [],
+        raw_text: ''
+      };
+      currentLayer = null;
+      currentSubLayer = null;
+      lastIndent = indent;
+      continue;
+    }
+    
+    if (!currentPacket) continue;
+    
+    // Detect new protocol layer (lines ending with no colon, followed by indented content)
+    // Protocol layers typically start at indent 0-4 and have specific patterns
+    const layerPatterns = [
+      /^Ethernet II/,
+      /^Internet Protocol Version \d/,
+      /^IPv[46]/,
+      /^User Datagram Protocol/,
+      /^Transmission Control Protocol/,
+      /^Internet Control Message Protocol/,
+      /^Address Resolution Protocol/,
+      /^Domain Name System/,
+      /^Hypertext Transfer Protocol/,
+      /^HTTP\/\d/,
+      /^Transport Layer Security/,
+      /^Secure Sockets Layer/,
+      /^DHCPv?6?/,
+      /^Simple Network Management Protocol/,
+      /^Server Message Block/,
+      /^NetBIOS/,
+      /^OpenVPN/,
+      /^Generic Routing Encapsulation/,
+      /^Spanning Tree Protocol/,
+      /^Link Layer Discovery Protocol/,
+      /^Cisco Discovery Protocol/,
+      /^Dynamic Host Configuration Protocol/,
+      /^Internet Group Management Protocol/,
+      /^Pragmatic General Multicast/,
+      /^Real-time Transport Protocol/,
+      /^Session Description Protocol/,
+      /^Session Announcement Protocol/,
+      /^File Transfer Protocol/,
+      /^Simple Mail Transfer Protocol/,
+      /^Post Office Protocol/,
+      /^Internet Message Access Protocol/,
+      /^Border Gateway Protocol/,
+      /^Open Shortest Path First/,
+      /^Layer [0-9]/,
+      /^\w+[\s\w]*:$/,  // Generic protocol name ending with colon
+    ];
+    
+    // Check if this is a new layer header (typically at indent 0-4)
+    if (indent <= 8 && !trimmedLine.includes(': ') && !trimmedLine.startsWith('[')) {
+      const possibleLayer = trimmedLine.replace(/:$/, '').trim();
+      if (possibleLayer.length > 3 && possibleLayer.length < 60) {
+        // Check if it matches a known protocol pattern
+        const isLayer = layerPatterns.some(p => p.test(possibleLayer));
+        if (isLayer || (indent === 0 && possibleLayer.includes('Protocol'))) {
+          currentLayer = {
+            name: possibleLayer,
+            fields: [],
+            sublayers: []
+          };
+          currentPacket.layers.push(currentLayer);
+          currentSubLayer = null;
+          lastIndent = indent;
+          continue;
+        }
+      }
+    }
+    
+    // Parse field lines (contains ": " separator)
+    if (trimmedLine.includes(': ')) {
+      const colonIndex = trimmedLine.indexOf(': ');
+      const key = trimmedLine.substring(0, colonIndex).trim();
+      const value = trimmedLine.substring(colonIndex + 2).trim();
+      
+      if (key && value !== undefined) {
+        const field = { key, value, indent };
+        
+        // Determine which layer/sublayer to add to
+        if (indent > 12 && currentSubLayer) {
+          currentSubLayer.fields.push(field);
+        } else if (currentLayer) {
+          // Check if this starts a new sublayer (indented section)
+          if (indent > lastIndent + 4) {
+            currentSubLayer = {
+              name: key,
+              fields: [field]
+            };
+            currentLayer.sublayers.push(currentSubLayer);
+          } else {
+            currentLayer.fields.push(field);
+            currentSubLayer = null;
+          }
+        } else {
+          // Frame-level fields
+          currentPacket.frame[key] = value;
+        }
+        lastIndent = indent;
+      }
+    } else if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
+      // Bracketed metadata like [Coloring Rule Name: UDP]
+      const content = trimmedLine.slice(1, -1);
+      if (content.includes(': ')) {
+        const [key, value] = content.split(': ');
+        if (currentLayer) {
+          currentLayer.fields.push({ key: `[${key}]`, value, indent });
+        }
+      }
+    } else if (currentLayer && trimmedLine.length > 0 && !trimmedLine.includes(':')) {
+      // Continuation line or standalone value
+      if (currentLayer.fields.length > 0) {
+        const lastField = currentLayer.fields[currentLayer.fields.length - 1];
+        if (lastField.value.length < 200) {
+          lastField.value += ' ' + trimmedLine;
+        }
+      }
+    }
+  }
+  
+  // Don't forget the last packet
+  if (currentPacket) packets.push(currentPacket);
+  
+  // Find the target packet (TShark -V outputs all packets up to -c limit)
+  const target = packets.find((p, i) => i === targetPacket - 1);
+  
+  if (!target && packets.length > 0) {
+    return packets[packets.length - 1]; // Return last packet if target not found
+  }
+  
+  return target || { frame: {}, layers: [], raw_text: output };
+}
+
 // ── SEARXNG WEB SEARCH FOR PORT INFO ─────────────────────────────────
 const portInfoCache = new Map();
 const PORT_INFO_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
@@ -1260,6 +1416,34 @@ const server = http.createServer(async (req, res) => {
 
     const details = await getPacketDetails(q.session_id, packetNum);
     return respond(details);
+  }
+
+  // ── Full Wireshark-style Packet Dissection (TShark -V) ────────────────────────
+  if (url.startsWith('/pcap/packet-dissection') && method === 'GET') {
+    const q = getQuery(url);
+    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
+    
+    const packetNum = parseInt(q.packet_number);
+    if (!packetNum || packetNum < 1) return respond({ error: 'Invalid packet_number' }, 400);
+    
+    const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
+    if (!fs.existsSync(pcapPath)) return respond({ error: 'Session expired or not found' }, 404);
+
+    // Use TShark's verbose mode for full dissection like Wireshark
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -V -c ${packetNum}`;
+    console.log(`[TShark-Dissect] Getting full dissection for packet ${packetNum}`);
+    
+    exec(cmd, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[TShark-Dissect] Error: ${err.message}`);
+        return respond({ error: 'Failed to dissect packet' }, 500);
+      }
+      
+      // Parse the verbose output into structured layers
+      const dissection = parseVerboseOutput(stdout, packetNum);
+      return respond(dissection);
+    });
+    return;
   }
 
   // ── Packets with Info column ────────────────────────────────
