@@ -1894,7 +1894,132 @@ async function executeTool(agentResult, sessionId) {
   return { result: packets, response: formattedResponse };
 }
 
-// ── Call Cloudflare Workers AI for intelligent responses ────────────────────────────────
+// ── Call Cloudflare Workers AI with STREAMING support ────────────────────────────────
+async function callLLMStream(prompt, res, origin) {
+  return new Promise((resolve, reject) => {
+    const systemPrompt = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
+
+RULES:
+• Give DETAILED, INTELLIGENT responses (5-8 bullet points when analyzing data)
+• Use emojis sparingly (1-2 per response, not every bullet)
+• If user asks multiple questions, answer ALL of them separately
+• When analyzing packets, provide specific details: IPs, ports, protocols, packet counts
+• Be technical but clear - you're talking to security professionals
+• If you see suspicious patterns, explain WHY they're suspicious
+• For files/HTTP objects, list them with sizes and types
+• Format numbers with commas (e.g., "5,110 packets" not "5110")`;
+    
+    const postData = JSON.stringify({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: prompt }
+      ],
+      max_tokens: 800,
+      stream: true  // ENABLE STREAMING!
+    });
+    
+    const options = {
+      hostname: 'api.cloudflare.com',
+      port: 443,
+      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_LLM_MODEL}`,
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${CF_API_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+      },
+      timeout: CF_LLM_TIMEOUT_MS,
+    };
+    
+    console.log(`[LLM-Stream] Starting streaming request to Cloudflare...`);
+    
+    // Set up SSE headers
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': ALLOWED_ORIGIN === '*' ? '*' : ALLOWED_ORIGIN,
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    });
+    
+    const req = https.request(options, (cfRes) => {
+      if (cfRes.statusCode !== 200) {
+        console.error(`[LLM-Stream] Error ${cfRes.statusCode}`);
+        res.write(`data: ${JSON.stringify({ error: 'LLM request failed' })}\n\n`);
+        res.end();
+        return resolve(null);
+      }
+      
+      let buffer = '';
+      let fullResponse = '';
+      
+      cfRes.on('data', (chunk) => {
+        const text = chunk.toString();
+        buffer += text;
+        
+        // Process SSE lines
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';  // Keep incomplete line in buffer
+        
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6).trim();
+            if (data === '[DONE]') {
+              res.write('data: [DONE]\n\n');
+              continue;
+            }
+            try {
+              const json = JSON.parse(data);
+              // Cloudflare streaming format: { response: "token" }
+              if (json.response) {
+                fullResponse += json.response;
+                // Forward to client
+                res.write(`data: ${JSON.stringify({ token: json.response })}\n\n`);
+              }
+            } catch (e) {
+              // Non-JSON line, skip
+            }
+          }
+        }
+      });
+      
+      cfRes.on('end', () => {
+        console.log(`[LLM-Stream] ✓ Complete (${fullResponse.length} chars)`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        resolve(fullResponse);
+      });
+      
+      cfRes.on('error', (e) => {
+        console.error(`[LLM-Stream] Response error: ${e.message}`);
+        res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+        res.end();
+        resolve(null);
+      });
+    });
+    
+    req.on('error', (e) => {
+      console.error(`[LLM-Stream] Request error: ${e.message}`);
+      res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+      res.end();
+      resolve(null);
+    });
+    
+    req.on('timeout', () => {
+      req.destroy();
+      console.error(`[LLM-Stream] Timeout`);
+      res.write(`data: ${JSON.stringify({ error: 'Timeout' })}\n\n`);
+      res.end();
+      resolve(null);
+    });
+    
+    req.write(postData);
+    req.end();
+  });
+}
+
+// ── Call Cloudflare Workers AI for intelligent responses (non-streaming) ────────────────────────────────
 async function callLLM(prompt, systemOverride = null) {
   return new Promise((resolve, reject) => {
     // Use Cloudflare Workers AI - FAST edge inference!
@@ -2095,141 +2220,86 @@ Provide a helpful, detailed response. If this is about the PCAP file, explain wh
   return llmResponse || toolResult.response;
 }
 
-// ── INSTANT QUERY - Get data from pre-computed memory (NO TShark!) ────────
+// ── INSTANT QUERY - ALWAYS use LLM with full pre-computed data (NO TShark!) ────────
 function getInstantQueryResult(prompt, data, sessionId) {
-  const l = prompt.toLowerCase();
-  
-  // Summary
-  if (l.includes('summary') || l.includes('overview') || l.includes('summarize') || l.includes('what') && l.includes('pcap')) {
-    return {
-      tool: 'summary',
-      response: `📊 PCAP Summary: ${data.total_packets.toLocaleString()} packets, ${(data.total_bytes / 1024 / 1024).toFixed(2)} MB, ${data.duration_seconds}s duration`,
-      data: {
-        total_packets: data.total_packets,
-        total_bytes: data.total_bytes,
-        duration_seconds: data.duration_seconds,
-        protocols: data.protocols,
-      }
-    };
-  }
-  
-  // Protocols
-  if (l.includes('protocol') || l.includes('hierarchy')) {
-    return {
-      tool: 'protocols',
-      response: `📋 Found ${Object.keys(data.protocols).length} protocols`,
-      data: data.protocols
-    };
-  }
-  
-  // DNS
-  if (l.includes('dns') || l.includes('domain')) {
-    return {
-      tool: 'dns',
-      response: `🔍 Found ${data.dns_queries.length} DNS queries`,
-      data: {
-        queries: data.dns_queries,
-        top_domains: Object.entries(data.top_domains).sort((a, b) => b[1] - a[1]).slice(0, 10),
-      }
-    };
-  }
-  
-  // HTTP
-  if (l.includes('http') && !l.includes('https')) {
-    return {
-      tool: 'http',
-      response: `🌐 Found ${data.http_hosts.length} HTTP hosts`,
-      data: {
-        hosts: data.http_hosts,
-        requests: data.http_requests,
-      }
-    };
-  }
-  
-  // HTTPS / TLS / Websites visited
-  if (l.includes('https') || l.includes('tls') || l.includes('website') || l.includes('visited') || l.includes('sni')) {
-    return {
-      tool: 'https',
-      response: `🔒 Found ${data.https_sites.length} HTTPS destinations`,
-      data: data.https_sites.filter(s => s)
-    };
-  }
-  
-  // Files / HTTP Objects / Images
-  if (l.includes('file') || l.includes('image') || l.includes('jpg') || l.includes('object') || l.includes('downloaded')) {
-    return {
-      tool: 'files',
-      response: `📁 Found ${data.http_objects.length} HTTP objects`,
-      data: data.http_objects
-    };
-  }
-  
-  // Ports
-  if (l.includes('port')) {
-    const portList = Object.entries(data.ports).sort((a, b) => b[1] - a[1]).slice(0, 20);
-    return {
-      tool: 'ports',
-      response: `🔌 Found ${Object.keys(data.ports).length} unique ports`,
-      data: portList
-    };
-  }
-  
-  // IPs / Top talkers
-  if (l.includes('ip') || l.includes('talker') || l.includes('endpoint') || l.includes('source') || l.includes('destination')) {
-    return {
-      tool: 'ips',
-      response: `🌐 Found ${data.unique_src_ips.length} source IPs and ${data.unique_dst_ips.length} destination IPs`,
-      data: {
-        conversations: data.ip_conversations,
-        top_src: Object.entries(data.top_src_ips).sort((a, b) => b[1] - a[1]).slice(0, 10),
-        top_dst: Object.entries(data.top_dst_ips).sort((a, b) => b[1] - a[1]).slice(0, 10),
-      }
-    };
-  }
-  
-  // Default - use LLM with full context
+  // Just return llm tool - the LLM will handle ALL queries with full context
+  // This ensures CONSISTENT, accurate answers without hallucination
   return {
     tool: 'llm',
-    response: 'Analyzing...',
+    response: 'Analyzing with pre-computed data...',
     data: null
   };
 }
 
 // ── Build LLM prompt from pre-computed data ────────────────────────────────
-function buildLLMPromptFromPrecomputed(prompt, instantResult, data) {
-  // Build rich context for LLM
-  let context = `PCAP Analysis Data (pre-computed):
+function buildLLMPromptFromPrecomputed(prompt, data) {
+  // Build COMPLETE context for LLM with ALL data - no truncation!
+  const allProtocols = Object.entries(data.protocols).sort((a, b) => b[1] - a[1]);
+  const allPorts = Object.entries(data.ports).sort((a, b) => b[1] - a[1]);
+  const allDomains = Object.entries(data.top_domains || {}).sort((a, b) => b[1] - a[1]);
+  
+  let context = `You are analyzing a PCAP network capture. Here is the COMPLETE data:
 
-📊 BASIC STATS:
+═══════════════════════════════════════════════════════════════
+📊 BASIC STATISTICS
+═══════════════════════════════════════════════════════════════
 • Total Packets: ${data.total_packets.toLocaleString()}
 • Total Bytes: ${(data.total_bytes / 1024 / 1024).toFixed(2)} MB
 • Duration: ${data.duration_seconds} seconds
 • Packet Rate: ${data.duration_seconds > 0 ? (data.total_packets / data.duration_seconds).toFixed(1) : 'N/A'} packets/sec
 
-📋 PROTOCOLS:
-${Object.entries(data.protocols).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([p, c]) => `• ${p}: ${c.toLocaleString()} packets`).join('\n')}
+═══════════════════════════════════════════════════════════════
+📋 ALL PROTOCOLS (${allProtocols.length} total)
+═══════════════════════════════════════════════════════════════
+${allProtocols.map(([p, c]) => `• ${p}: ${c.toLocaleString()} packets`).join('\n')}
 
-🔌 TOP PORTS:
-${Object.entries(data.ports).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([p, c]) => `• Port ${p}: ${c} packets`).join('\n')}
+═══════════════════════════════════════════════════════════════
+🔌 ALL PORTS (${allPorts.length} total)
+═══════════════════════════════════════════════════════════════
+${allPorts.slice(0, 30).map(([p, c]) => `• Port ${p}: ${c} packets`).join('\n')}
+${allPorts.length > 30 ? `... and ${allPorts.length - 30} more ports` : ''}
 
-🌐 TOP IPs:
-${data.ip_conversations.slice(0, 5).map(c => `• ${c.src} → ${c.dst} (${(c.bytes / 1024).toFixed(1)} KB)`).join('\n')}
+═══════════════════════════════════════════════════════════════
+🌐 IP CONVERSATIONS (Top 20 by bytes)
+═══════════════════════════════════════════════════════════════
+${data.ip_conversations.slice(0, 20).map(c => `• ${c.src} → ${c.dst} (${(c.bytes / 1024).toFixed(1)} KB)`).join('\n')}
 
-🔍 DNS QUERIES (${data.dns_queries.length} total):
-${data.dns_queries.slice(0, 5).join('\n')}
+═══════════════════════════════════════════════════════════════
+🔍 ALL DNS QUERIES (${data.dns_queries.length} total)
+═══════════════════════════════════════════════════════════════
+${data.dns_queries.length > 0 ? data.dns_queries.join('\n') : 'No DNS queries found'}
 
-🌐 HTTP HOSTS (${data.http_hosts.length} total):
-${data.http_hosts.slice(0, 5).join('\n')}
+═══════════════════════════════════════════════════════════════
+🌐 TOP DOMAINS BY QUERY COUNT
+═══════════════════════════════════════════════════════════════
+${allDomains.slice(0, 20).map(([d, c]) => `• ${d}: ${c} queries`).join('\n')}
 
-🔒 HTTPS SITES (${data.https_sites.length} total):
-${data.https_sites.slice(0, 5).join('\n')}
+═══════════════════════════════════════════════════════════════
+🌐 ALL HTTP HOSTS (${data.http_hosts.length} total)
+═══════════════════════════════════════════════════════════════
+${data.http_hosts.length > 0 ? data.http_hosts.join('\n') : 'No HTTP hosts found'}
 
-📁 HTTP OBJECTS (${data.http_objects.length} total):
-${data.http_objects.slice(0, 5).map(f => `• ${f.filename} (${(f.size / 1024).toFixed(1)} KB, ${f.content_type})`).join('\n')}
+═══════════════════════════════════════════════════════════════
+🔒 ALL HTTPS/TLS SITES (${data.https_sites.length} total)
+═══════════════════════════════════════════════════════════════
+${data.https_sites.filter(s => s).length > 0 ? data.https_sites.filter(s => s).join('\n') : 'No HTTPS sites found'}
 
-User Question: "${prompt}"
+═══════════════════════════════════════════════════════════════
+📁 ALL HTTP OBJECTS/FILES (${data.http_objects.length} total)
+═══════════════════════════════════════════════════════════════
+${data.http_objects.length > 0 ? data.http_objects.map(f => `• ${f.filename} (${(f.size / 1024).toFixed(1)} KB, ${f.content_type})`).join('\n') : 'No HTTP objects found'}
 
-Answer in a friendly, detailed way. Use the data above to provide specific numbers and insights.`;
+═══════════════════════════════════════════════════════════════
+USER QUESTION: "${prompt}"
+═══════════════════════════════════════════════════════════════
+
+INSTRUCTIONS:
+1. Answer the user's question using ONLY the data above - DO NOT MAKE UP DATA
+2. Be specific: use actual numbers, domain names, IP addresses from the data
+3. If asked about domains/websites, list the ACTUAL domains from the DNS/HTTP/HTTPS sections
+4. If asked about files/images, list the ACTUAL filenames from the HTTP OBJECTS section
+5. Format your response clearly with bullet points
+6. If something is not in the data, say "No [X] found in this PCAP" instead of making it up`;
 
   return context;
 }
@@ -2335,6 +2405,9 @@ const server = http.createServer(async (req, res) => {
         // Store pre-computed data for instant queries
         precomputedData.set(session_id, precomputed);
         console.log(`[Upload] ✓ Pre-computation complete! Data cached for instant queries.`);
+        console.log(`[Upload] ✓ Stored in precomputedData: ${session_id}`);
+        console.log(`[Upload] ✓ Data summary: ${precomputed.total_packets} packets, ${precomputed.dns_queries?.length || 0} DNS, ${precomputed.http_hosts?.length || 0} HTTP hosts`);
+        console.log(`[Upload] ✓ precomputedData now has ${precomputedData.size} sessions`);
       } else {
         console.warn(`[Upload] ⚠ Pre-computation had issues, queries may be slower.`);
       }
@@ -2679,6 +2752,65 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // ── Agent STREAMING endpoint (ChatGPT-style) ───────────────────────────────
+  if (url === '/pcap/agent/stream' && method === 'POST') {
+    if (!checkRateLimit(clientIp, RATE_AGENT)) {
+      res.writeHead(429, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
+      return res.end(JSON.stringify({ error: 'Too many queries. Limit: 30/min.' }));
+    }
+
+    try {
+      const body = await parseBody(req);
+      const parsed = JSON.parse(body.toString());
+      const { prompt, session_id } = parsed || {};
+
+      if (!isValidSessionId(session_id)) {
+        res.writeHead(400, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
+        return res.end(JSON.stringify({ error: 'Invalid session_id' }));
+      }
+      if (!fs.existsSync(path.join(PCAP_DIR, `${session_id}.pcap`))) {
+        res.writeHead(404, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
+        return res.end(JSON.stringify({ error: 'Session expired or PCAP not found' }));
+      }
+      if (!prompt || typeof prompt !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
+        return res.end(JSON.stringify({ error: 'Missing prompt' }));
+      }
+
+      console.log(`[Agent-Stream] Query received for session: ${session_id}`);
+      
+      // Check for pre-computed data
+      const precomputed = precomputedData.get(session_id);
+      
+      if (!precomputed) {
+        console.error(`[Agent-Stream] ❌ NO PRE-COMPUTED DATA for ${session_id}!`);
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          ...getCorsHeaders(origin),
+        });
+        res.write(`data: ${JSON.stringify({ error: 'Session data not found. Please re-upload.' })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
+      
+      console.log(`[Agent-Stream] ✓ Using pre-computed data: ${precomputed.total_packets} packets`);
+      
+      // Build FULL context from pre-computed data
+      const llmPrompt = buildLLMPromptFromPrecomputed(prompt, precomputed);
+      
+      // Stream the response!
+      await callLLMStream(llmPrompt, res, origin);
+      return;  // Response already sent via stream
+      
+    } catch (e) {
+      console.error(`[Agent-Stream] Error: ${e.message}`);
+      res.writeHead(500, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
+      return res.end(JSON.stringify({ error: e.message }));
+    }
+  }
+
   // ── Agent ──────────────────────────────────────────────────
   if (url === '/pcap/agent/query' && method === 'POST') {
     if (!checkRateLimit(clientIp, RATE_AGENT))
@@ -2697,6 +2829,9 @@ const server = http.createServer(async (req, res) => {
 
       // Check if we have pre-computed data (INSTANT queries!)
       const precomputed = precomputedData.get(session_id);
+      console.log(`[Agent] Query received for session: ${session_id}`);
+      console.log(`[Agent] Pre-computed data found: ${!!precomputed}`);
+      console.log(`[Agent] Available sessions in cache:`, [...precomputedData.keys()]);
       
       // First try LLM-powered natural conversation (greetings, compliments, etc.)
       const naturalResponse = await generateNaturalResponse(prompt);
@@ -2714,21 +2849,25 @@ const server = http.createServer(async (req, res) => {
       // ═══════════════════════════════════════════════════════════════
       if (precomputed) {
         console.log(`[Agent] ✓ Using pre-computed data (INSTANT query)`);
+        console.log(`[Agent] Data: ${precomputed.total_packets} packets, ${precomputed.dns_queries?.length || 0} DNS, ${precomputed.http_hosts?.length || 0} HTTP hosts`);
         
-        // Build context from pre-computed data
-        const instantResult = getInstantQueryResult(prompt, precomputed, session_id);
-        
-        // Format with AI for human-friendly response
-        const llmPrompt = buildLLMPromptFromPrecomputed(prompt, instantResult, precomputed);
+        // Build FULL context from pre-computed data - NO TRUNCATION
+        const llmPrompt = buildLLMPromptFromPrecomputed(prompt, precomputed);
         const llmResponse = await callLLM(llmPrompt);
         
+        console.log(`[Agent] ✓ LLM response: ${(llmResponse || '').slice(0, 100)}...`);
+        
         return respond({
-          tool_called: instantResult.tool,
-          parameters: instantResult.params || {},
-          result: null,  // Don't send raw data, LLM formatted it
-          response: llmResponse || instantResult.response,
+          tool_called: 'llm',
+          parameters: {},
+          result: null,
+          response: llmResponse || 'Unable to analyze. Please try again.',
         });
       }
+      
+      // NO PRE-COMPUTED DATA - This shouldn't happen!
+      console.error(`[Agent] ❌ NO PRE-COMPUTED DATA for ${session_id}!`);
+      console.error(`[Agent] Available sessions:`, [...precomputedData.keys()]);
       
       // ═══════════════════════════════════════════════════════════════
       // FALLBACK - No pre-computed data, run TShark (slower)
