@@ -1914,17 +1914,20 @@ if (isSmallTalk) {
 const sessionData = sessions.get(session_id);
 
 // Get ALL data types for comprehensive context
+// Get ALL data types for comprehensive context
 const [packets, protocols, ports, dnsQueries, tlsSni, httpObjects, httpRequests] = await Promise.all([
+  runTshark(session_id, '', DEFAULT_FIELDS, 500),
+  getProtocolCounts(session_id, 0),
+  getAllPorts(session_id),
+  getDnsQueries(session_id, 100),
+  getTlsSni(session_id, 100),
+  getHttpObjects(session_id),
+  getHttpRequests(session_id, 100),
+]);
 
       // Build comprehensive context
       const contextSummary = `Total Packets: ${sessionData?.total_packets || packets.length}
-Protocols: ${Object.entries(protocols.protocols || {}).map(([p, c]) => `${p}(${c})`).join(', ')}
-Unique Ports: ${Object.keys(ports).length}
-DNS Queries: ${dnsQueries.length}
-TLS Domains: ${tlsSni.length}
-HTTP Objects: ${httpObjects.length}`;
 
-      // Step 1: Analyze prompt to decide what data is needed
       // Step 1: Analyze prompt to decide what data is needed
 const analysis = await analyzePromptForTshark(prompt, contextSummary);
 console.log(`[Agent-Stream] Analysis: ${analysis.reasoning}`);
