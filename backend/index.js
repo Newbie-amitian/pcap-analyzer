@@ -531,7 +531,7 @@ function getHttpRequests(sessionId, limit = 0) {
 
     // Use two separate tshark calls — one without -Y filter for host, one for method+uri
     // This avoids the http.request dissector crash on some pcaps
-let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e frame.number -e http.host -e http.request.method -e http.request.uri`;
+let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e frame.number -e http.host -e http.request.method -e http.request.uri -e http.file_data`;
     if (limit > 0) cmd += ` -c ${limit}`;
     cmd += ' 2>/dev/null';
 
@@ -546,14 +546,21 @@ let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e frame.n
 
       // AFTER:
       for (const line of lines) {
-        const [frameNum, host, method, uri] = line.split('\t');
-        // Only include lines that have both a host and a method (actual HTTP requests)
+        const [frameNum, host, method, uri, fileDataHex] = line.split('\t');
         if (host && method) {
+          // Decode hex-encoded POST body if present
+          let postBody = null;
+          if (fileDataHex && fileDataHex.trim()) {
+            try {
+              postBody = Buffer.from(fileDataHex.trim(), 'hex').toString('utf8');
+            } catch (_) {}
+          }
           requests.push({
             frame_number: parseInt(frameNum) || null,
             host: host.trim(),
             method: method.trim() || 'GET',
             uri: uri ? uri.trim() : '/',
+            post_body: postBody,
             user_agent: null,
           });
         }
@@ -2060,8 +2067,9 @@ for (const s of tlsSni) if (s.server_name) allDomains.add(s.server_name);
 for (const r of httpRequests) if (r.host) allDomains.add(r.host);
 
 // All unique HTTP URIs
+// AFTER:
 const allUris = httpRequests.map(r =>
-  `#${r.frame_number || '?'} | ${r.method} http://${r.host}${r.uri}`
+  `#${r.frame_number || '?'} | ${r.method} http://${r.host}${r.uri}${r.post_body ? ` | POST DATA: ${r.post_body}` : ''}`
 );
 
 // Packets with numbers for lookup
