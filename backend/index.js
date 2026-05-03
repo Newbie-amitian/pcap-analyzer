@@ -1143,7 +1143,15 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
 
     req.on('error', (e) => {
       console.error(`[SearXNG] Request error for port ${port}: ${e.message}`);
-      resolve(null);
+      // Retry once after 1 second on socket hang up
+      if (e.message.includes('socket hang up') || e.message.includes('ECONNRESET')) {
+        setTimeout(() => {
+          console.log(`[SearXNG] Retrying port ${port}...`);
+          searchPortWithSearXNG(port, searchType).then(resolve).catch(() => resolve(null));
+        }, 1000);
+      } else {
+        resolve(null);
+      }
     });
 
     req.on('timeout', () => {
@@ -1860,7 +1868,7 @@ const server = http.createServer(async (req, res) => {
     
     // Process service ports in batches
     for (let i = 0; i < servicePorts.length; i += MAX_CONCURRENT) {
-  if (i > 0) await new Promise(r => setTimeout(r, 500));
+  if (i > 0) await new Promise(r => setTimeout(r, 1000));
   const batch = servicePorts.slice(i, i + MAX_CONCURRENT);
   const batchResults = await Promise.all(
     batch.map(async ({ port, count }) => {
