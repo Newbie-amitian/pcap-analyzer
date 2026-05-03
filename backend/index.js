@@ -1885,20 +1885,30 @@ const server = http.createServer(async (req, res) => {
       }
 
       console.log(`[Agent-Stream] Query received for session: ${session_id}`);
-      
-      // Get session data
-      const sessionData = sessions.get(session_id);
-      
-      // Get ALL data types for comprehensive context
-      const [packets, protocols, ports, dnsQueries, tlsSni, httpObjects, httpRequests] = await Promise.all([
-        runTshark(session_id, '', DEFAULT_FIELDS, 500), // More packets
-        getProtocolCounts(session_id, 0), // ALL protocols
-        getAllPorts(session_id),
-        getDnsQueries(session_id, 100),
-        getTlsSni(session_id, 100),
-        getHttpObjects(session_id),
-        getHttpRequests(session_id, 100),
-      ]);
+
+// Handle small talk before running any TShark commands
+const nonPcapPhrases = ['hi', 'hello', 'hey', 'thanks', 'thank you', 'ok', 'okay', 'bye', 'lol', 'cool', 'nice', 'sup', 'yo'];
+const isSmallTalk = nonPcapPhrases.includes(prompt.trim().toLowerCase());
+
+if (isSmallTalk) {
+  const corsHeaders = getCorsHeaders(origin);
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    ...corsHeaders,
+  });
+  res.write(`data: ${JSON.stringify({ token: "Hey! Ask me anything about your PCAP — like what protocols are present, which IPs are most active, any suspicious traffic, DNS queries, or HTTPS domains visited." })}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
+  return;
+}
+
+// Get session data
+const sessionData = sessions.get(session_id);
+
+// Get ALL data types for comprehensive context
+const [packets, protocols, ports, dnsQueries, tlsSni, httpObjects, httpRequests] = await Promise.all([
 
       // Build comprehensive context
       const contextSummary = `Total Packets: ${sessionData?.total_packets || packets.length}
