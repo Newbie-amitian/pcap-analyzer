@@ -1852,9 +1852,10 @@ const server = http.createServer(async (req, res) => {
     
     // Process service ports in batches
     for (let i = 0; i < servicePorts.length; i += MAX_CONCURRENT) {
-      const batch = servicePorts.slice(i, i + MAX_CONCURRENT);
-      const batchResults = await Promise.all(
-        batch.map(async ({ port, count }) => {
+  if (i > 0) await new Promise(r => setTimeout(r, 500));
+  const batch = servicePorts.slice(i, i + MAX_CONCURRENT);
+  const batchResults = await Promise.all(
+    batch.map(async ({ port, count }) => {
           const intel = await getPortIntelligence(port);
           return {
             port,
