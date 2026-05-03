@@ -463,7 +463,6 @@ const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e tcp.s
 // NEW: Get HTTP Objects, DNS Queries, TLS SNI
 // ═══════════════════════════════════════════════════════════════════
 
-// AFTER:
 function getHttpObjects(sessionId) {
   return new Promise((resolve) => {
     const exportDir = path.join(EXPORT_DIR, sessionId);
@@ -525,7 +524,6 @@ function getHttpObjects(sessionId) {
     });
   });
 }
-// AFTER:
 function getDnsQueries(sessionId, limit = 0) {
   return new Promise((resolve) => {
     const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
@@ -594,7 +592,6 @@ function getTlsSni(sessionId, limit = 100) {
   });
 }
 
-// AFTER:
 function getHttpRequests(sessionId, limit = 0) {
   return new Promise((resolve) => {
     const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
@@ -2342,7 +2339,6 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
     return res.end(artifact.buffer);
   }
 
-  // ── 404 ─────────────────────────────────────────────────────
   // ── Generate presigned PUT URL for direct frontend→B2 upload ──
   if (url === '/pcap/b2-upload-url' && method === 'POST') {
     if (!checkRateLimit(clientIp, RATE_UPLOAD))
