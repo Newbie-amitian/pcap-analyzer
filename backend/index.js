@@ -1111,9 +1111,8 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
   });
 }
 
-// ── Port Intelligence using SearXNG only (NO HARDCODING) ──────────────────────────────────────────
+// ── Port Intelligence - Group ephemeral ports, SearXNG for service ports ──────────────────────────────────────────
 async function getPortIntelligence(port) {
-  // NO HARDCODING - Use SearXNG for ALL ports including ephemeral
   console.log(`[PortIntel] Port ${port} - searching SearXNG...`);
 
   const [generalResult, risksResult] = await Promise.all([
@@ -1158,6 +1157,48 @@ async function getPortIntelligence(port) {
     cve_count: 0,
     all_cves: [],
     source: 'SearXNG Web Search',
+  };
+}
+
+// Get intelligence for ephemeral ports as a GROUP (not individual)
+async function getEphemeralPortIntelligence(ephemeralPorts) {
+  console.log(`[PortIntel] Grouping ${ephemeralPorts.length} ephemeral ports for single search...`);
+  
+  // Make ONE search for ephemeral ports in general
+  const result = await searchPortWithSearXNG('ephemeral port dynamic client', 'general');
+  const risksResult = await searchPortWithSearXNG('ephemeral port security', 'risks');
+  
+  const serviceName = 'Ephemeral';
+  const description = result?.description || `Ephemeral ports are dynamic client-side ports used for outbound connections (IANA range 49152-65535)`;
+  const commonUses = ['Client connections', 'Temporary connections', 'Outbound traffic', 'Dynamic port allocation'];
+  const risks = risksResult?.risks?.length > 0 ? risksResult.risks : [
+    'Port scanning',
+    'Service fingerprinting', 
+    'Application identification',
+    'Ephemeral port exhaustion'
+  ];
+
+  const totalPackets = ephemeralPorts.reduce((sum, p) => sum + p.count, 0);
+  const portList = ephemeralPorts.map(p => p.port).sort((a, b) => a - b);
+  const portDetails = ephemeralPorts.map(p => ({ port: p.port, count: p.count })).sort((a, b) => a.port - b.port);
+
+  console.log(`[PortIntel] ✓ Ephemeral group: ${ephemeralPorts.length} ports, ${totalPackets} packets`);
+
+  return {
+    port: 'ephemeral',
+    port_range: { min: portList[0], max: portList[portList.length - 1] },
+    port_count: ephemeralPorts.length,
+    count: totalPackets,
+    risk: 'LOW',
+    reason: 'Ephemeral ports (49152-65535) are used for outbound client connections',
+    service_name: serviceName,
+    description: `${ephemeralPorts.length} ephemeral ports used for outbound connections`,
+    secure_alternative: 'Client-side ports, typically low risk',
+    common_uses: commonUses,
+    risks: risks,
+    source: 'SearXNG Web Search',
+    all_ports: portDetails,
+    sample_ports: portList.slice(0, 10),
   };
 }
 
@@ -1682,29 +1723,58 @@ const server = http.createServer(async (req, res) => {
     const portEntries = Object.entries(portCounts);
     console.log(`[PortIntel] Analyzing ${portEntries.length} unique ports via SearXNG...`);
     
-    // Get intelligence for ALL ports via SearXNG (NO HARDCODING)
-    const alerts = await Promise.all(
-      portEntries.map(async ([port, count]) => {
-        const portNum = parseInt(port);
-        const intel = await getPortIntelligence(portNum);
-        return {
-          port: portNum,
-          count,
-          risk: intel.risk,
-          reason: intel.reason,
-          cve_id: intel.cve_id,
-          cvss_score: intel.cvss_score,
-          source: intel.source,
-          cve_count: intel.cve_count,
-          all_cves: intel.all_cves,
-          service_name: intel.service_name,
-          description: intel.description,
-          secure_alternative: intel.secure_alternative,
-          common_uses: intel.common_uses,
-          risks: intel.risks,
-        };
-      })
-    );
+    // Separate ephemeral ports (49152-65535) from service ports
+    const ephemeralPorts = [];
+    const servicePorts = [];
+    
+    for (const [port, count] of portEntries) {
+      const portNum = parseInt(port);
+      if (portNum >= 49152 && portNum <= 65535) {
+        ephemeralPorts.push({ port: portNum, count });
+      } else {
+        servicePorts.push({ port: portNum, count });
+      }
+    }
+    
+    console.log(`[PortIntel] ${servicePorts.length} service ports, ${ephemeralPorts.length} ephemeral ports`);
+    
+    // Get intelligence for SERVICE ports via SearXNG (with concurrency limit)
+    const MAX_CONCURRENT = 5; // Limit concurrent SearXNG requests
+    const alerts = [];
+    
+    // Process service ports in batches
+    for (let i = 0; i < servicePorts.length; i += MAX_CONCURRENT) {
+      const batch = servicePorts.slice(i, i + MAX_CONCURRENT);
+      const batchResults = await Promise.all(
+        batch.map(async ({ port, count }) => {
+          const intel = await getPortIntelligence(port);
+          return {
+            port,
+            count,
+            risk: intel.risk,
+            reason: intel.reason,
+            cve_id: intel.cve_id,
+            cvss_score: intel.cvss_score,
+            source: intel.source,
+            cve_count: intel.cve_count,
+            all_cves: intel.all_cves,
+            service_name: intel.service_name,
+            description: intel.description,
+            secure_alternative: intel.secure_alternative,
+            common_uses: intel.common_uses,
+            risks: intel.risks,
+          };
+        })
+      );
+      alerts.push(...batchResults);
+      console.log(`[PortIntel] Processed ${Math.min(i + MAX_CONCURRENT, servicePorts.length)}/${servicePorts.length} service ports`);
+    }
+    
+    // Get intelligence for ALL ephemeral ports as ONE group (2 requests instead of 200+)
+    if (ephemeralPorts.length > 0) {
+      const ephemeralIntel = await getEphemeralPortIntelligence(ephemeralPorts);
+      alerts.push(ephemeralIntel);
+    }
     
     const summary = { critical: 0, high: 0, medium: 0, low: 0 };
     for (const a of alerts) {
@@ -1716,6 +1786,8 @@ const server = http.createServer(async (req, res) => {
       alerts, 
       summary,
       total_ports: portEntries.length,
+      service_ports: servicePorts.length,
+      ephemeral_ports: ephemeralPorts.length,
       timestamp: new Date().toISOString(),
       cached: false,
       data_sources: {
