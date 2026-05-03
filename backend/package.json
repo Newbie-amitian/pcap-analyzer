@@ -9,5 +9,8 @@
   },
   "keywords": ["pcap", "tshark", "network", "security", "searxng", "cve"],
   "license": "MIT",
-  "dependencies": {}
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/s3-request-presigner": "^3.0.0"
+  }
 }
