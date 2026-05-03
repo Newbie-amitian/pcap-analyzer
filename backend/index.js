@@ -456,20 +456,24 @@ function getHttpObjects(sessionId) {
 
 // AFTER:
 function getDnsQueries(sessionId, limit = 0) {
-  ...
-  const limitFlag = limit > 0 ? `-c ${limit}` : '';
-  const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "dns.qry.name" -T fields -E separator=/t -e dns.qry.name -e dns.a -e dns.aaaa -e dns.flags.response ${limitFlag} 2>/dev/null`;
-    
+  return new Promise((resolve) => {
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) return resolve([]);
+
+    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "dns.qry.name" -T fields -E separator=/t -e dns.qry.name -e dns.a -e dns.aaaa -e dns.flags.response`;
+    if (limit > 0) cmd += ` -c ${limit}`;
+    cmd += ' 2>/dev/null';
+
     exec(cmd, { timeout: 30000 }, (err, stdout) => {
       if (err) {
         console.error(`[DNS] Error: ${err.message}`);
         return resolve([]);
       }
-      
+
       const queries = [];
       const seen = new Set();
       const lines = stdout.trim().split('\n').filter(l => l.trim());
-      
+
       for (const line of lines) {
         const [name, a, aaaa, isResponse] = line.split('\t');
         if (name && !seen.has(name)) {
@@ -481,7 +485,7 @@ function getDnsQueries(sessionId, limit = 0) {
           });
         }
       }
-      
+
       console.log(`[DNS] Found ${queries.length} unique queries`);
       resolve(queries);
     });
@@ -527,8 +531,9 @@ function getHttpRequests(sessionId, limit = 0) {
 
     // Use two separate tshark calls — one without -Y filter for host, one for method+uri
     // This avoids the http.request dissector crash on some pcaps
-    const limitFlag = limit > 0 ? `-c ${limit}` : '';
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e http.host -e http.request.method -e http.request.uri ${limitFlag} 2>/dev/null`;
+    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e http.host -e http.request.method -e http.request.uri`;
+    if (limit > 0) cmd += ` -c ${limit}`;
+    cmd += ' 2>/dev/null';
 
     exec(cmd, { timeout: 30000 }, (err, stdout) => {
       if (err) {
