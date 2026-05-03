@@ -1391,20 +1391,27 @@ FORMATTING RULES:
   📄 **filename.jpg** — image/jpeg — 168480 bytes
 - For IP addresses, list them like this:
   🖥 **192.168.1.1** — 240 packets — Client
-- For domains/websites, use ### for each category heading, then a plain comma-separated list on the next line:
+- For domains/websites, use ### for each category heading, then a plain comma-separated list on the next line. Copy domain names EXACTLY as they appear in the data — no modifications, no http://, no brackets, no markdown links, just the raw domain string:
   ### Microsoft Services
-  site1.com, site2.com, site3.com
+  www.msftconnecttest.com, edge.microsoft.com, config.edge.skype.com
   ### Google Services
-  site4.com, site5.com
-  Dynamically decide category names. Put EVERY domain in exactly one category. Never use bullet points or tables for domains. Always add a brief summary sentence after.
+  www.google.com, fonts.gstatic.com
+  Dynamically decide category names based on actual domains present. Put EVERY domain in exactly one category. Never use bullet points, tables, or markdown links for domains. Always add a brief summary sentence after the last category.
 - Use **bold** for important findings or anything worth flagging.
 
 IMAGE PREVIEW RULES:
-- If the user asks to "see", "show", "preview", or "display" an image/file from the HTTP OBJECTS section, respond with ONLY this exact markdown and nothing else (no table, no extra text before it):
-  Here's the preview of **filename.jpg**:
-  ![filename.jpg](IMAGE_URL_PLACEHOLDER:filename.jpg)
-  *(Extracted from HTTP traffic — file size: X bytes)*
-- Never say you "cannot show" or "don't have access to" images. You can always show them using the format above.`
+- When the user asks to "see", "show", "preview", or "display" any image or file from the HTTP OBJECTS section, you MUST output this exact markdown syntax — no exceptions, no prose substitutes:
+
+Here's **filename.jpg** pulled from the traffic:
+
+![filename.jpg](IMAGE_URL_PLACEHOLDER:filename.jpg)
+
+*size bytes — image/jpeg*
+
+- Replace filename.jpg with the EXACT filename from HTTP OBJECTS (e.g. aspen.jpg), and size with the actual byte count.
+- The src must be literally IMAGE_URL_PLACEHOLDER:filename.jpg — do not change this format, do not add http://, do not make it a real URL. The frontend will resolve it automatically.
+- Every single time an image preview is requested, output the ![...](...) tag. Never substitute it with text like "(Extracted from HTTP traffic)" or "here's the preview" without the actual image tag.
+- If the user asks again, output the ![...](...) tag again. Never skip it.
 const userPrompt = `NETWORK DATA:
 ${fullContext}
 
