@@ -418,42 +418,68 @@ const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e tcp.s
 // NEW: Get HTTP Objects, DNS Queries, TLS SNI
 // ═══════════════════════════════════════════════════════════════════
 
+// AFTER:
 function getHttpObjects(sessionId) {
   return new Promise((resolve) => {
     const exportDir = path.join(EXPORT_DIR, sessionId);
     if (!fs.existsSync(exportDir)) {
       return resolve([]);
     }
-    
-    try {
-      const files = fs.readdirSync(exportDir);
-      const objects = files.map(filename => {
-        const fp = path.join(exportDir, filename);
-        const stats = fs.statSync(fp);
-        const ext = path.extname(filename).toLowerCase();
-        const contentTypes = {
-          '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
-          '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
-          '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
-          '.json': 'application/json', '.pdf': 'application/pdf',
-          '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2',
-        };
-        return {
-          filename,
-          content_type: contentTypes[ext] || 'application/octet-stream',
-          size: stats.size,
-          extension: ext,
-        };
-      });
-      console.log(`[HTTP-Objects] Found ${objects.length} objects`);
-      resolve(objects);
-    } catch (e) {
-      console.error(`[HTTP-Objects] Error: ${e.message}`);
-      resolve([]);
-    }
+
+    // First get packet numbers for HTTP responses from tshark
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "http.response" -T fields -e frame.number -e http.request.uri -e http.content_type 2>/dev/null`;
+
+    exec(cmd, { timeout: 30000 }, (err, stdout) => {
+      // Build a map of uri → packet number
+      const uriToPacket = {};
+      if (!err && stdout) {
+        for (const line of stdout.trim().split('\n').filter(l => l.trim())) {
+          const [frameNum, uri] = line.split('\t');
+          if (uri && frameNum) {
+            // Use just the filename part of the URI as key
+            const key = uri.split('/').pop().split('?')[0].toLowerCase();
+            if (key) uriToPacket[key] = parseInt(frameNum) || null;
+          }
+        }
+      }
+
+      try {
+        const files = fs.readdirSync(exportDir);
+        const objects = files.map(filename => {
+          const fp = path.join(exportDir, filename);
+          const stats = fs.statSync(fp);
+          const ext = path.extname(filename).toLowerCase();
+          const contentTypes = {
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+            '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+            '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
+            '.json': 'application/json', '.pdf': 'application/pdf',
+            '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2',
+          };
+
+          // Try to match filename to a packet number
+          const baseKey = filename.replace(/\(\d+\)/, '').split('.')[0].toLowerCase();
+          const fullKey = filename.replace(/\(\d+\)/, '').toLowerCase();
+          const packet_number = uriToPacket[fullKey] || uriToPacket[baseKey] || null;
+
+          return {
+            filename,
+            content_type: contentTypes[ext] || 'application/octet-stream',
+            size: stats.size,
+            extension: ext,
+            packet_number,
+          };
+        });
+        console.log(`[HTTP-Objects] Found ${objects.length} objects`);
+        resolve(objects);
+      } catch (e) {
+        console.error(`[HTTP-Objects] Error: ${e.message}`);
+        resolve([]);
+      }
+    });
   });
 }
-
 // AFTER:
 function getDnsQueries(sessionId, limit = 0) {
   return new Promise((resolve) => {
@@ -1720,6 +1746,7 @@ const server = http.createServer(async (req, res) => {
               buffer: fs.readFileSync(fp),
               contentType: EXT_CT[ext] || 'application/octet-stream',
               filename: file,
+              packet_num: null, // will be filled below
             });
           }
           imageStore.set(session_id, artifacts);
@@ -2193,13 +2220,38 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
       });
 
     return respond({
-      images: Array.from(artifacts.entries()).map(([k, v]) => ({
-        filename: v.filename,
-        content_type: v.contentType,
-        artifact_key: k,
-        size: v.buffer.length,
-        is_image: v.contentType.startsWith('image/'),
-      })),
+       const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
+    let uriToPacket = {};
+    if (fs.existsSync(pcapPath)) {
+      try {
+        const out = require('child_process').execSync(
+          `"${TSHARK_BIN}" -r "${pcapPath}" -Y "http.response" -T fields -e frame.number -e http.request.uri 2>/dev/null`,
+          { timeout: 15000, maxBuffer: 5 * 1024 * 1024 }
+        ).toString();
+        for (const line of out.trim().split('\n').filter(l => l.trim())) {
+          const [frameNum, uri] = line.split('\t');
+          if (uri && frameNum) {
+            const key = uri.split('/').pop().split('?')[0].toLowerCase();
+            if (key) uriToPacket[key] = parseInt(frameNum) || null;
+          }
+        }
+      } catch (_) {}
+    }
+
+    return respond({
+      images: Array.from(artifacts.entries()).map(([k, v]) => {
+        const baseKey = v.filename.replace(/\(\d+\)/, '').toLowerCase();
+        const nameOnly = baseKey.split('.')[0];
+        const packet_num = uriToPacket[baseKey] || uriToPacket[nameOnly] || null;
+        return {
+          filename: v.filename,
+          content_type: v.contentType,
+          artifact_key: k,
+          size: v.buffer.length,
+          is_image: v.contentType.startsWith('image/'),
+          packet_num,
+        };
+      }),
       total: artifacts.size,
     });
   }
