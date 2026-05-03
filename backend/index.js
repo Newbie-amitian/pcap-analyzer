@@ -1365,7 +1365,7 @@ resolve(parsed);
 }
 
 // Step 2: Generate final response with all context
-async function callLLMStream(prompt, res, origin, fullContext) {
+async function callLLMStream(prompt, res, origin, fullContext, history = '') {
   return new Promise((resolve, reject) => {
 const systemPrompt = `You are PacketSight's friendly network analyst — sharp, knowledgeable, but casual. Like a security-savvy colleague explaining things over coffee.
 
@@ -1922,8 +1922,8 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await parseBody(req);
       const parsed = JSON.parse(body.toString());
-const { prompt, session_id, history } = parsed || {};
-
+const { prompt, session_id, history = '' } = parsed || {};
+      
       if (!isValidSessionId(session_id)) {
         res.writeHead(400, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
         return res.end(JSON.stringify({ error: 'Invalid session_id' }));
@@ -2064,7 +2064,7 @@ ${sortedPorts.map(([p, c]) => `port ${p}: ${c} packets`).join('\n')}
 `.trim();
 
       // Step 2: Stream response with full context
-      await callLLMStream(prompt, res, origin, fullContext);
+await callLLMStream(prompt, res, origin, fullContext, history);
       return;
       
     } catch (e) {
