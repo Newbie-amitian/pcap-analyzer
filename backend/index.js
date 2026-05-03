@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 
 // ═══════════════════════════════════════════════════════════════════
+
 // REQUIRED ENVIRONMENT VARIABLES (Set these in Render dashboard!)
 // ═══════════════════════════════════════════════════════════════════
 const SEARXNG_URL = process.env.SEARXNG_URL;
@@ -1959,51 +1960,53 @@ if (analysis.intent === 'greeting') {
 console.log(`[Agent-Stream] Need: ${analysis.data_types?.join(', ')}`);
 
       // Build context based on analysis - KEEP IT CONCISE
-      let fullContext = '';
-      
-      // Basic stats always included
-      fullContext += `Total Packets: ${(sessionData?.total_packets || packets.length).toLocaleString()}\n`;
-      fullContext += `Duration: ${protocols.maxTime?.toFixed(2) || 0}s\n`;
-      
-      // Top 10 protocols
-      const sortedProtos = Object.entries(protocols.protocols || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
-      fullContext += `Protocols: ${sortedProtos.map(([p, c]) => `${p}(${c})`).join(', ')}\n`;
-      
-      // DNS Queries (top 20)
-      if (dnsQueries.length > 0 && (!analysis.data_types || analysis.data_types.includes('dns') || analysis.data_types.includes('protocols'))) {
-        fullContext += `DNS Queries: ${dnsQueries.slice(0, 20).map(q => q.domain).join(', ')}\n`;
-      }
-      
-      // TLS SNI (top 20)
-      if (tlsSni.length > 0 && (!analysis.data_types || analysis.data_types.includes('tls_sni') || analysis.data_types.includes('http'))) {
-        fullContext += `HTTPS Domains: ${tlsSni.slice(0, 20).map(s => s.server_name).join(', ')}\n`;
-      }
-      
-      // HTTP Objects
-      if (httpObjects.length > 0 && (!analysis.data_types || analysis.data_types.includes('http_objects') || analysis.data_types.includes('http'))) {
-        fullContext += `HTTP Objects: ${httpObjects.map(o => o.filename).join(', ')}\n`;
-      }
-      
-      // Top 10 ports
-      const sortedPorts = Object.entries(ports).sort((a, b) => b[1] - a[1]).slice(0, 10);
-      fullContext += `Top Ports: ${sortedPorts.map(([p, c]) => `${p}(${c})`).join(', ')}\n`;
-      
-      // Top talkers
-      const ipCounts = {};
-      for (const p of packets) {
-        if (p.src_ip) ipCounts[p.src_ip] = (ipCounts[p.src_ip] || 0) + 1;
-        if (p.dst_ip) ipCounts[p.dst_ip] = (ipCounts[p.dst_ip] || 0) + 1;
-      }
-      const topIps = Object.entries(ipCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
-      fullContext += `Top IPs: ${topIps.map(([ip, c]) => `${ip}(${c})`).join(', ')}\n`;
-      
-      // Sample packets (first 15)
-      if (!analysis.data_types || analysis.data_types.includes('packets')) {
-        fullContext += `Sample Packets:\n`;
-        for (const p of packets.slice(0, 15)) {
-          fullContext += `#${p.id}: ${p.src_ip || '?'} → ${p.dst_ip || '?'} [${p.protocol}]\n`;
-        }
-      }
+      // Build compact, structured context — no raw packet rows
+const sortedProtos = Object.entries(protocols.protocols || {}).sort((a, b) => b[1] - a[1]).slice(0, 15);
+const sortedPorts = Object.entries(ports).sort((a, b) => b[1] - a[1]).slice(0, 20);
+
+// Compute top IPs from packets
+const ipCounts = {};
+for (const p of packets) {
+  if (p.src_ip) ipCounts[p.src_ip] = (ipCounts[p.src_ip] || 0) + 1;
+  if (p.dst_ip) ipCounts[p.dst_ip] = (ipCounts[p.dst_ip] || 0) + 1;
+}
+const topIps = Object.entries(ipCounts).sort((a, b) => b[1] - a[1]).slice(0, 10);
+
+// Collect ALL unique domains from DNS + TLS SNI + HTTP hosts (deduplicated)
+const allDomains = new Set();
+for (const q of dnsQueries) if (q.domain) allDomains.add(q.domain);
+for (const s of tlsSni) if (s.server_name) allDomains.add(s.server_name);
+for (const r of httpRequests) if (r.host) allDomains.add(r.host);
+
+// All unique HTTP URIs
+const allUris = httpRequests.map(r => `${r.method} http://${r.host}${r.uri}`);
+
+let fullContext = `
+=== PCAP SUMMARY ===
+Total Packets: ${(sessionData?.total_packets || packets.length).toLocaleString()}
+Duration: ${protocols.maxTime?.toFixed(2) || 0}s
+Unique IPs: ${Object.keys(ipCounts).length}
+Unique Ports: ${Object.keys(ports).length}
+Unique Domains: ${allDomains.size}
+
+=== PROTOCOLS ===
+${sortedProtos.map(([p, c]) => `${p}: ${c} packets`).join('\n')}
+
+=== ALL DOMAINS VISITED (DNS + HTTPS + HTTP) ===
+${[...allDomains].sort().join('\n')}
+
+=== HTTP REQUESTS ===
+${allUris.slice(0, 50).join('\n') || 'None'}
+
+=== HTTP OBJECTS (files downloaded) ===
+${httpObjects.map(o => `${o.filename} (${o.content_type}, ${o.size} bytes)`).join('\n') || 'None'}
+
+=== TOP IPs ===
+${topIps.map(([ip, c]) => `${ip}: ${c} packets`).join('\n')}
+
+=== TOP PORTS ===
+${sortedPorts.map(([p, c]) => `port ${p}: ${c} packets`).join('\n')}
+`.trim();
 
       // Step 2: Stream response with full context
       await callLLMStream(prompt, res, origin, fullContext);
