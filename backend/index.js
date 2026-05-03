@@ -143,16 +143,21 @@ setInterval(() => {
 
 // ── CORS ──────────────────────────────────────────────────────
 function getCorsHeaders(origin) {
-  let allowedOrigin = ALLOWED_ORIGIN;
-  
+  const allowedOrigins = (process.env.ALLOWED_ORIGIN || 'http://localhost:3000)
+    .split(',')
+    .map(o => o.trim());
+
+  let allowedOrigin = allowedOrigins[0];
+
+  if (origin && allowedOrigins.includes(origin)) {
+    allowedOrigin = origin;
+  }
+
+  // Always allow localhost in development
   if (origin && (origin.includes('localhost') || origin.includes('127.0.0.1'))) {
     allowedOrigin = origin;
   }
-  
-  if (ALLOWED_ORIGIN === '*') {
-    allowedOrigin = '*';
-  }
-  
+
   return {
     'Access-Control-Allow-Origin': allowedOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
