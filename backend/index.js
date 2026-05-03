@@ -143,7 +143,7 @@ setInterval(() => {
 
 // ── CORS ──────────────────────────────────────────────────────
 function getCorsHeaders(origin) {
-  const allowedOrigins = (process.env.ALLOWED_ORIGIN || 'http://localhost:3000)
+const allowedOrigins = (process.env.ALLOWED_ORIGIN || 'http://localhost:3000')
     .split(',')
     .map(o => o.trim());
 
