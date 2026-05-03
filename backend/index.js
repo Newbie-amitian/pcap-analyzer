@@ -1378,8 +1378,13 @@ IMPORTANT RULES:
 
 FORMATTING RULES:
 - When a list has more than 8 items (domains, files, IPs, ports, protocols), ALWAYS use a markdown table instead of bullet points.
-- For domains/websites, ALWAYS group them into a markdown table where each COLUMN is a category and domains are listed downward under each column. Dynamically decide the category names based on what domains are present (e.g. "Visited Sites", "Microsoft Services", "Google Services", "Advertising/Tracking", "Content/Media", "Local/Network" — but adapt these to what actually exists in the data). Fill each column top to bottom. Leave cells empty when one column runs out before others. Never list domains as bullet points if there are more than 8. Always add a brief summary after the table.
-- For protocols, use columns: | Protocol | Packets |
+- For domains/websites, ALWAYS output them in this EXACT custom block format and nothing else:
+  :::domain-grid
+  Category Name 1: site1.com|site2.com|site3.com
+  Category Name 2: site4.com|site5.com
+  Category Name 3: site6.com|site7.com
+  :::
+  Dynamically decide how many categories and what to name them based on the actual domains present (e.g. "Microsoft Services", "Google Services", "Advertising/Tracking", "Content/Media", "Local/Network" — but only create categories that actually have domains). Put EVERY domain into exactly one category. Never use bullet points or markdown tables for domains. Always add a brief summary sentence after the ::: closing tag.- For protocols, use columns: | Protocol | Packets |
 - For files downloaded, use columns: | Filename | Type | Size |
 - For IP addresses, use columns: | IP Address | Packets | Role |
 - Always add a brief summary sentence after the table.`;
