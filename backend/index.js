@@ -872,17 +872,174 @@ const IANA_PORTS = {
   27017: { name: 'mongodb', desc: 'MongoDB Database', risk: 'HIGH', secure: 'Bind localhost + Auth' },
 };
 
+// ── SearXNG Search for Port Intelligence ──────────────────────────────────
+async function searchPortWithSearXNG(port) {
+  return new Promise((resolve, reject) => {
+    const searchUrl = `${SEARXNG_URL}/search?q=TCP+UDP+port+${port}+service+protocol&format=json&engines=${SEARXNG_ENGINES}`;
+
+    console.log(`[SearXNG] Searching for port ${port}...`);
+
+    const urlObj = new URL(searchUrl);
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port || 443,
+      path: urlObj.pathname + urlObj.search,
+      method: 'GET',
+      timeout: SEARXNG_TIMEOUT_MS,
+    };
+
+    const protocol = urlObj.protocol === 'https:' ? https : http;
+
+    const req = protocol.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) {
+            console.error(`[SearXNG] Error ${res.statusCode} for port ${port}`);
+            return resolve(null);
+          }
+
+          const json = JSON.parse(data);
+          const results = json.results || [];
+
+          if (results.length === 0) {
+            return resolve(null);
+          }
+
+          // Extract useful info from search results
+          let serviceName = 'unknown';
+          let description = '';
+          let commonUses = [];
+          let risks = [];
+
+          for (const result of results.slice(0, 5)) {
+            const content = (result.content || '').toLowerCase();
+            const title = (result.title || '').toLowerCase();
+
+            // Try to identify service name from title or content
+            if (!description && result.content) {
+              description = result.content.slice(0, 200);
+            }
+
+            // Look for common patterns
+            if (content.includes('dns') || title.includes('dns')) {
+              serviceName = 'dns';
+              commonUses.push('DNS queries', 'Name resolution');
+            }
+            if (content.includes('dhcp') || title.includes('dhcp')) {
+              serviceName = 'dhcp';
+              commonUses.push('IP address assignment', 'Network configuration');
+            }
+            if (content.includes('http') || title.includes('http') || content.includes('web')) {
+              commonUses.push('Web services', 'HTTP traffic');
+            }
+            if (content.includes('streaming') || content.includes('media')) {
+              commonUses.push('Media streaming', 'Video/Audio');
+            }
+            if (content.includes('gaming') || content.includes('game')) {
+              commonUses.push('Gaming', 'Online multiplayer');
+            }
+            if (content.includes('voip') || content.includes('sip')) {
+              commonUses.push('VoIP', 'Voice over IP');
+            }
+            if (content.includes('vpn') || content.includes('tunnel')) {
+              commonUses.push('VPN', 'Secure tunneling');
+            }
+            if (content.includes('vulnerability') || content.includes('exploit') || content.includes('security')) {
+              risks.push('Potential security concerns found');
+            }
+          }
+
+          // Default common uses if none found
+          if (commonUses.length === 0) {
+            commonUses.push('Network service', 'Application communication');
+          }
+
+          console.log(`[SearXNG] ✓ Found info for port ${port}: ${serviceName}`);
+          resolve({
+            service_name: serviceName,
+            description: description || `Port ${port} - identified via web search`,
+            common_uses: commonUses,
+            risks: risks.length > 0 ? risks : ['Standard network service - review traffic patterns'],
+            source: 'SearXNG Web Search'
+          });
+        } catch (e) {
+          console.error(`[SearXNG] Parse error for port ${port}: ${e.message}`);
+          resolve(null);
+        }
+      });
+    });
+
+    req.on('error', (e) => {
+      console.error(`[SearXNG] Request error for port ${port}: ${e.message}`);
+      resolve(null);
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      console.error(`[SearXNG] Timeout for port ${port}`);
+      resolve(null);
+    });
+
+    req.end();
+  });
+}
+
 // ── Port Intelligence ──────────────────────────────────────────
 async function getPortIntelligence(port) {
   const ianaInfo = IANA_PORTS[port];
-  
+
   if (ianaInfo) {
+    // Add common uses based on service
+    const commonUsesMap = {
+      'ftp-data': ['File transfer', 'FTP data channel'],
+      'ftp': ['File transfer', 'FTP control'],
+      'ssh': ['Remote administration', 'Secure file transfer (SFTP)', 'Tunneling'],
+      'telnet': ['Legacy remote access', 'Device configuration'],
+      'smtp': ['Email sending', 'Mail relay'],
+      'dns': ['Domain name resolution', 'DNS queries'],
+      'dhcp': ['Automatic IP assignment', 'Network boot'],
+      'tftp': ['Simple file transfer', 'Network boot'],
+      'http': ['Web browsing', 'API services', 'Web applications'],
+      'pop3': ['Email retrieval', 'Mail client access'],
+      'ntp': ['Time synchronization', 'Clock sync'],
+      'rpc': ['Remote procedure calls', 'Windows services'],
+      'netbios-ns': ['Windows name resolution', 'NetBIOS'],
+      'netbios-dgm': ['Windows datagram service', 'NetBIOS'],
+      'netbios-ssn': ['Windows session service', 'NetBIOS'],
+      'imap': ['Email retrieval', 'Mail client access'],
+      'snmp': ['Network monitoring', 'Device management'],
+      'ldap': ['Directory services', 'Authentication'],
+      'https': ['Secure web browsing', 'API services', 'Web applications'],
+      'smb': ['File sharing', 'Printer sharing', 'Windows networking'],
+      'smtps': ['Secure email sending', 'Mail relay'],
+      'dhcpv6': ['IPv6 address assignment', 'IPv6 network config'],
+      'ldaps': ['Secure directory services', 'Secure authentication'],
+      'imaps': ['Secure email retrieval', 'Mail client access'],
+      'pop3s': ['Secure email retrieval', 'Mail client access'],
+      'mssql': ['Microsoft SQL Server', 'Database access'],
+      'oracle': ['Oracle Database', 'Database access'],
+      'ssdp': ['UPnP discovery', 'Device discovery'],
+      'mysql': ['MySQL Database', 'Database access'],
+      'rdp': ['Remote desktop', 'Windows remote access'],
+      'mdns': ['Bonjour/mDNS', 'Local name resolution', 'Apple services'],
+      'llmnr': ['Windows name resolution', 'Local network'],
+      'postgresql': ['PostgreSQL Database', 'Database access'],
+      'vnc': ['Remote desktop access', 'Screen sharing'],
+      'redis': ['In-memory database', 'Caching', 'Message broker'],
+      'http-proxy': ['Web proxy', 'Alternative HTTP port'],
+      'https-alt': ['Alternative HTTPS port', 'Web services'],
+      'elasticsearch': ['Search engine', 'Log analytics', 'Full-text search'],
+      'mongodb': ['MongoDB Database', 'NoSQL database'],
+    };
+
     return {
       port: port,
       service_name: ianaInfo.name,
       description: ianaInfo.desc,
       secure_alternative: ianaInfo.secure,
-      common_uses: [],
+      common_uses: commonUsesMap[ianaInfo.name] || ['Network service'],
       risk: ianaInfo.risk,
       reason: ianaInfo.desc,
       cve_id: null,
@@ -892,14 +1049,14 @@ async function getPortIntelligence(port) {
       source: 'IANA Port Registry',
     };
   }
-  
+
   if (port >= 49152 && port <= 65535) {
     return {
       port: port,
       service_name: 'ephemeral',
       description: `Ephemeral port ${port} - client-side temporary connection`,
       secure_alternative: 'Usually client-side, low risk',
-      common_uses: ['Client connections', 'Temporary connections'],
+      common_uses: ['Client connections', 'Temporary connections', 'Outbound traffic'],
       risk: 'LOW',
       reason: 'Ephemeral port - typically used for outbound client connections',
       cve_id: null,
@@ -909,13 +1066,34 @@ async function getPortIntelligence(port) {
       source: 'IANA Port Registry',
     };
   }
-  
+
+  // Unknown port - search SearXNG
+  console.log(`[PortIntel] Unknown port ${port} - searching SearXNG...`);
+  const searxngResult = await searchPortWithSearXNG(port);
+
+  if (searxngResult) {
+    return {
+      port: port,
+      service_name: searxngResult.service_name,
+      description: searxngResult.description,
+      secure_alternative: 'Review traffic patterns and firewall rules',
+      common_uses: searxngResult.common_uses,
+      risk: 'MEDIUM',
+      reason: searxngResult.risks[0] || 'Unknown service - identified via web search',
+      cve_id: null,
+      cvss_score: null,
+      cve_count: 0,
+      all_cves: [],
+      source: searxngResult.source,
+    };
+  }
+
   return {
     port: port,
     service_name: 'unknown',
     description: `Port ${port} - unknown service`,
     secure_alternative: 'Investigate manually',
-    common_uses: ['Unknown'],
+    common_uses: ['Unknown - requires manual investigation'],
     risk: 'MEDIUM',
     reason: 'Unknown service - manual investigation recommended',
     cve_id: null,
@@ -952,10 +1130,13 @@ RULES:
       stream: true
     });
     
+    // URL-encode the model name (@ symbol and special chars)
+    const encodedModel = encodeURIComponent(CF_LLM_MODEL);
+
     const options = {
       hostname: 'api.cloudflare.com',
       port: 443,
-      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_LLM_MODEL}`,
+      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${encodedModel}`,
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${CF_API_TOKEN}`,
@@ -964,8 +1145,9 @@ RULES:
       },
       timeout: CF_LLM_TIMEOUT_MS,
     };
-    
+
     console.log(`[LLM-Stream] Starting streaming request to Cloudflare...`);
+    console.log(`[LLM-Stream] Model: ${CF_LLM_MODEL}, Encoded: ${encodedModel}`);
     
     const corsHeaders = getCorsHeaders(origin);
     res.writeHead(200, {
@@ -1071,11 +1253,14 @@ RULES:
       ],
       max_tokens: 600
     });
-    
+
+    // URL-encode the model name (@ symbol and special chars)
+    const encodedModel = encodeURIComponent(CF_LLM_MODEL);
+
     const options = {
       hostname: 'api.cloudflare.com',
       port: 443,
-      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_LLM_MODEL}`,
+      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${encodedModel}`,
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${CF_API_TOKEN}`,
@@ -1084,7 +1269,7 @@ RULES:
       },
       timeout: CF_LLM_TIMEOUT_MS,
     };
-    
+
     console.log(`[LLM] Calling Cloudflare Workers AI: ${CF_LLM_MODEL}`);
     
     const req = https.request(options, (res) => {
@@ -1515,11 +1700,13 @@ const server = http.createServer(async (req, res) => {
     
     // Group ephemeral ports into a single entry
     const alerts = [...serviceAlerts];
-    
+
     if (ephemeralPorts.length > 0) {
       const totalEphemeralPackets = ephemeralPorts.reduce((sum, p) => sum + p.count, 0);
       const portList = ephemeralPorts.map(p => p.port).sort((a, b) => a - b);
-      
+      // Store ALL port numbers, not just sample
+      const portDetails = ephemeralPorts.map(p => ({ port: p.port, count: p.count })).sort((a, b) => a.port - b.port);
+
       alerts.push({
         port: 'ephemeral',
         port_range: { min: portList[0], max: portList[portList.length - 1] },
@@ -1532,7 +1719,8 @@ const server = http.createServer(async (req, res) => {
         secure_alternative: 'Client-side ports, typically low risk',
         common_uses: ['Client connections', 'Temporary connections', 'Outbound traffic'],
         source: 'IANA Port Registry',
-        sample_ports: portList.slice(0, 10),
+        all_ports: portDetails, // ALL port numbers with their counts
+        sample_ports: portList.slice(0, 10), // Keep sample for backward compatibility
       });
     }
     
