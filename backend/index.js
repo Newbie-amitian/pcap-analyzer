@@ -1345,11 +1345,17 @@ Respond with ONLY a JSON object (no markdown, no explanation):
             console.error(`[LLM-Analyze] Error ${res.statusCode}`);
             return resolve({ data_types: ['packets', 'protocols'], reasoning: 'Default fallback' });
           }
-          const json = JSON.parse(data);
-const raw = json.choices?.[0]?.message?.content || '{}';
-// Strip markdown fences — Llama ignores response_format: json_object
-const clean = raw.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
-const parsed = JSON.parse(clean);
+          // AFTER:
+const json = JSON.parse(data);
+const raw = json.choices?.[0]?.message?.content;
+// Llama 4 Scout returns content as object directly, Llama 3 returns string
+let parsed;
+if (typeof raw === 'object' && raw !== null) {
+  parsed = raw;
+} else {
+  const clean = (raw || '{}').replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
+  parsed = JSON.parse(clean);
+}
 console.log(`[LLM-Analyze] Need: ${parsed.data_types?.join(', ')}`);
 resolve(parsed);
         } catch (e) {
