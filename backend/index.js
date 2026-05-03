@@ -1264,7 +1264,7 @@ async function getEphemeralPortIntelligence(ephemeralPorts) {
 // Step 1: Analyze prompt to decide what TShark command to run
 async function analyzePromptForTshark(prompt, contextSummary) {
   return new Promise((resolve) => {
-    const analysisPrompt = `You are a PCAP analysis assistant. Analyze the user's question and decide what TShark data would help answer it.
+   const analysisPrompt = `You are a PCAP network analysis assistant. Classify the user's message and decide what to do.
 
 AVAILABLE DATA TYPES:
 - packets: Basic packet list (src_ip, dst_ip, protocol, ports, info)
@@ -1280,11 +1280,17 @@ AVAILABLE DATA TYPES:
 PCAP SUMMARY:
 ${contextSummary}
 
-USER QUESTION: "${prompt}"
+USER MESSAGE: "${prompt}"
+
+Classify the intent:
+- "greeting" → small talk, greetings, thanks, unrelated chat (hi, hello, thanks, cool, etc.)
+- "pcap_query" → any question about network traffic, packets, IPs, protocols, ports, security, etc.
 
 Respond with ONLY a JSON object (no markdown, no explanation):
 {
+  "intent": "greeting" or "pcap_query",
   "data_types": ["list", "of", "needed", "data", "types"],
+  "greeting_response": "friendly reply if intent is greeting, else null",
   "reasoning": "brief explanation"
 }`;
 
@@ -1919,9 +1925,28 @@ TLS Domains: ${tlsSni.length}
 HTTP Objects: ${httpObjects.length}`;
 
       // Step 1: Analyze prompt to decide what data is needed
-      const analysis = await analyzePromptForTshark(prompt, contextSummary);
-      console.log(`[Agent-Stream] Analysis: ${analysis.reasoning}`);
-      console.log(`[Agent-Stream] Need: ${analysis.data_types?.join(', ')}`);
+      // Step 1: Analyze prompt to decide what data is needed
+const analysis = await analyzePromptForTshark(prompt, contextSummary);
+console.log(`[Agent-Stream] Analysis: ${analysis.reasoning}`);
+console.log(`[Agent-Stream] Intent: ${analysis.intent}`);
+
+// If greeting/small talk, respond directly without TShark
+if (analysis.intent === 'greeting') {
+  const corsHeaders = getCorsHeaders(origin);
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    ...corsHeaders,
+  });
+  const reply = analysis.greeting_response || "Hey! Ask me anything about your PCAP — protocols, IPs, DNS queries, suspicious traffic, and more.";
+  res.write(`data: ${JSON.stringify({ token: reply })}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
+  return;
+}
+
+console.log(`[Agent-Stream] Need: ${analysis.data_types?.join(', ')}`);
 
       // Build context based on analysis - KEEP IT CONCISE
       let fullContext = '';
