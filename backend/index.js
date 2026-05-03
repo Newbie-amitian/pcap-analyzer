@@ -971,10 +971,11 @@ function extractFieldsHierarchical(xmlBlock, depth) {
 // ═══════════════════════════════════════════════════════════════════
 async function searchPortWithSearXNG(port, searchType = 'general') {
   return new Promise((resolve, reject) => {
+    // More specific queries for better results
     const queries = {
-      general: `IANA network TCP UDP port ${port} service name protocol what is`,
-      risks: `network port ${port} TCP UDP security vulnerability exploit CVE NVD`,
-      uses: `network port ${port} TCP UDP purpose application usage`
+      general: `IANA registered port ${port} TCP UDP service name`,
+      risks: `port ${port} TCP UDP security vulnerability CVE NVD`,
+      uses: `port ${port} protocol application usage purpose`
     };
 
     const searchUrl = `${SEARXNG_URL}/search?q=${encodeURIComponent(queries[searchType] || queries.general)}&format=json&engines=${SEARXNG_ENGINES}`;
@@ -1009,6 +1010,36 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
             return resolve(null);
           }
 
+          // Check for well-known ports first (more reliable)
+          const wellKnownServices = {
+            20: 'FTP Data', 21: 'FTP', 22: 'SSH', 23: 'Telnet',
+            25: 'SMTP', 53: 'DNS', 67: 'DHCP Server', 68: 'DHCP Client',
+            69: 'TFTP', 80: 'HTTP', 110: 'POP3', 119: 'NNTP',
+            123: 'NTP', 135: 'RPC', 137: 'NetBIOS Name', 138: 'NetBIOS Datagram',
+            139: 'NetBIOS Session', 143: 'IMAP', 161: 'SNMP', 162: 'SNMP Trap',
+            389: 'LDAP', 443: 'HTTPS', 445: 'SMB', 465: 'SMTPS',
+            514: 'Syslog', 515: 'LPR', 587: 'SMTP TLS', 636: 'LDAPS',
+            993: 'IMAPS', 995: 'POP3S', 1080: 'SOCKS', 1433: 'MSSQL',
+            1434: 'MSSQL Monitor', 1521: 'Oracle', 3306: 'MySQL',
+            3389: 'RDP', 5432: 'PostgreSQL', 5900: 'VNC', 5901: 'VNC',
+            6379: 'Redis', 8080: 'HTTP Proxy', 8443: 'HTTPS Alt',
+            27017: 'MongoDB', 5353: 'mDNS', 5355: 'LLMNR',
+            1900: 'SSDP', 547: 'DHCPv6', 631: 'IPP', 
+          };
+
+          // Check if port is well-known
+          if (wellKnownServices[port]) {
+            const serviceName = wellKnownServices[port];
+            console.log(`[SearXNG] ✓ Port ${port}: ${serviceName} (well-known)`);
+            return resolve({
+              service_name: serviceName,
+              description: `Port ${port} is used for ${serviceName}`,
+              common_uses: getServiceCommonUses(serviceName),
+              risks: [],
+              source: 'IANA Well-Known Ports'
+            });
+          }
+
           let serviceName = 'Unknown';
           let description = '';
           let commonUses = [];
@@ -1022,38 +1053,46 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
               description = result.content.slice(0, 300);
             }
 
-            // Service identification patterns
-            if (content.includes('dns') || title.includes('dns')) {
+            // More specific service detection
+            if (content.includes('domain name') || content.includes('dns server') || title.includes('dns')) {
               serviceName = 'DNS';
-              if (!commonUses.includes('DNS queries')) commonUses.push('DNS queries', 'Name resolution');
+              commonUses = ['DNS queries', 'Name resolution'];
             }
-            if (content.includes('dhcp') || title.includes('dhcp')) {
-              serviceName = 'DHCP';
-              if (!commonUses.includes('IP address assignment')) commonUses.push('IP address assignment', 'Network configuration');
+            if (content.includes('dhcp') && !content.includes('dns')) {
+              serviceName = port === 67 ? 'DHCP Server' : port === 68 ? 'DHCP Client' : 'DHCP';
+              commonUses = ['IP address assignment', 'Network configuration'];
             }
-            if (content.includes('http') || title.includes('http') || content.includes('web')) {
-              if (serviceName === 'Unknown') serviceName = 'HTTP';
-              if (!commonUses.includes('Web services')) commonUses.push('Web services', 'HTTP traffic');
+            if (content.includes('hypertext transfer') || content.includes('web server') || title.includes('http')) {
+              serviceName = 'HTTP';
+              commonUses = ['Web traffic', 'HTTP requests'];
             }
-            if (content.includes('https') || title.includes('https') || content.includes('ssl') || content.includes('tls')) {
+            if (content.includes('https') || content.includes('ssl/tls') || content.includes('secure web')) {
               serviceName = 'HTTPS';
-              if (!commonUses.includes('Secure web')) commonUses.push('Secure web browsing', 'Encrypted HTTP');
+              commonUses = ['Secure web traffic', 'Encrypted HTTP'];
             }
-            if (content.includes('ssh') || title.includes('ssh')) {
+            if (content.includes('ssh') || content.includes('secure shell')) {
               serviceName = 'SSH';
-              if (!commonUses.includes('Remote access')) commonUses.push('Secure remote access', 'Terminal access');
+              commonUses = ['Secure remote access', 'Terminal access'];
             }
-            if (content.includes('ftp') || title.includes('ftp')) {
+            if (content.includes('file transfer') && content.includes('ftp')) {
               serviceName = 'FTP';
-              if (!commonUses.includes('File transfer')) commonUses.push('File transfer', 'Data exchange');
+              commonUses = ['File transfer'];
             }
-            if (content.includes('smtp') || title.includes('smtp') || content.includes('email') || content.includes('mail')) {
-              serviceName = 'SMTP';
-              if (!commonUses.includes('Email')) commonUses.push('Email sending', 'Mail relay');
+            if (content.includes('netbios')) {
+              serviceName = 'NetBIOS';
+              commonUses = ['Windows networking', 'Name resolution'];
             }
-            if (content.includes('ephemeral') || content.includes('dynamic port') || content.includes('client port')) {
-              serviceName = 'Ephemeral';
-              if (!commonUses.includes('Client connections')) commonUses.push('Client connections', 'Temporary connections', 'Outbound traffic');
+            if (content.includes('mdns') || content.includes('multicast dns')) {
+              serviceName = 'mDNS';
+              commonUses = ['Local service discovery', 'Bonjour'];
+            }
+            if (content.includes('llmnr')) {
+              serviceName = 'LLMNR';
+              commonUses = ['Local name resolution'];
+            }
+            if (content.includes('ssdp') || content.includes('upnp')) {
+              serviceName = 'SSDP';
+              commonUses = ['UPnP discovery', 'Device discovery'];
             }
 
             // Security risks
@@ -1063,22 +1102,16 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
             if (content.includes('exploit') || content.includes('exploited')) {
               if (!risks.includes('Active exploits')) risks.push('Active exploits reported');
             }
-            if (content.includes('cve') || content.includes('cve-')) {
+            if (content.includes('cve-')) {
               const cveMatch = content.match(/cve-\d{4}-\d+/gi);
               if (cveMatch && !risks.some(r => r.includes('CVE'))) {
                 risks.push(`Related CVEs: ${cveMatch.slice(0, 3).join(', ').toUpperCase()}`);
               }
             }
-            if (content.includes('brute force')) {
-              if (!risks.includes('Brute force')) risks.push('Brute force attack risk');
-            }
-            if (content.includes('port scanning') || content.includes('reconnaissance')) {
-              if (!risks.includes('Port scanning')) risks.push('Port scanning risk');
-            }
           }
 
           if (commonUses.length === 0) {
-            commonUses.push('Network service', 'Application communication');
+            commonUses = ['Network service', 'Application communication'];
           }
 
           console.log(`[SearXNG] ✓ Found ${searchType} info for port ${port}: ${serviceName}`);
@@ -1109,6 +1142,26 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
 
     req.end();
   });
+}
+
+// Helper to get common uses for well-known services
+function getServiceCommonUses(serviceName) {
+  const uses = {
+    'DNS': ['DNS queries', 'Name resolution', 'Domain lookups'],
+    'DHCP Server': ['IP address assignment', 'Network configuration'],
+    'DHCP Client': ['Obtain IP address', 'Network configuration'],
+    'HTTP': ['Web traffic', 'HTTP requests', 'Unencrypted web'],
+    'HTTPS': ['Secure web traffic', 'Encrypted HTTP', 'E-commerce'],
+    'SSH': ['Secure remote access', 'Terminal access', 'File transfer'],
+    'FTP': ['File transfer', 'Data exchange'],
+    'NetBIOS': ['Windows networking', 'Name resolution', 'File sharing'],
+    'mDNS': ['Local service discovery', 'Bonjour', 'Zeroconf'],
+    'LLMNR': ['Local name resolution', 'Windows networking'],
+    'SSDP': ['UPnP discovery', 'Device discovery'],
+    'SMTP': ['Email sending', 'Mail relay'],
+    'RDP': ['Remote desktop', 'Windows remote access'],
+  };
+  return uses[serviceName] || ['Network service', 'Application communication'];
 }
 
 // ── Port Intelligence - Group ephemeral ports, SearXNG for service ports ──────────────────────────────────────────
@@ -1294,35 +1347,26 @@ Respond with ONLY a JSON object (no markdown, no explanation):
 // Step 2: Generate final response with all context
 async function callLLMStream(prompt, res, origin, fullContext) {
   return new Promise((resolve, reject) => {
-    const systemPrompt = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
+    const systemPrompt = `You are a PCAP network traffic analyzer. Answer questions about the network capture data provided. Be concise and specific. Use **bold** for important findings.`;
 
-RULES:
-• Give DETAILED, INTELLIGENT responses (5-8 bullet points when analyzing data)
-• Use **bold** for emphasis on important items
-• If user asks multiple questions, answer ALL of them separately
-• When analyzing packets, provide specific details: IPs, ports, protocols, packet counts
-• Be technical but clear - you're talking to security professionals
-• If you see suspicious patterns, explain WHY they're suspicious
-• For files/HTTP objects, list them with sizes and types
-• Format numbers with commas (e.g., "5,110 packets" not "5110")
-• If the user asks about a specific website, domain, or file - SEARCH the provided data for it`;
-
-    const llmPrompt = `${systemPrompt}
-
+    const userPrompt = `NETWORK DATA:
 ${fullContext}
 
-USER QUESTION: "${prompt}"
+QUESTION: ${prompt}
 
-Answer the user's question using ONLY the data provided above. Be specific with actual IPs, ports, domains, and packet counts. Use **bold** for important findings.`;
+Answer based on the data above:`;
 
     const postData = JSON.stringify({
       model: CF_LLM_MODEL,
       messages: [
-        { role: 'user', content: llmPrompt }
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
       ],
-      max_tokens: 1000,
+      max_tokens: 800,
       stream: true
     });
+
+    console.log(`[LLM-Stream] Prompt size: ${userPrompt.length} chars`);
 
     const options = {
       hostname: 'api.cloudflare.com',
@@ -1352,8 +1396,8 @@ Answer the user's question using ONLY the data provided above. Be specific with 
         let errorBody = '';
         cfRes.on('data', chunk => errorBody += chunk);
         cfRes.on('end', () => {
-          console.error(`[LLM-Stream] Error ${cfRes.statusCode}: ${errorBody.slice(0, 500)}`);
-          res.write(`data: ${JSON.stringify({ error: `LLM error: ${cfRes.statusCode}` })}\n\n`);
+          console.error(`[LLM-Stream] Error ${cfRes.statusCode}: ${errorBody.slice(0, 1000)}`);
+          res.write(`data: ${JSON.stringify({ error: `LLM error: ${cfRes.statusCode} - ${errorBody.slice(0, 200)}` })}\n\n`);
           res.end();
         });
         return resolve(null);
@@ -1383,13 +1427,18 @@ Answer the user's question using ONLY the data provided above. Be specific with 
                 fullResponse += content;
                 res.write(`data: ${JSON.stringify({ token: content })}\n\n`);
               }
-            } catch (e) { }
+            } catch (e) { 
+              console.error(`[LLM-Stream] Parse error: ${e.message} on line: ${line.slice(0, 100)}`);
+            }
           }
         }
       });
       
       cfRes.on('end', () => {
         console.log(`[LLM-Stream] ✓ Complete (${fullResponse.length} chars)`);
+        if (fullResponse.length === 0) {
+          console.error(`[LLM-Stream] WARNING: Empty response!`);
+        }
         res.write('data: [DONE]\n\n');
         res.end();
         resolve(fullResponse);
@@ -1413,7 +1462,7 @@ Answer the user's question using ONLY the data provided above. Be specific with 
     req.on('timeout', () => {
       req.destroy();
       console.error(`[LLM-Stream] Timeout`);
-      res.write(`data: ${JSON.stringify({ error: 'Timeout' })}\n\n`);
+      res.write(`data: ${JSON.stringify({ error: 'Request timeout' })}\n\n`);
       res.end();
       resolve(null);
     });
@@ -1860,100 +1909,51 @@ HTTP Objects: ${httpObjects.length}`;
       console.log(`[Agent-Stream] Analysis: ${analysis.reasoning}`);
       console.log(`[Agent-Stream] Need: ${analysis.data_types?.join(', ')}`);
 
-      // Build full context based on analysis
-      let fullContext = `**PCAP ANALYSIS DATA**\n\n`;
+      // Build context based on analysis - KEEP IT CONCISE
+      let fullContext = '';
       
       // Basic stats always included
-      fullContext += `**BASIC STATISTICS:**\n`;
-      fullContext += `• Total Packets: ${(sessionData?.total_packets || packets.length).toLocaleString()}\n`;
-      fullContext += `• Duration: ${protocols.maxTime?.toFixed(2) || 0} seconds\n\n`;
+      fullContext += `Total Packets: ${(sessionData?.total_packets || packets.length).toLocaleString()}\n`;
+      fullContext += `Duration: ${protocols.maxTime?.toFixed(2) || 0}s\n`;
       
-      // Protocols
-      if (!analysis.data_types || analysis.data_types.includes('protocols')) {
-        fullContext += `**PROTOCOL DISTRIBUTION:**\n`;
-        const sortedProtos = Object.entries(protocols.protocols || {}).sort((a, b) => b[1] - a[1]);
-        for (const [proto, count] of sortedProtos) {
-          fullContext += `• ${proto}: ${count.toLocaleString()} packets\n`;
-        }
-        fullContext += `\n`;
+      // Top 10 protocols
+      const sortedProtos = Object.entries(protocols.protocols || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
+      fullContext += `Protocols: ${sortedProtos.map(([p, c]) => `${p}(${c})`).join(', ')}\n`;
+      
+      // DNS Queries (top 20)
+      if (dnsQueries.length > 0 && (!analysis.data_types || analysis.data_types.includes('dns') || analysis.data_types.includes('protocols'))) {
+        fullContext += `DNS Queries: ${dnsQueries.slice(0, 20).map(q => q.domain).join(', ')}\n`;
       }
       
-      // DNS Queries
-      if (!analysis.data_types || analysis.data_types.includes('dns')) {
-        if (dnsQueries.length > 0) {
-          fullContext += `**DNS QUERIES (${dnsQueries.length} unique):**\n`;
-          for (const q of dnsQueries.slice(0, 50)) {
-            fullContext += `• ${q.domain}${q.answers ? ` → ${q.answers}` : ''}\n`;
-          }
-          fullContext += `\n`;
-        }
-      }
-      
-      // TLS SNI
-      if (!analysis.data_types || analysis.data_types.includes('tls_sni')) {
-        if (tlsSni.length > 0) {
-          fullContext += `**TLS/HTTPS DOMAINS (${tlsSni.length} unique):**\n`;
-          for (const s of tlsSni) {
-            fullContext += `• ${s.server_name}${s.destination_ip ? ` (→ ${s.destination_ip})` : ''}\n`;
-          }
-          fullContext += `\n`;
-        }
-      }
-      
-      // HTTP Requests
-      if (!analysis.data_types || analysis.data_types.includes('http')) {
-        if (httpRequests.length > 0) {
-          fullContext += `**HTTP REQUESTS (${httpRequests.length}):**\n`;
-          for (const r of httpRequests) {
-            fullContext += `• ${r.method || 'GET'} ${r.host || ''}${r.uri || '/'}\n`;
-          }
-          fullContext += `\n`;
-        }
+      // TLS SNI (top 20)
+      if (tlsSni.length > 0 && (!analysis.data_types || analysis.data_types.includes('tls_sni') || analysis.data_types.includes('http'))) {
+        fullContext += `HTTPS Domains: ${tlsSni.slice(0, 20).map(s => s.server_name).join(', ')}\n`;
       }
       
       // HTTP Objects
-      if (!analysis.data_types || analysis.data_types.includes('http_objects')) {
-        if (httpObjects.length > 0) {
-          fullContext += `**EXTRACTED HTTP OBJECTS (${httpObjects.length}):**\n`;
-          for (const obj of httpObjects) {
-            fullContext += `• ${obj.filename} (${(obj.size / 1024).toFixed(1)} KB, ${obj.content_type})\n`;
-          }
-          fullContext += `\n`;
-        }
+      if (httpObjects.length > 0 && (!analysis.data_types || analysis.data_types.includes('http_objects') || analysis.data_types.includes('http'))) {
+        fullContext += `HTTP Objects: ${httpObjects.map(o => o.filename).join(', ')}\n`;
       }
       
-      // Ports
-      if (!analysis.data_types || analysis.data_types.includes('ports')) {
-        const sortedPorts = Object.entries(ports).sort((a, b) => b[1] - a[1]).slice(0, 30);
-        fullContext += `**TOP PORTS:**\n`;
-        for (const [port, count] of sortedPorts) {
-          fullContext += `• Port ${port}: ${count} packets\n`;
-        }
-        fullContext += `\n`;
-      }
+      // Top 10 ports
+      const sortedPorts = Object.entries(ports).sort((a, b) => b[1] - a[1]).slice(0, 10);
+      fullContext += `Top Ports: ${sortedPorts.map(([p, c]) => `${p}(${c})`).join(', ')}\n`;
       
-      // Top Talkers
-      if (!analysis.data_types || analysis.data_types.includes('endpoints')) {
-        const ipCounts = {};
-        for (const p of packets) {
-          if (p.src_ip) ipCounts[p.src_ip] = (ipCounts[p.src_ip] || 0) + 1;
-          if (p.dst_ip) ipCounts[p.dst_ip] = (ipCounts[p.dst_ip] || 0) + 1;
-        }
-        const topIps = Object.entries(ipCounts).sort((a, b) => b[1] - a[1]).slice(0, 10);
-        fullContext += `**TOP TALKERS (IPs with most traffic):**\n`;
-        for (const [ip, count] of topIps) {
-          fullContext += `• ${ip}: ${count.toLocaleString()} packets\n`;
-        }
-        fullContext += `\n`;
+      // Top talkers
+      const ipCounts = {};
+      for (const p of packets) {
+        if (p.src_ip) ipCounts[p.src_ip] = (ipCounts[p.src_ip] || 0) + 1;
+        if (p.dst_ip) ipCounts[p.dst_ip] = (ipCounts[p.dst_ip] || 0) + 1;
       }
+      const topIps = Object.entries(ipCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      fullContext += `Top IPs: ${topIps.map(([ip, c]) => `${ip}(${c})`).join(', ')}\n`;
       
-      // Sample Packets
+      // Sample packets (first 15)
       if (!analysis.data_types || analysis.data_types.includes('packets')) {
-        fullContext += `**SAMPLE PACKETS (first 50):**\n`;
-        for (const p of packets.slice(0, 50)) {
-          fullContext += `• #${p.id}: ${p.src_ip || 'N/A'} → ${p.dst_ip || 'N/A'} [${p.protocol}] ${p.info || ''}\n`;
+        fullContext += `Sample Packets:\n`;
+        for (const p of packets.slice(0, 15)) {
+          fullContext += `#${p.id}: ${p.src_ip || '?'} → ${p.dst_ip || '?'} [${p.protocol}]\n`;
         }
-        fullContext += `\n`;
       }
 
       // Step 2: Stream response with full context
