@@ -1695,7 +1695,8 @@ const server = http.createServer(async (req, res) => {
 
       // Extract HTTP objects in background
       fs.mkdirSync(exportDir, { recursive: true });
-      exec(`"${TSHARK_BIN}" -r "${pcapPath}" --export-objects http,"${exportDir}" 2>/dev/null`, { timeout: 120000 }, (err, _out, stderr) => {
+      // AFTER:
+      exec(`"${TSHARK_BIN}" -r "${pcapPath}" --export-objects http,"${exportDir}" 2>/dev/null`, { timeout: 120000, maxBuffer: 200 * 1024 * 1024 }, (err, _out, stderr) => {
         if (err) { console.error(`[Export] Failed: ${err.message}`); return; }
         try {
           const EXT_CT = {
