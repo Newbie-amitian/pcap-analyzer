@@ -2203,6 +2203,7 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
   }
 
   // ── HTTP Objects list ──────────────────────────────────────
+  // AFTER (correct):
   if (url.startsWith('/pcap/images') && method === 'GET') {
     const q = getQuery(url);
     if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
@@ -2219,8 +2220,8 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
         message: 'No HTTP objects found yet. Extraction runs in the background after upload — wait a few seconds then retry.',
       });
 
-    return respond({
-       const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
+    // Get packet numbers by matching URIs to frame numbers
+    const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
     let uriToPacket = {};
     if (fs.existsSync(pcapPath)) {
       try {
@@ -2255,7 +2256,6 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
       total: artifacts.size,
     });
   }
-
   // ── HTTP Object data ───────────────────────────────────────
   if (url.startsWith('/pcap/image-data') && method === 'GET') {
     const q = getQuery(url);
