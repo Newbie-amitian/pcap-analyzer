@@ -522,7 +522,7 @@ function getHttpRequests(sessionId, limit = 100) {
     const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
     if (!fs.existsSync(pcapPath)) return resolve([]);
     
-    const cmd = `"${TShARK_BIN}" -r "${pcapPath}" -Y "http.request" -T fields -E separator=/t -e http.host -e http.request.method -e http.request.uri -e http.user-agent -c ${limit} 2>/dev/null`;
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "http.request" -T fields -E separator=/t -e http.host -e http.request.method -e http.request.uri -e http.user-agent -c ${limit} 2>/dev/null`;
     
     exec(cmd, { timeout: 30000 }, (err, stdout) => {
       if (err) {
