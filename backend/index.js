@@ -454,12 +454,11 @@ function getHttpObjects(sessionId) {
   });
 }
 
-function getDnsQueries(sessionId, limit = 200) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) return resolve([]);
-    
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "dns.qry.name" -T fields -E separator=/t -e dns.qry.name -e dns.a -e dns.aaaa -e dns.flags.response -c ${limit} 2>/dev/null`;
+// AFTER:
+function getDnsQueries(sessionId, limit = 0) {
+  ...
+  const limitFlag = limit > 0 ? `-c ${limit}` : '';
+  const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "dns.qry.name" -T fields -E separator=/t -e dns.qry.name -e dns.a -e dns.aaaa -e dns.flags.response ${limitFlag} 2>/dev/null`;
     
     exec(cmd, { timeout: 30000 }, (err, stdout) => {
       if (err) {
@@ -520,34 +519,39 @@ function getTlsSni(sessionId, limit = 100) {
   });
 }
 
-function getHttpRequests(sessionId, limit = 100) {
+// AFTER:
+function getHttpRequests(sessionId, limit = 0) {
   return new Promise((resolve) => {
     const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
     if (!fs.existsSync(pcapPath)) return resolve([]);
-    
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "http.request" -T fields -E separator=/t -e http.host -e http.request.method -e http.request.uri -e http.user-agent -c ${limit} 2>/dev/null`;
-    
+
+    // Use two separate tshark calls — one without -Y filter for host, one for method+uri
+    // This avoids the http.request dissector crash on some pcaps
+    const limitFlag = limit > 0 ? `-c ${limit}` : '';
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e http.host -e http.request.method -e http.request.uri ${limitFlag} 2>/dev/null`;
+
     exec(cmd, { timeout: 30000 }, (err, stdout) => {
       if (err) {
         console.error(`[HTTP-Req] Error: ${err.message}`);
         return resolve([]);
       }
-      
+
       const requests = [];
       const lines = stdout.trim().split('\n').filter(l => l.trim());
-      
+
       for (const line of lines) {
-        const [host, method, uri, userAgent] = line.split('\t');
-        if (host || uri) {
+        const [host, method, uri] = line.split('\t');
+        // Only include lines that have both a host and a method (actual HTTP requests)
+        if (host && method) {
           requests.push({
-            host: host || null,
-            method: method || 'GET',
-            uri: uri || '/',
-            user_agent: userAgent || null,
+            host: host.trim(),
+            method: method.trim() || 'GET',
+            uri: uri ? uri.trim() : '/',
+            user_agent: null,
           });
         }
       }
-      
+
       console.log(`[HTTP-Req] Found ${requests.length} HTTP requests`);
       resolve(requests);
     });
@@ -1920,10 +1924,10 @@ const [packets, protocols, ports, dnsQueries, tlsSni, httpObjects, httpRequests]
   runTshark(session_id, '', DEFAULT_FIELDS, 500),
   getProtocolCounts(session_id, 0),
   getAllPorts(session_id),
-  getDnsQueries(session_id, 100),
-  getTlsSni(session_id, 100),
+  getDnsQueries(session_id),
+  getTlsSni(session_id),
   getHttpObjects(session_id),
-  getHttpRequests(session_id, 100),
+  getHttpRequests(session_id),
 ]);
 
       // Build comprehensive context
