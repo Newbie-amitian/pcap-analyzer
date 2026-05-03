@@ -2052,6 +2052,11 @@ for (const r of httpRequests) if (r.host) allDomains.add(r.host);
 // All unique HTTP URIs
 const allUris = httpRequests.map(r => `${r.method} http://${r.host}${r.uri}`);
 
+// Packets with numbers for lookup
+const packetList = packets.slice(0, 500).map(p =>
+  `#${p.id} | ${p.timestamp?.toFixed(3)}s | ${p.src_ip || '?'} → ${p.dst_ip || '?'} | ${p.protocol} | ${p.info || ''}`
+).join('\n');
+
 let fullContext = `
 === PCAP SUMMARY ===
 Total Packets: ${(sessionData?.total_packets || packets.length).toLocaleString()}
@@ -2077,8 +2082,10 @@ ${topIps.map(([ip, c]) => `${ip}: ${c} packets`).join('\n')}
 
 === TOP PORTS ===
 ${sortedPorts.map(([p, c]) => `port ${p}: ${c} packets`).join('\n')}
-`.trim();
 
+=== PACKET LIST (with packet numbers) ===
+${packetList}
+`.trim();
       // Step 2: Stream response with full context
 await callLLMStream(prompt, res, origin, fullContext, history);
       return;
