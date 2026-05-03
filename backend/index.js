@@ -1367,8 +1367,12 @@ resolve(parsed);
 // Step 2: Generate final response with all context
 async function callLLMStream(prompt, res, origin, fullContext) {
   return new Promise((resolve, reject) => {
-    const systemPrompt = `You are a PCAP network traffic analyzer. Answer questions about the network capture data provided. Be concise and specific. Use **bold** for important findings.`;
+const systemPrompt = `You are a PCAP network traffic analyzer. Answer questions about the network capture data provided. Be concise and specific. Use **bold** for important findings.
 
+IMPORTANT RULES:
+- When asked about "websites visited", "domains", or "sites accessed" — ALWAYS list ALL entries from the "ALL DOMAINS VISITED" section, not just HTTP requests. This includes DNS queries and HTTPS/TLS domains.
+- When asked about downloaded files — list from the HTTP OBJECTS section.
+- Never limit your answer to just one data source when multiple are available.`;
     const userPrompt = `NETWORK DATA:
 ${fullContext}
 
