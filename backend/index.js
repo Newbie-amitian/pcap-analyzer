@@ -2036,15 +2036,21 @@ if (!sessions.get(session_id)._cache) {
 }
 const cache = sessions.get(session_id)._cache;
 
-const [packets, protocols, ports, dnsQueries, tlsSni, httpObjects, httpRequests] = await Promise.all([
-  cache.packets    || runTshark(session_id, '', DEFAULT_FIELDS, 500).then(r => { cache.packets = r; return r; }),
-  cache.protocols  || getProtocolCounts(session_id, 0).then(r => { cache.protocols = r; return r; }),
-  cache.ports      || getAllPorts(session_id).then(r => { cache.ports = r; return r; }),
-  cache.dnsQueries || getDnsQueries(session_id).then(r => { cache.dnsQueries = r; return r; }),
-  cache.tlsSni     || getTlsSni(session_id).then(r => { cache.tlsSni = r; return r; }),
-  cache.httpObjects|| getHttpObjects(session_id).then(r => { cache.httpObjects = r; return r; }),
-  cache.httpRequests||getHttpRequests(session_id).then(r => { cache.httpRequests = r; return r; }),
-]);
+if (!cache.packets)      cache.packets      = await runTshark(session_id, '', DEFAULT_FIELDS, 500);
+if (!cache.protocols)    cache.protocols    = await getProtocolCounts(session_id, 0);
+if (!cache.ports)        cache.ports        = await getAllPorts(session_id);
+if (!cache.dnsQueries)   cache.dnsQueries   = await getDnsQueries(session_id);
+if (!cache.tlsSni)       cache.tlsSni       = await getTlsSni(session_id);
+if (!cache.httpObjects)  cache.httpObjects  = await getHttpObjects(session_id);
+if (!cache.httpRequests) cache.httpRequests = await getHttpRequests(session_id);
+
+const packets     = cache.packets;
+const protocols   = cache.protocols;
+const ports       = cache.ports;
+const dnsQueries  = cache.dnsQueries;
+const tlsSni      = cache.tlsSni;
+const httpObjects = cache.httpObjects;
+const httpRequests= cache.httpRequests;
 
       // Build comprehensive context
 // Build comprehensive context
