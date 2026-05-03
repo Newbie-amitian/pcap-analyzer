@@ -562,7 +562,7 @@ function getHttpRequests(sessionId, limit = 0) {
 
     // Use two separate tshark calls — one without -Y filter for host, one for method+uri
     // This avoids the http.request dissector crash on some pcaps
-let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e frame.number -e http.host -e http.request.method -e http.request.uri -e http.file_data`;
+let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e frame.number -e http.host -e http.request.method -e http.request.uri -e http.file_data -e urlencoded-form.key -e urlencoded-form.value`;
     if (limit > 0) cmd += ` -c ${limit}`;
     cmd += ' 2>/dev/null';
 
@@ -575,17 +575,25 @@ let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e frame.n
       const requests = [];
       const lines = stdout.trim().split('\n').filter(l => l.trim());
 
-      // AFTER:
       for (const line of lines) {
-        const [frameNum, host, method, uri, fileDataHex] = line.split('\t');
+        const [frameNum, host, method, uri, fileDataHex, formKeys, formValues] = line.split('\t');
         if (host && method) {
-          // Decode hex-encoded POST body if present
           let postBody = null;
-          if (fileDataHex && fileDataHex.trim()) {
+
+          // Try urlencoded form fields first (most reliable for login forms)
+          if (formKeys && formValues) {
+            const keys = formKeys.split(',');
+            const vals = formValues.split(',');
+            postBody = keys.map((k, i) => `${k}=${vals[i] || ''}`).join('&');
+          }
+
+          // Fall back to hex-decoded file_data
+          if (!postBody && fileDataHex && fileDataHex.trim()) {
             try {
               postBody = Buffer.from(fileDataHex.trim(), 'hex').toString('utf8');
             } catch (_) {}
           }
+
           requests.push({
             frame_number: parseInt(frameNum) || null,
             host: host.trim(),
@@ -596,7 +604,6 @@ let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e frame.n
           });
         }
       }
-
       console.log(`[HTTP-Req] Found ${requests.length} HTTP requests`);
       resolve(requests);
     });
