@@ -2453,6 +2453,99 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
   }
 
   // ── 404 ─────────────────────────────────────────────────────
+  // ── Generate presigned PUT URL for direct frontend→B2 upload ──
+  if (url === '/pcap/b2-upload-url' && method === 'POST') {
+    if (!checkRateLimit(clientIp, RATE_UPLOAD))
+      return respond({ error: 'Too many uploads. Limit: 10/min.' }, 429);
+    try {
+      const body = await parseBody(req);
+      const { filename, filesize } = JSON.parse(body.toString());
+      if (!filename) return respond({ error: 'Missing filename' }, 400);
+      const MAX_BYTES = 200 * 1024 * 1024;
+      if (filesize && filesize > MAX_BYTES)
+        return respond({ error: 'File too large. Max 200MB.' }, 413);
+      const b2Key = `pcaps/${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${filename}`;
+      const presignedUrl = await getSignedUrl(b2, new PutObjectCommand({
+        Bucket: process.env.B2_BUCKET_NAME,
+        Key: b2Key,
+        ContentType: 'application/octet-stream',
+      }), { expiresIn: 600 });
+      console.log(`[B2] Generated presigned URL for: ${b2Key}`);
+      return respond({ presigned_url: presignedUrl, b2_key: b2Key });
+    } catch (e) {
+      console.error(`[B2-URL] Error: ${e.message}`);
+      return respond({ error: e.message }, 500);
+    }
+  }
+
+  // ── Process PCAP downloaded from B2 ───────────────────────────
+  if (url === '/pcap/process-b2' && method === 'POST') {
+    if (!checkRateLimit(clientIp, RATE_UPLOAD))
+      return respond({ error: 'Too many uploads. Limit: 10/min.' }, 429);
+    try {
+      const body = await parseBody(req);
+      const { b2_key, filename } = JSON.parse(body.toString());
+      if (!b2_key) return respond({ error: 'Missing b2_key' }, 400);
+      const session_id = `session-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const pcapPath = path.join(PCAP_DIR, `${session_id}.pcap`);
+      const exportDir = path.join(EXPORT_DIR, session_id);
+      await downloadFromB2(b2_key, pcapPath);
+      deleteFromB2(b2_key).catch(() => {});
+      fs.mkdirSync(exportDir, { recursive: true });
+      exec(`"${TSHARK_BIN}" -r "${pcapPath}" --export-objects http,"${exportDir}" 2>/dev/null`,
+        { timeout: 120000, maxBuffer: 200 * 1024 * 1024 }, (err) => {
+        if (err) { console.error(`[Export] Failed: ${err.message}`); return; }
+        try {
+          const EXT_CT = {
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+            '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+            '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
+            '.json': 'application/json', '.pdf': 'application/pdf',
+          };
+          const artifacts = new Map();
+          for (const file of fs.readdirSync(exportDir)) {
+            const fp = path.join(exportDir, file);
+            const ext = path.extname(file).toLowerCase();
+            artifacts.set(encodeURIComponent(file), {
+              buffer: fs.readFileSync(fp),
+              contentType: EXT_CT[ext] || 'application/octet-stream',
+              filename: file,
+            });
+          }
+          imageStore.set(session_id, artifacts);
+          console.log(`[Export] ${artifacts.size} HTTP objects extracted`);
+        } catch (e) { console.error(`[Export] Read error: ${e.message}`); }
+      });
+      const quickTotal = await getTruePacketCount(session_id);
+      const quickProtos = await getProtocolCounts(session_id, 0);
+      const quickDuration = await new Promise((resolve) => {
+        const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.time_relative 2>/dev/null | tail -1`;
+        exec(cmd, { timeout: 10000 }, (err, stdout) =>
+          resolve(parseFloat(stdout?.trim()) || 0));
+      });
+      sessions.set(session_id, {
+        session_id,
+        filename: filename || b2_key.split('/').pop(),
+        created_at: Date.now(),
+        total_packets: quickTotal || 0,
+      });
+      return respond({
+        session_id,
+        summary: {
+          total_packets: quickTotal || 0,
+          protocols: quickProtos.protocols || {},
+          duration_seconds: Math.round(quickDuration) || 0,
+          time_range: { start: 0, end: Math.round(quickDuration) || 0 },
+          raw_text: '',
+        },
+      });
+    } catch (e) {
+      console.error(`[B2-Process] Error: ${e.message}`);
+      return respond({ error: e.message }, 500);
+    }
+  }
+
+  // ── 404 ─────────────────────────────────────────────────────
   res.writeHead(404, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
   return res.end(JSON.stringify({ error: 'Not found' }));
 });
