@@ -1152,47 +1152,28 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
             }
 
             // More specific service detection
-            if (content.includes('domain name') || content.includes('dns server') || title.includes('dns')) {
-              serviceName = 'DNS';
-              commonUses = ['DNS queries', 'Name resolution'];
-            }
-            if (content.includes('dhcp') && !content.includes('dns')) {
-              serviceName = port === 67 ? 'DHCP Server' : port === 68 ? 'DHCP Client' : 'DHCP';
-              commonUses = ['IP address assignment', 'Network configuration'];
-            }
-            if (content.includes('hypertext transfer') || content.includes('web server') || title.includes('http')) {
-              serviceName = 'HTTP';
-              commonUses = ['Web traffic', 'HTTP requests'];
-            }
-            if (content.includes('https') || content.includes('ssl/tls') || content.includes('secure web')) {
-              serviceName = 'HTTPS';
-              commonUses = ['Secure web traffic', 'Encrypted HTTP'];
-            }
-            if (content.includes('ssh') || content.includes('secure shell')) {
-              serviceName = 'SSH';
-              commonUses = ['Secure remote access', 'Terminal access'];
-            }
-            if (content.includes('file transfer') && content.includes('ftp')) {
-              serviceName = 'FTP';
-              commonUses = ['File transfer'];
-            }
-            if (content.includes('netbios')) {
-              serviceName = 'NetBIOS';
-              commonUses = ['Windows networking', 'Name resolution'];
-            }
-            if (content.includes('mdns') || content.includes('multicast dns')) {
-              serviceName = 'mDNS';
-              commonUses = ['Local service discovery', 'Bonjour'];
-            }
-            if (content.includes('llmnr')) {
-              serviceName = 'LLMNR';
-              commonUses = ['Local name resolution'];
-            }
-            if (content.includes('ssdp') || content.includes('upnp')) {
-              serviceName = 'SSDP';
-              commonUses = ['UPnP discovery', 'Device discovery'];
-            }
+            const serviceScores = {};
+const scoreService = (name, uses, points) => {
+  if (!serviceScores[name]) serviceScores[name] = { score: 0, uses };
+  serviceScores[name].score += points;
+};
 
+if (content.includes('domain name') || content.includes('dns server') || title.includes('dns')) scoreService('DNS', ['DNS queries', 'Name resolution'], 3);
+if (content.includes('dhcp') && !content.includes('dns')) scoreService(port === 67 ? 'DHCP Server' : port === 68 ? 'DHCP Client' : 'DHCP', ['IP address assignment', 'Network configuration'], 3);
+if (content.includes('hypertext transfer') || content.includes('web server') || title.includes('http')) scoreService('HTTP', ['Web traffic', 'HTTP requests'], 2);
+if (content.includes('https') || content.includes('ssl/tls') || content.includes('secure web')) scoreService('HTTPS', ['Secure web traffic', 'Encrypted HTTP'], 3);
+if (content.includes('ssh') || content.includes('secure shell')) scoreService('SSH', ['Secure remote access', 'Terminal access'], 3);
+if (content.includes('file transfer') && content.includes('ftp')) scoreService('FTP', ['File transfer'], 2);
+if (content.includes('netbios')) scoreService('NetBIOS', ['Windows networking', 'Name resolution'], 2);
+if (content.includes('mdns') || content.includes('multicast dns')) scoreService('mDNS', ['Local service discovery', 'Bonjour'], 3);
+if (content.includes('llmnr')) scoreService('LLMNR', ['Local name resolution'], 2);
+if (content.includes('ssdp') || content.includes('upnp')) scoreService('SSDP', ['UPnP discovery', 'Device discovery'], 2);
+
+const topService = Object.entries(serviceScores).sort((a, b) => b[1].score - a[1].score)[0];
+if (topService) {
+  serviceName = topService[0];
+  commonUses = topService[1].uses;
+}
             // Security risks
             if (content.includes('vulnerability') || content.includes('vulnerable')) {
               if (!risks.includes('Known vulnerabilities')) risks.push('Known vulnerabilities exist');
@@ -1432,13 +1413,18 @@ Respond with ONLY a JSON object (no markdown, no explanation):
           // AFTER:
 const json = JSON.parse(data);
 const raw = json.choices?.[0]?.message?.content;
-// Llama 4 Scout returns content as object directly, Llama 3 returns string
 let parsed;
-if (typeof raw === 'object' && raw !== null) {
-  parsed = raw;
-} else {
-  const clean = (raw || '{}').replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
-  parsed = JSON.parse(clean);
+try {
+  if (typeof raw === 'object' && raw !== null) {
+    parsed = raw;
+  } else {
+    const clean = (raw || '{}').replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
+    const jsonMatch = clean.match(/\{[\s\S]*\}/);
+    parsed = JSON.parse(jsonMatch ? jsonMatch[0] : '{}');
+  }
+} catch (parseErr) {
+  console.error(`[LLM-Analyze] JSON parse failed: ${parseErr.message}`);
+  parsed = { data_types: ['packets', 'protocols'], reasoning: 'JSON parse fallback' };
 }
 console.log(`[LLM-Analyze] Need: ${parsed.data_types?.join(', ')}`);
 resolve(parsed);
@@ -1997,10 +1983,10 @@ const server = http.createServer(async (req, res) => {
     }
     
     const summary = { critical: 0, high: 0, medium: 0, low: 0 };
-    for (const a of alerts) {
-      const r = a.risk.toLowerCase();
-      if (summary[r] !== undefined) summary[r]++;
-    }
+for (const a of alerts) {
+  const r = (a.risk || 'low').toString().trim().toLowerCase();
+  if (r in summary) summary[r]++;
+}
     
     const result = { 
       alerts, 
@@ -2077,10 +2063,13 @@ const sessionData = sessions.get(session_id);
 // Get ALL data types for comprehensive context
 // Get ALL data types for comprehensive context
 // ── Per-session data cache ──────────────────────────────────
-if (!sessions.get(session_id)._cache) {
-  sessions.get(session_id)._cache = {};
+const session = sessions.get(session_id);
+if (!session) {
+  res.writeHead(404, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
+  return res.end(JSON.stringify({ error: 'Session not found' }));
 }
-const cache = sessions.get(session_id)._cache;
+if (!session._cache) session._cache = {};
+const cache = session._cache;
 
 if (!cache.packets)      cache.packets      = await runTshark(session_id, '', DEFAULT_FIELDS, 500);
 if (!cache.protocols)    cache.protocols    = await getProtocolCounts(session_id, 0);
