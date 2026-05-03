@@ -1378,13 +1378,12 @@ IMPORTANT RULES:
 
 FORMATTING RULES:
 - When a list has more than 8 items (domains, files, IPs, ports, protocols), ALWAYS use a markdown table instead of bullet points.
-- For domains/websites, ALWAYS output them in this EXACT custom block format:
-  :::domain-grid
-  Category Name 1: site1.com|site2.com|site3.com|site4.com
+- For domains/websites, ALWAYS output them in this EXACT format — no other text between STARTDOMAINS and ENDDOMAINS:
+  STARTDOMAINS
+  Category Name 1: site1.com|site2.com|site3.com
   Category Name 2: site4.com|site5.com|site6.com
-  :::
-  Dynamically decide category names based on actual domains present (e.g. "Microsoft Services", "Google Services", "Advertising/Tracking", "Content/Media", "Local/Network"). Put EVERY domain into exactly one category. Never use bullet points or markdown tables for domains. Always add a brief summary sentence after the ::: closing tag.
-- For files downloaded, use columns: | Filename | Type | Size |
+  ENDDOMAINS
+  Dynamically decide category names based on actual domains present (e.g. "Microsoft Services", "Google Services", "Advertising/Tracking", "Content/Media", "Local/Network"). Put EVERY domain into exactly one category. Never use bullet points or markdown tables for domains. Always add a brief summary sentence after ENDDOMAINS.- For files downloaded, use columns: | Filename | Type | Size |
 - For IP addresses, use columns: | IP Address | Packets | Role |
 - Always add a brief summary sentence after the table.`;
     const userPrompt = `NETWORK DATA:
