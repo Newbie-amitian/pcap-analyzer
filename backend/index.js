@@ -49,7 +49,7 @@ console.log(`   ALLOWED_ORIGIN = ${ALLOWED_ORIGIN}`);
 // Configuration
 // ═══════════════════════════════════════════════════════════════════
 const CF_LLM_MODEL = '@cf/meta/llama-3-8b-instruct';
-const CF_LLM_TIMEOUT_MS = 15000;
+const CF_LLM_TIMEOUT_MS = 30000; // Increased for 2-step process
 const SEARXNG_TIMEOUT_MS = 10000;
 const SEARXNG_MAX_RESULTS = 5;
 const SEARXNG_ENGINES = 'google,bing,duckduckgo,startpage';
@@ -80,7 +80,7 @@ if (!fs.existsSync(EXPORT_DIR)) fs.mkdirSync(EXPORT_DIR, { recursive: true });
 // ── Session store ──────────────────────────────────────────────
 const sessions = new Map();
 const imageStore = new Map();
-const portIntelCache = new Map(); // Cache for port intelligence
+const portIntelCache = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 // ── Session Recovery ───────────────────────────────────────────
@@ -227,7 +227,7 @@ const isValidSessionId = (id) =>
   typeof id === 'string' && /^session-\d{13}-[a-z0-9]{6}$/.test(id);
 
 // ═══════════════════════════════════════════════════════════════════
-// TShark core runner - FIXED to handle root warning
+// TShark core runner
 // ═══════════════════════════════════════════════════════════════════
 const DEFAULT_FIELDS = [
   'frame.number',
@@ -255,7 +255,6 @@ function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
     for (const f of fields) cmd += ` -e ${f}`;
     if (filter) cmd += ` -Y "${filter.replace(/"/g, '\\"')}"`;
     if (limit > 0) cmd += ` -c ${limit}`;
-    // Suppress root warning with 2>/dev/null
     cmd += ' 2>/dev/null';
 
     console.log(`[TShark] Running: ${cmd.slice(0, 150)}...`);
@@ -343,14 +342,16 @@ function getTruePacketCount(sessionId) {
   });
 }
 
-function getProtocolCounts(sessionId, limit = 2000) {
+function getProtocolCounts(sessionId, limit = 0) {
   return new Promise((resolve) => {
     const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
     if (!fs.existsSync(pcapPath)) return resolve({ protocols: {}, maxTime: 0 });
     
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e _ws.col.Protocol -e frame.time_relative -c ${limit} 2>/dev/null`;
+    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e _ws.col.Protocol -e frame.time_relative`;
+    if (limit > 0) cmd += ` -c ${limit}`;
+    cmd += ' 2>/dev/null';
     
-    exec(cmd, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+    exec(cmd, { timeout: 60000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         console.error(`[TShark-Proto] Error: ${err.message}`);
         return resolve({ protocols: {}, maxTime: 0 });
@@ -406,6 +407,146 @@ function getAllPorts(sessionId) {
       
       console.log(`[TShark-Ports] Found ${Object.keys(portCounts).length} unique ports from ${lines.length} packets`);
       resolve(portCounts);
+    });
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NEW: Get HTTP Objects, DNS Queries, TLS SNI
+// ═══════════════════════════════════════════════════════════════════
+
+function getHttpObjects(sessionId) {
+  return new Promise((resolve) => {
+    const exportDir = path.join(EXPORT_DIR, sessionId);
+    if (!fs.existsSync(exportDir)) {
+      return resolve([]);
+    }
+    
+    try {
+      const files = fs.readdirSync(exportDir);
+      const objects = files.map(filename => {
+        const fp = path.join(exportDir, filename);
+        const stats = fs.statSync(fp);
+        const ext = path.extname(filename).toLowerCase();
+        const contentTypes = {
+          '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+          '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+          '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
+          '.json': 'application/json', '.pdf': 'application/pdf',
+          '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2',
+        };
+        return {
+          filename,
+          content_type: contentTypes[ext] || 'application/octet-stream',
+          size: stats.size,
+          extension: ext,
+        };
+      });
+      console.log(`[HTTP-Objects] Found ${objects.length} objects`);
+      resolve(objects);
+    } catch (e) {
+      console.error(`[HTTP-Objects] Error: ${e.message}`);
+      resolve([]);
+    }
+  });
+}
+
+function getDnsQueries(sessionId, limit = 200) {
+  return new Promise((resolve) => {
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) return resolve([]);
+    
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "dns.qry.name" -T fields -E separator=/t -e dns.qry.name -e dns.a -e dns.aaaa -e dns.flags.response -c ${limit} 2>/dev/null`;
+    
+    exec(cmd, { timeout: 30000 }, (err, stdout) => {
+      if (err) {
+        console.error(`[DNS] Error: ${err.message}`);
+        return resolve([]);
+      }
+      
+      const queries = [];
+      const seen = new Set();
+      const lines = stdout.trim().split('\n').filter(l => l.trim());
+      
+      for (const line of lines) {
+        const [name, a, aaaa, isResponse] = line.split('\t');
+        if (name && !seen.has(name)) {
+          seen.add(name);
+          queries.push({
+            domain: name,
+            type: isResponse === '1' ? 'response' : 'query',
+            answers: [a, aaaa].filter(Boolean).join(', ') || null,
+          });
+        }
+      }
+      
+      console.log(`[DNS] Found ${queries.length} unique queries`);
+      resolve(queries);
+    });
+  });
+}
+
+function getTlsSni(sessionId, limit = 100) {
+  return new Promise((resolve) => {
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) return resolve([]);
+    
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "tls.handshake.extensions_server_name" -T fields -e tls.handshake.extensions_server_name -e ip.dst -c ${limit} 2>/dev/null`;
+    
+    exec(cmd, { timeout: 30000 }, (err, stdout) => {
+      if (err) {
+        console.error(`[TLS-SNI] Error: ${err.message}`);
+        return resolve([]);
+      }
+      
+      const sniList = [];
+      const seen = new Set();
+      const lines = stdout.trim().split('\n').filter(l => l.trim());
+      
+      for (const line of lines) {
+        const [sni, dstIp] = line.split('\t');
+        if (sni && !seen.has(sni)) {
+          seen.add(sni);
+          sniList.push({ server_name: sni, destination_ip: dstIp || null });
+        }
+      }
+      
+      console.log(`[TLS-SNI] Found ${sniList.length} unique SNI domains`);
+      resolve(sniList);
+    });
+  });
+}
+
+function getHttpRequests(sessionId, limit = 100) {
+  return new Promise((resolve) => {
+    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
+    if (!fs.existsSync(pcapPath)) return resolve([]);
+    
+    const cmd = `"${TShARK_BIN}" -r "${pcapPath}" -Y "http.request" -T fields -E separator=/t -e http.host -e http.request.method -e http.request.uri -e http.user-agent -c ${limit} 2>/dev/null`;
+    
+    exec(cmd, { timeout: 30000 }, (err, stdout) => {
+      if (err) {
+        console.error(`[HTTP-Req] Error: ${err.message}`);
+        return resolve([]);
+      }
+      
+      const requests = [];
+      const lines = stdout.trim().split('\n').filter(l => l.trim());
+      
+      for (const line of lines) {
+        const [host, method, uri, userAgent] = line.split('\t');
+        if (host || uri) {
+          requests.push({
+            host: host || null,
+            method: method || 'GET',
+            uri: uri || '/',
+            user_agent: userAgent || null,
+          });
+        }
+      }
+      
+      console.log(`[HTTP-Req] Found ${requests.length} HTTP requests`);
+      resolve(requests);
     });
   });
 }
@@ -826,14 +967,13 @@ function extractFieldsHierarchical(xmlBlock, depth) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// IANA Port Database
-// ── SearXNG Search for Port Intelligence ──────────────────────────────────
+// SearXNG Search for Port Intelligence - NO HARDCODING
+// ═══════════════════════════════════════════════════════════════════
 async function searchPortWithSearXNG(port, searchType = 'general') {
   return new Promise((resolve, reject) => {
-    // Different search queries based on search type - use "network port" to avoid phone number results
     const queries = {
       general: `IANA network TCP UDP port ${port} service name protocol what is`,
-      risks: `network port ${port} TCP UDP security vulnerability exploit CVE`,
+      risks: `network port ${port} TCP UDP security vulnerability exploit CVE NVD`,
       uses: `network port ${port} TCP UDP purpose application usage`
     };
 
@@ -869,8 +1009,7 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
             return resolve(null);
           }
 
-          // Extract useful info from search results
-          let serviceName = 'unknown';
+          let serviceName = 'Unknown';
           let description = '';
           let commonUses = [];
           let risks = [];
@@ -879,12 +1018,11 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
             const content = (result.content || '').toLowerCase();
             const title = (result.title || '').toLowerCase();
 
-            // Try to identify service name from title or content
             if (!description && result.content) {
               description = result.content.slice(0, 300);
             }
 
-            // Look for common patterns - service identification
+            // Service identification patterns
             if (content.includes('dns') || title.includes('dns')) {
               serviceName = 'DNS';
               if (!commonUses.includes('DNS queries')) commonUses.push('DNS queries', 'Name resolution');
@@ -894,7 +1032,7 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
               if (!commonUses.includes('IP address assignment')) commonUses.push('IP address assignment', 'Network configuration');
             }
             if (content.includes('http') || title.includes('http') || content.includes('web')) {
-              if (!serviceName || serviceName === 'unknown') serviceName = 'HTTP';
+              if (serviceName === 'Unknown') serviceName = 'HTTP';
               if (!commonUses.includes('Web services')) commonUses.push('Web services', 'HTTP traffic');
             }
             if (content.includes('https') || title.includes('https') || content.includes('ssl') || content.includes('tls')) {
@@ -913,45 +1051,12 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
               serviceName = 'SMTP';
               if (!commonUses.includes('Email')) commonUses.push('Email sending', 'Mail relay');
             }
-            if (content.includes('database') || content.includes('sql') || content.includes('mysql') || content.includes('postgres')) {
-              if (!commonUses.includes('Database')) commonUses.push('Database access', 'Data storage');
-            }
-            if (content.includes('remote') || content.includes('desktop') || content.includes('rdp')) {
-              if (!commonUses.includes('Remote access')) commonUses.push('Remote access', 'Remote desktop');
-            }
-            if (content.includes('streaming') || content.includes('media')) {
-              if (!commonUses.includes('Media streaming')) commonUses.push('Media streaming', 'Video/Audio');
-            }
-            if (content.includes('gaming') || content.includes('game')) {
-              if (!commonUses.includes('Gaming')) commonUses.push('Gaming', 'Online multiplayer');
-            }
-            if (content.includes('voip') || content.includes('sip')) {
-              if (!commonUses.includes('VoIP')) commonUses.push('VoIP', 'Voice over IP');
-            }
-            if (content.includes('vpn') || content.includes('tunnel')) {
-              if (!commonUses.includes('VPN')) commonUses.push('VPN', 'Secure tunneling');
-            }
-            if (content.includes('netbios') || content.includes('smb')) {
-              if (!commonUses.includes('Windows networking')) commonUses.push('Windows networking', 'File sharing');
-            }
-            if (content.includes('mdns') || content.includes('bonjour') || content.includes('multicast dns')) {
-              serviceName = 'mDNS';
-              if (!commonUses.includes('Local discovery')) commonUses.push('Local service discovery', 'Bonjour');
-            }
-            if (content.includes('llmnr') || content.includes('link-local')) {
-              serviceName = 'LLMNR';
-              if (!commonUses.includes('Name resolution')) commonUses.push('Local name resolution');
-            }
-            if (content.includes('ssdp') || content.includes('upnp')) {
-              serviceName = 'SSDP';
-              if (!commonUses.includes('Device discovery')) commonUses.push('UPnP discovery', 'Device discovery');
-            }
-            if (content.includes('ntp') || content.includes('time')) {
-              serviceName = 'NTP';
-              if (!commonUses.includes('Time sync')) commonUses.push('Time synchronization');
+            if (content.includes('ephemeral') || content.includes('dynamic port') || content.includes('client port')) {
+              serviceName = 'Ephemeral';
+              if (!commonUses.includes('Client connections')) commonUses.push('Client connections', 'Temporary connections', 'Outbound traffic');
             }
 
-            // Extract security risks from search results
+            // Security risks
             if (content.includes('vulnerability') || content.includes('vulnerable')) {
               if (!risks.includes('Known vulnerabilities')) risks.push('Known vulnerabilities exist');
             }
@@ -967,26 +1072,16 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
             if (content.includes('brute force')) {
               if (!risks.includes('Brute force')) risks.push('Brute force attack risk');
             }
-            if (content.includes('injection') || content.includes('xss') || content.includes('sql injection')) {
-              if (!risks.includes('Injection risks')) risks.push('Injection attack risks');
-            }
-            if (content.includes('ddos') || content.includes('amplification')) {
-              if (!risks.includes('DDoS vector')) risks.push('DDoS amplification risk');
-            }
-            if (content.includes('unencrypted') || content.includes('cleartext') || content.includes('plaintext')) {
-              if (!risks.includes('Unencrypted')) risks.push('Unencrypted communication');
-            }
-            if (content.includes('remote code execution') || content.includes('rce')) {
-              if (!risks.includes('RCE risk')) risks.push('Remote code execution risk');
+            if (content.includes('port scanning') || content.includes('reconnaissance')) {
+              if (!risks.includes('Port scanning')) risks.push('Port scanning risk');
             }
           }
 
-          // Default common uses if none found
           if (commonUses.length === 0) {
             commonUses.push('Network service', 'Application communication');
           }
 
-          console.log(`[SearXNG] ✓ Found ${searchType} info for port ${port}: ${serviceName}, ${risks.length} risks, ${commonUses.length} uses`);
+          console.log(`[SearXNG] ✓ Found ${searchType} info for port ${port}: ${serviceName}`);
           resolve({
             service_name: serviceName,
             description: description || `Port ${port} - network service`,
@@ -1018,26 +1113,7 @@ async function searchPortWithSearXNG(port, searchType = 'general') {
 
 // ── Port Intelligence using SearXNG only (NO HARDCODING) ──────────────────────────────────────────
 async function getPortIntelligence(port) {
-  // Ephemeral ports - well-known IANA range, no need to search
-  if (port >= 49152 && port <= 65535) {
-    return {
-      port: port,
-      service_name: 'Ephemeral',
-      description: `Ephemeral port ${port} - client-side temporary connection (IANA range 49152-65535)`,
-      secure_alternative: 'Usually client-side, low risk',
-      common_uses: ['Client connections', 'Temporary connections', 'Outbound traffic'],
-      risks: ['Port scanning', 'Service fingerprinting'],
-      risk: 'LOW',
-      reason: 'Ephemeral port - used for outbound client connections',
-      cve_id: null,
-      cvss_score: null,
-      cve_count: 0,
-      all_cves: [],
-      source: 'IANA Port Registry',
-    };
-  }
-
-  // All other ports - use SearXNG for everything
+  // NO HARDCODING - Use SearXNG for ALL ports including ephemeral
   console.log(`[PortIntel] Port ${port} - searching SearXNG...`);
 
   const [generalResult, risksResult] = await Promise.all([
@@ -1045,23 +1121,23 @@ async function getPortIntelligence(port) {
     searchPortWithSearXNG(port, 'risks')
   ]);
 
-  // Extract info from SearXNG results
   const serviceName = generalResult?.service_name || 'Unknown';
   const description = generalResult?.description || `Port ${port} - network service`;
   const commonUses = generalResult?.common_uses || ['Network service', 'Application communication'];
   const risks = risksResult?.risks || [];
 
-  // Determine risk level based on risks found
-  let riskLevel = 'MEDIUM';
-  if (risks.length === 0) {
-    riskLevel = 'LOW';
-  } else if (risks.some(r => r.toLowerCase().includes('critical') || r.toLowerCase().includes('rce') || r.toLowerCase().includes('remote code'))) {
-    riskLevel = 'CRITICAL';
-  } else if (risks.some(r => r.toLowerCase().includes('exploit') || r.toLowerCase().includes('vulnerability') || r.toLowerCase().includes('cve'))) {
-    riskLevel = 'HIGH';
+  // Determine risk level
+  let riskLevel = 'LOW';
+  if (risks.length > 0) {
+    if (risks.some(r => r.toLowerCase().includes('critical') || r.toLowerCase().includes('rce'))) {
+      riskLevel = 'CRITICAL';
+    } else if (risks.some(r => r.toLowerCase().includes('exploit') || r.toLowerCase().includes('vulnerability') || r.toLowerCase().includes('cve'))) {
+      riskLevel = 'HIGH';
+    } else if (risks.length > 0) {
+      riskLevel = 'MEDIUM';
+    }
   }
 
-  // Default risk if none found
   if (risks.length === 0) {
     risks.push('Standard network service - review traffic patterns');
   }
@@ -1084,32 +1160,129 @@ async function getPortIntelligence(port) {
     source: 'SearXNG Web Search',
   };
 }
-async function callLLMStream(prompt, res, origin) {
+
+// ═══════════════════════════════════════════════════════════════════
+// LLM Functions - 2-STEP DYNAMIC PROCESS
+// ═══════════════════════════════════════════════════════════════════
+
+// Step 1: Analyze prompt to decide what TShark command to run
+async function analyzePromptForTshark(prompt, contextSummary) {
+  return new Promise((resolve) => {
+    const analysisPrompt = `You are a PCAP analysis assistant. Analyze the user's question and decide what TShark data would help answer it.
+
+AVAILABLE DATA TYPES:
+- packets: Basic packet list (src_ip, dst_ip, protocol, ports, info)
+- protocols: Protocol distribution (counts per protocol)
+- dns: DNS queries and responses
+- http: HTTP requests (hosts, URIs, methods)
+- tls_sni: TLS Server Name Indication (domains accessed via HTTPS)
+- http_objects: Extracted HTTP files (images, HTML, JS, etc)
+- ports: Unique destination ports with counts
+- conversations: IP conversation statistics
+- endpoints: Top talkers (IPs with most traffic)
+
+PCAP SUMMARY:
+${contextSummary}
+
+USER QUESTION: "${prompt}"
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{
+  "data_types": ["list", "of", "needed", "data", "types"],
+  "reasoning": "brief explanation"
+}`;
+
+    const postData = JSON.stringify({
+      model: CF_LLM_MODEL,
+      messages: [
+        { role: 'user', content: analysisPrompt }
+      ],
+      max_tokens: 200,
+      response_format: { type: "json_object" }
+    });
+
+    const options = {
+      hostname: 'api.cloudflare.com',
+      port: 443,
+      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${CF_API_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+      },
+      timeout: 15000,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) {
+            console.error(`[LLM-Analyze] Error ${res.statusCode}`);
+            return resolve({ data_types: ['packets', 'protocols'], reasoning: 'Default fallback' });
+          }
+          const json = JSON.parse(data);
+          const content = json.choices?.[0]?.message?.content || '{}';
+          const parsed = JSON.parse(content);
+          console.log(`[LLM-Analyze] Need: ${parsed.data_types?.join(', ')}`);
+          resolve(parsed);
+        } catch (e) {
+          console.error(`[LLM-Analyze] Parse error: ${e.message}`);
+          resolve({ data_types: ['packets', 'protocols'], reasoning: 'Parse error fallback' });
+        }
+      });
+    });
+
+    req.on('error', (e) => {
+      console.error(`[LLM-Analyze] Request error: ${e.message}`);
+      resolve({ data_types: ['packets', 'protocols'], reasoning: 'Request error fallback' });
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ data_types: ['packets', 'protocols'], reasoning: 'Timeout fallback' });
+    });
+
+    req.write(postData);
+    req.end();
+  });
+}
+
+// Step 2: Generate final response with all context
+async function callLLMStream(prompt, res, origin, fullContext) {
   return new Promise((resolve, reject) => {
     const systemPrompt = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
 
 RULES:
 • Give DETAILED, INTELLIGENT responses (5-8 bullet points when analyzing data)
-• Use emojis sparingly (1-2 per response, not every bullet)
+• Use **bold** for emphasis on important items
 • If user asks multiple questions, answer ALL of them separately
 • When analyzing packets, provide specific details: IPs, ports, protocols, packet counts
 • Be technical but clear - you're talking to security professionals
 • If you see suspicious patterns, explain WHY they're suspicious
 • For files/HTTP objects, list them with sizes and types
-• Format numbers with commas (e.g., "5,110 packets" not "5110")`;
+• Format numbers with commas (e.g., "5,110 packets" not "5110")
+• If the user asks about a specific website, domain, or file - SEARCH the provided data for it`;
 
-    // Use OpenAI-compatible endpoint for better compatibility
+    const llmPrompt = `${systemPrompt}
+
+${fullContext}
+
+USER QUESTION: "${prompt}"
+
+Answer the user's question using ONLY the data provided above. Be specific with actual IPs, ports, domains, and packet counts. Use **bold** for important findings.`;
+
     const postData = JSON.stringify({
       model: CF_LLM_MODEL,
       messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: prompt }
+        { role: 'user', content: llmPrompt }
       ],
-      max_tokens: 800,
+      max_tokens: 1000,
       stream: true
     });
 
-    // OpenAI-compatible endpoint: /client/v4/accounts/{account_id}/ai/v1/chat/completions
     const options = {
       hostname: 'api.cloudflare.com',
       port: 443,
@@ -1123,9 +1296,7 @@ RULES:
       timeout: CF_LLM_TIMEOUT_MS,
     };
 
-    console.log(`[LLM-Stream] Starting streaming request to Cloudflare...`);
-    console.log(`[LLM-Stream] Model: ${CF_LLM_MODEL}`);
-    console.log(`[LLM-Stream] Endpoint: /client/v4/accounts/.../ai/v1/chat/completions`);
+    console.log(`[LLM-Stream] Starting streaming request...`);
 
     const corsHeaders = getCorsHeaders(origin);
     res.writeHead(200, {
@@ -1166,7 +1337,6 @@ RULES:
             }
             try {
               const json = JSON.parse(data);
-              // OpenAI-compatible format: choices[0].delta.content
               const content = json.choices?.[0]?.delta?.content || json.response;
               if (content) {
                 fullResponse += content;
@@ -1217,26 +1387,19 @@ async function callLLM(prompt, systemOverride = null) {
     const defaultSystem = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
 
 RULES:
-• Give DETAILED, INTELLIGENT responses (5-8 bullet points when analyzing data)
-• Use emojis sparingly (1-2 per response, not every bullet)
-• If user asks multiple questions, answer ALL of them separately
-• When analyzing packets, provide specific details: IPs, ports, protocols, packet counts
-• Be technical but clear - you're talking to security professionals
-• If you see suspicious patterns, explain WHY they're suspicious
-• For files/HTTP objects, list them with sizes and types
-• Format numbers with commas (e.g., "5,110 packets" not "5110")`;
+• Give DETAILED, INTELLIGENT responses
+• Use **bold** for emphasis
+• Be specific with IPs, ports, protocols, and packet counts`;
 
-    // Use OpenAI-compatible endpoint for better compatibility
     const postData = JSON.stringify({
       model: CF_LLM_MODEL,
       messages: [
         { role: 'system', content: systemOverride || defaultSystem },
         { role: 'user', content: prompt }
       ],
-      max_tokens: 600
+      max_tokens: 800
     });
 
-    // OpenAI-compatible endpoint: /client/v4/accounts/{account_id}/ai/v1/chat/completions
     const options = {
       hostname: 'api.cloudflare.com',
       port: 443,
@@ -1262,14 +1425,12 @@ RULES:
             return resolve(null);
           }
           const json = JSON.parse(data);
-
-          // OpenAI-compatible format: choices[0].message.content
           const content = json.choices?.[0]?.message?.content;
           if (content) {
             console.log(`[LLM] ✓ Got response (${content.length} chars)`);
             resolve(content);
           } else {
-            console.error(`[LLM] Unexpected response format: ${JSON.stringify(json).slice(0, 200)}`);
+            console.error(`[LLM] Unexpected response format`);
             resolve(null);
           }
         } catch (e) {
@@ -1286,7 +1447,7 @@ RULES:
 
     req.on('timeout', () => {
       req.destroy();
-      console.error(`[LLM] Timeout after ${CF_LLM_TIMEOUT_MS}ms`);
+      console.error(`[LLM] Timeout`);
       resolve(null);
     });
 
@@ -1323,7 +1484,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url === '/pcap/health') {
-    return respond({ status: 'ok', engine: 'TShark + IANA Port DB', sessions: sessions.size });
+    return respond({ status: 'ok', engine: 'TShark + SearXNG', sessions: sessions.size });
   }
 
   // ── Upload ─────────────────────────────────────────────────
@@ -1387,7 +1548,7 @@ const server = http.createServer(async (req, res) => {
       // Get quick stats for immediate response
       const [quickTotal, quickProtos, quickDuration] = await Promise.all([
         getTruePacketCount(session_id),
-        getProtocolCounts(session_id, 2000),
+        getProtocolCounts(session_id, 0), // Get ALL protocols
         new Promise((resolve) => {
           const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.time_relative 2>/dev/null | tail -1`;
           exec(cmd, { timeout: 10000 }, (err, stdout) => {
@@ -1413,7 +1574,6 @@ const server = http.createServer(async (req, res) => {
         if (evictKey) sessions.delete(evictKey);
       }
 
-      // Return response immediately
       respond({
         session_id,
         summary: {
@@ -1500,129 +1660,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── Packets Detailed ────────────────────────────────────────
-  if (url.startsWith('/pcap/packets-detailed') && method === 'GET') {
-    const q = getQuery(url);
-    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
-
-    const page = Math.max(1, parseInt(q.page || '1'));
-    const per_page = Math.min(200, parseInt(q.per_page || '50'));
-    const skip = (page - 1) * per_page;
-
-    const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
-    if (!fs.existsSync(pcapPath)) return respond({ packets: [], total: 0, page, per_page });
-
-    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T json -c ${skip + per_page} 2>/dev/null`;
-    
-    console.log(`[TSharkDetailed] Running JSON output for packets`);
-
-    exec(cmd, { timeout: 60000, maxBuffer: 100 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[TSharkDetailed] Error: ${err.message}`);
-        return respond({ packets: [], total: 0, page, per_page });
-      }
-
-      try {
-        const jsonData = JSON.parse(stdout);
-        const pageData = jsonData.slice(skip);
-        
-        const packets = pageData.map((pkt, idx) => {
-          const layers = pkt._source?.layers || {};
-          const frame = layers.frame || {};
-          
-          let src_ip = null;
-          let dst_ip = null;
-          if (layers.ip) {
-            src_ip = layers.ip['ip.src'] || null;
-            dst_ip = layers.ip['ip.dst'] || null;
-          } else if (layers.ipv6) {
-            src_ip = layers.ipv6['ipv6.src'] || null;
-            dst_ip = layers.ipv6['ipv6.dst'] || null;
-          }
-          
-          let src_port = null;
-          let dst_port = null;
-          if (layers.tcp) {
-            src_port = parseInt(layers.tcp['tcp.srcport']) || null;
-            dst_port = parseInt(layers.tcp['tcp.dstport']) || null;
-          } else if (layers.udp) {
-            src_port = parseInt(layers.udp['udp.srcport']) || null;
-            dst_port = parseInt(layers.udp['udp.dstport']) || null;
-          }
-          
-          let protocol = 'UNKNOWN';
-          if (layers.tcp) protocol = 'TCP';
-          else if (layers.udp) protocol = 'UDP';
-          else if (layers.icmp || layers.icmpv6) protocol = 'ICMP';
-          else if (layers.arp) protocol = 'ARP';
-          else if (layers.dns || layers.mdns) protocol = layers.mdns ? 'MDNS' : 'DNS';
-          else if (layers.http) protocol = 'HTTP';
-          else if (layers.tls || layers.ssl) protocol = 'TLS';
-          else if (layers.dhcp || layers.dhcpv6) protocol = layers.dhcpv6 ? 'DHCPv6' : 'DHCP';
-          else if (layers.ssdp) protocol = 'SSDP';
-          else if (layers.ntp) protocol = 'NTP';
-          else if (layers.igmp) protocol = 'IGMP';
-          
-          let info = '';
-          if (layers.dns || layers.mdns) {
-            const dnsLayer = layers.dns || layers.mdns;
-            if (dnsLayer['dns.qry.name']) {
-              info = dnsLayer['dns.flags.response'] === '1' ? 
-                `Response: ${dnsLayer['dns.qry.name']}` : 
-                `Query: ${dnsLayer['dns.qry.name']}`;
-            }
-          } else if (layers.http) {
-            if (layers.http['http.request.method']) {
-              info = `${layers.http['http.request.method']} ${layers.http['http.request.uri'] || '/'}`;
-            } else if (layers.http['http.response.code']) {
-              info = `HTTP ${layers.http['http.response.code']} ${layers.http['http.response.phrase'] || ''}`;
-            }
-          } else if (layers.tcp) {
-            const flags = [];
-            if (layers.tcp['tcp.flags.syn'] === '1') flags.push('SYN');
-            if (layers.tcp['tcp.flags.ack'] === '1') flags.push('ACK');
-            if (layers.tcp['tcp.flags.fin'] === '1') flags.push('FIN');
-            if (layers.tcp['tcp.flags.reset'] === '1') flags.push('RST');
-            if (flags.length > 0) info = `[${flags.join(', ')}]`;
-          } else if (layers.arp) {
-            const opcode = layers.arp['arp.opcode'];
-            const senderIP = layers.arp['arp.src.proto_ipv4'] || '';
-            const targetIP = layers.arp['arp.dst.proto_ipv4'] || '';
-            const senderMAC = layers.arp['arp.src.hw_mac'] || '';
-            
-            if (opcode === '1') {
-              info = targetIP ? `Who has ${targetIP}? Tell ${senderIP}` : 'ARP Request';
-            } else if (opcode === '2') {
-              info = senderIP && senderMAC ? `${senderIP} is at ${senderMAC}` : 'ARP Reply';
-            }
-          }
-          
-          return {
-            id: parseInt(frame['frame.number']) || (skip + idx + 1),
-            src_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            protocol,
-            length: parseInt(frame['frame.len']) || 0,
-            timestamp: parseFloat(frame['frame.time_relative']) || 0,
-            datetime: frame['frame.time'] || '',
-            info: info.trim(),
-          };
-        });
-
-        const sessionData = sessions.get(q.session_id);
-        const realTotal = sessionData?.total_packets ?? jsonData.length;
-
-        return respond({ packets, total: realTotal, page, per_page });
-      } catch (parseErr) {
-        console.error(`[TSharkDetailed] JSON parse error: ${parseErr.message}`);
-        return respond({ packets: [], total: 0, page, per_page });
-      }
-    });
-    return;
-  }
-
   // ── Vulnerabilities / Port Intel ────────────────────────────
   if (url.startsWith('/pcap/vulnerabilities') && method === 'GET') {
     const q = getQuery(url);
@@ -1643,27 +1680,15 @@ const server = http.createServer(async (req, res) => {
     // Get ports directly
     const portCounts = await getAllPorts(q.session_id);
     const portEntries = Object.entries(portCounts);
-    console.log(`[PortIntel] Analyzing ${portEntries.length} unique ports`);
+    console.log(`[PortIntel] Analyzing ${portEntries.length} unique ports via SearXNG...`);
     
-    // Separate ephemeral ports from service ports
-    const ephemeralPorts = [];
-    const servicePorts = [];
-    
-    for (const [port, count] of portEntries) {
-      const portNum = parseInt(port);
-      if (portNum >= 49152 && portNum <= 65535) {
-        ephemeralPorts.push({ port: portNum, count });
-      } else {
-        servicePorts.push({ port: portNum, count });
-      }
-    }
-    
-    // Get intelligence for service ports
-    const serviceAlerts = await Promise.all(
-      servicePorts.map(async ({ port, count }) => {
-        const intel = await getPortIntelligence(port);
+    // Get intelligence for ALL ports via SearXNG (NO HARDCODING)
+    const alerts = await Promise.all(
+      portEntries.map(async ([port, count]) => {
+        const portNum = parseInt(port);
+        const intel = await getPortIntelligence(portNum);
         return {
-          port,
+          port: portNum,
           count,
           risk: intel.risk,
           reason: intel.reason,
@@ -1681,33 +1706,6 @@ const server = http.createServer(async (req, res) => {
       })
     );
     
-    // Group ephemeral ports into a single entry
-    const alerts = [...serviceAlerts];
-
-    if (ephemeralPorts.length > 0) {
-      const totalEphemeralPackets = ephemeralPorts.reduce((sum, p) => sum + p.count, 0);
-      const portList = ephemeralPorts.map(p => p.port).sort((a, b) => a - b);
-      // Store ALL port numbers, not just sample
-      const portDetails = ephemeralPorts.map(p => ({ port: p.port, count: p.count })).sort((a, b) => a.port - b.port);
-
-      alerts.push({
-        port: 'ephemeral',
-        port_range: { min: portList[0], max: portList[portList.length - 1] },
-        port_count: ephemeralPorts.length,
-        count: totalEphemeralPackets,
-        risk: 'LOW',
-        reason: 'Ephemeral ports (49152-65535) are used for outbound client connections',
-        service_name: 'ephemeral',
-        description: `${ephemeralPorts.length} ephemeral ports used for outbound connections`,
-        secure_alternative: 'Client-side ports, typically low risk',
-        common_uses: ['Client connections', 'Temporary connections', 'Outbound traffic'],
-        risks: ['Port scanning', 'Service fingerprinting', 'Application identification', 'Ephemeral port exhaustion'],
-        source: 'IANA Port Registry',
-        all_ports: portDetails, // ALL port numbers with their counts
-        sample_ports: portList.slice(0, 10), // Keep sample for backward compatibility
-      });
-    }
-    
     const summary = { critical: 0, high: 0, medium: 0, low: 0 };
     for (const a of alerts) {
       const r = a.risk.toLowerCase();
@@ -1718,10 +1716,12 @@ const server = http.createServer(async (req, res) => {
       alerts, 
       summary,
       total_ports: portEntries.length,
-      service_ports: servicePorts.length,
-      ephemeral_ports: ephemeralPorts.length,
       timestamp: new Date().toISOString(),
-      cached: false
+      cached: false,
+      data_sources: {
+        port_info: 'SearXNG Web Search',
+        vulnerabilities: 'SearXNG Web Search'
+      }
     };
     
     // Cache the results
@@ -1731,7 +1731,7 @@ const server = http.createServer(async (req, res) => {
     return respond(result);
   }
 
-  // ── Agent STREAMING endpoint ────────────────────────────────
+  // ── Agent STREAMING endpoint - DYNAMIC TSHARK ────────────────────────────────
   if (url === '/pcap/agent/stream' && method === 'POST') {
     if (!checkRateLimit(clientIp, RATE_AGENT)) {
       res.writeHead(429, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
@@ -1761,33 +1761,131 @@ const server = http.createServer(async (req, res) => {
 
       console.log(`[Agent-Stream] Query received for session: ${session_id}`);
       
-      // Get session data for context
+      // Get session data
       const sessionData = sessions.get(session_id);
-      const pcapPath = path.join(PCAP_DIR, `${session_id}.pcap`);
       
-      // Build context from current session
-      const [packets, ports, protocols] = await Promise.all([
-        runTshark(session_id, '', DEFAULT_FIELDS, 100),
+      // Get ALL data types for comprehensive context
+      const [packets, protocols, ports, dnsQueries, tlsSni, httpObjects, httpRequests] = await Promise.all([
+        runTshark(session_id, '', DEFAULT_FIELDS, 500), // More packets
+        getProtocolCounts(session_id, 0), // ALL protocols
         getAllPorts(session_id),
-        getProtocolCounts(session_id, 1000),
+        getDnsQueries(session_id, 100),
+        getTlsSni(session_id, 100),
+        getHttpObjects(session_id),
+        getHttpRequests(session_id, 100),
       ]);
+
+      // Build comprehensive context
+      const contextSummary = `Total Packets: ${sessionData?.total_packets || packets.length}
+Protocols: ${Object.entries(protocols.protocols || {}).map(([p, c]) => `${p}(${c})`).join(', ')}
+Unique Ports: ${Object.keys(ports).length}
+DNS Queries: ${dnsQueries.length}
+TLS Domains: ${tlsSni.length}
+HTTP Objects: ${httpObjects.length}`;
+
+      // Step 1: Analyze prompt to decide what data is needed
+      const analysis = await analyzePromptForTshark(prompt, contextSummary);
+      console.log(`[Agent-Stream] Analysis: ${analysis.reasoning}`);
+      console.log(`[Agent-Stream] Need: ${analysis.data_types?.join(', ')}`);
+
+      // Build full context based on analysis
+      let fullContext = `**PCAP ANALYSIS DATA**\n\n`;
       
-      const llmPrompt = `You are analyzing a PCAP network capture. Here is the data:
+      // Basic stats always included
+      fullContext += `**BASIC STATISTICS:**\n`;
+      fullContext += `• Total Packets: ${(sessionData?.total_packets || packets.length).toLocaleString()}\n`;
+      fullContext += `• Duration: ${protocols.maxTime?.toFixed(2) || 0} seconds\n\n`;
+      
+      // Protocols
+      if (!analysis.data_types || analysis.data_types.includes('protocols')) {
+        fullContext += `**PROTOCOL DISTRIBUTION:**\n`;
+        const sortedProtos = Object.entries(protocols.protocols || {}).sort((a, b) => b[1] - a[1]);
+        for (const [proto, count] of sortedProtos) {
+          fullContext += `• ${proto}: ${count.toLocaleString()} packets\n`;
+        }
+        fullContext += `\n`;
+      }
+      
+      // DNS Queries
+      if (!analysis.data_types || analysis.data_types.includes('dns')) {
+        if (dnsQueries.length > 0) {
+          fullContext += `**DNS QUERIES (${dnsQueries.length} unique):**\n`;
+          for (const q of dnsQueries.slice(0, 50)) {
+            fullContext += `• ${q.domain}${q.answers ? ` → ${q.answers}` : ''}\n`;
+          }
+          fullContext += `\n`;
+        }
+      }
+      
+      // TLS SNI
+      if (!analysis.data_types || analysis.data_types.includes('tls_sni')) {
+        if (tlsSni.length > 0) {
+          fullContext += `**TLS/HTTPS DOMAINS (${tlsSni.length} unique):**\n`;
+          for (const s of tlsSni) {
+            fullContext += `• ${s.server_name}${s.destination_ip ? ` (→ ${s.destination_ip})` : ''}\n`;
+          }
+          fullContext += `\n`;
+        }
+      }
+      
+      // HTTP Requests
+      if (!analysis.data_types || analysis.data_types.includes('http')) {
+        if (httpRequests.length > 0) {
+          fullContext += `**HTTP REQUESTS (${httpRequests.length}):**\n`;
+          for (const r of httpRequests) {
+            fullContext += `• ${r.method || 'GET'} ${r.host || ''}${r.uri || '/'}\n`;
+          }
+          fullContext += `\n`;
+        }
+      }
+      
+      // HTTP Objects
+      if (!analysis.data_types || analysis.data_types.includes('http_objects')) {
+        if (httpObjects.length > 0) {
+          fullContext += `**EXTRACTED HTTP OBJECTS (${httpObjects.length}):**\n`;
+          for (const obj of httpObjects) {
+            fullContext += `• ${obj.filename} (${(obj.size / 1024).toFixed(1)} KB, ${obj.content_type})\n`;
+          }
+          fullContext += `\n`;
+        }
+      }
+      
+      // Ports
+      if (!analysis.data_types || analysis.data_types.includes('ports')) {
+        const sortedPorts = Object.entries(ports).sort((a, b) => b[1] - a[1]).slice(0, 30);
+        fullContext += `**TOP PORTS:**\n`;
+        for (const [port, count] of sortedPorts) {
+          fullContext += `• Port ${port}: ${count} packets\n`;
+        }
+        fullContext += `\n`;
+      }
+      
+      // Top Talkers
+      if (!analysis.data_types || analysis.data_types.includes('endpoints')) {
+        const ipCounts = {};
+        for (const p of packets) {
+          if (p.src_ip) ipCounts[p.src_ip] = (ipCounts[p.src_ip] || 0) + 1;
+          if (p.dst_ip) ipCounts[p.dst_ip] = (ipCounts[p.dst_ip] || 0) + 1;
+        }
+        const topIps = Object.entries(ipCounts).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        fullContext += `**TOP TALKERS (IPs with most traffic):**\n`;
+        for (const [ip, count] of topIps) {
+          fullContext += `• ${ip}: ${count.toLocaleString()} packets\n`;
+        }
+        fullContext += `\n`;
+      }
+      
+      // Sample Packets
+      if (!analysis.data_types || analysis.data_types.includes('packets')) {
+        fullContext += `**SAMPLE PACKETS (first 50):**\n`;
+        for (const p of packets.slice(0, 50)) {
+          fullContext += `• #${p.id}: ${p.src_ip || 'N/A'} → ${p.dst_ip || 'N/A'} [${p.protocol}] ${p.info || ''}\n`;
+        }
+        fullContext += `\n`;
+      }
 
-**Basic Stats:**
-• Total Packets: ${sessionData?.total_packets || packets.length}
-• Protocols: ${Object.entries(protocols.protocols || {}).map(([p, c]) => `${p}: ${c}`).join(', ')}
-
-**Sample Packets (first 20):**
-${packets.slice(0, 20).map(p => `• #${p.id}: ${p.src_ip || 'N/A'} → ${p.dst_ip || 'N/A'} [${p.protocol}] ${p.info || ''}`).join('\n')}
-
-**Unique Ports:** ${Object.keys(ports).slice(0, 20).join(', ')}
-
-**User Question:** "${prompt}"
-
-Answer the user's question using ONLY the data above. Be specific with actual IPs, ports, and packet counts.`;
-
-      await callLLMStream(llmPrompt, res, origin);
+      // Step 2: Stream response with full context
+      await callLLMStream(prompt, res, origin, fullContext);
       return;
       
     } catch (e) {
@@ -1823,7 +1921,7 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
       const [packets, ports, protocols] = await Promise.all([
         runTshark(session_id, '', DEFAULT_FIELDS, 100),
         getAllPorts(session_id),
-        getProtocolCounts(session_id, 1000),
+        getProtocolCounts(session_id, 0),
       ]);
       
       const llmPrompt = `You are analyzing a PCAP network capture. Here is the data:
@@ -1893,36 +1991,38 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
     if (!sessionExists) {
       return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
     }
-    
-    const art = imageStore.get(q.session_id)?.get(q.key || '');
-    if (!art) return respond({ error: 'Object not found' }, 404);
+
+    const artifactKey = q.artifact_key;
+    if (!artifactKey) return respond({ error: 'Missing artifact_key' }, 400);
+
+    const artifacts = imageStore.get(q.session_id);
+    if (!artifacts) return respond({ error: 'No objects found for this session' }, 404);
+
+    const artifact = artifacts.get(artifactKey);
+    if (!artifact) return respond({ error: 'Object not found' }, 404);
 
     res.writeHead(200, {
-      'Content-Type': art.contentType,
-      'Content-Length': art.buffer.length,
-      'Content-Disposition': `inline; filename="${art.filename}"`,
+      'Content-Type': artifact.contentType,
+      'Content-Length': artifact.buffer.length,
+      'Cache-Control': 'public, max-age=3600',
       ...getCorsHeaders(origin),
     });
-    return res.end(art.buffer);
+    return res.end(artifact.buffer);
   }
 
-  return respond({ error: 'Not found' }, 404);
+  // ── 404 ─────────────────────────────────────────────────────
+  res.writeHead(404, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
+  return res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// Global error handler
-process.on('uncaughtException', (err) => {
-  console.error('[FATAL] Uncaught exception:', err.message);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[FATAL] Unhandled rejection:', reason);
-});
-
-const PORT = process.env.PORT || 4000;
+// ═══════════════════════════════════════════════════════════════════
+// Start Server
+// ═══════════════════════════════════════════════════════════════════
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log(`✅ TShark PCAP Analyzer running on port ${PORT}`);
-  console.log(`🔧 TShark binary: ${TSHARK_BIN}`);
-  console.log(`📁 PCAP dir:      ${path.resolve(PCAP_DIR)}`);
-  console.log(`📁 Export dir:    ${path.resolve(EXPORT_DIR)}`);
+  console.log('═══════════════════════════════════════════════════════════════');
+  console.log(`🚀 PCAP Analyzer Backend running on port ${PORT}`);
+  console.log(`📊 Engine: TShark + SearXNG (NO AI for port intel)`);
+  console.log(`🤖 LLM: Cloudflare Workers AI (${CF_LLM_MODEL})`);
+  console.log('═══════════════════════════════════════════════════════════════');
 });
-
