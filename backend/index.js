@@ -2294,6 +2294,17 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
   return res.end(JSON.stringify({ error: 'Not found' }));
 });
 
+// ── Keep-alive (prevents Render free tier from sleeping) ──────
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+if (RENDER_URL) {
+  setInterval(() => {
+    https.get(`${RENDER_URL}/ping`, (res) => {
+      console.log(`[KeepAlive] Ping → ${res.statusCode}`);
+    }).on('error', (e) => {
+      console.error(`[KeepAlive] Failed: ${e.message}`);
+    });
+  }, 10 * 60 * 1000); // every 10 minutes
+}
 // ═══════════════════════════════════════════════════════════════════
 // Start Server
 // ═══════════════════════════════════════════════════════════════════
