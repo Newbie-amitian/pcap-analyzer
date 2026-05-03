@@ -2355,7 +2355,6 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
         Bucket: process.env.B2_BUCKET_NAME,
         Key: b2Key,
         ContentType: 'application/octet-stream',
-        ChecksumAlgorithm: undefined,
       }), { expiresIn: 600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm']) });
       console.log(`[B2] Generated presigned URL for: ${b2Key}`);
       return respond({ presigned_url: presignedUrl, b2_key: b2Key });
