@@ -873,11 +873,18 @@ const IANA_PORTS = {
 };
 
 // ── SearXNG Search for Port Intelligence ──────────────────────────────────
-async function searchPortWithSearXNG(port) {
+async function searchPortWithSearXNG(port, searchType = 'general') {
   return new Promise((resolve, reject) => {
-    const searchUrl = `${SEARXNG_URL}/search?q=TCP+UDP+port+${port}+service+protocol&format=json&engines=${SEARXNG_ENGINES}`;
+    // Different search queries based on search type
+    const queries = {
+      general: `TCP UDP port ${port} service protocol what is`,
+      risks: `port ${port} security vulnerabilities risks exploits CVE`,
+      uses: `port ${port} common uses applications purpose`
+    };
 
-    console.log(`[SearXNG] Searching for port ${port}...`);
+    const searchUrl = `${SEARXNG_URL}/search?q=${encodeURIComponent(queries[searchType] || queries.general)}&format=json&engines=${SEARXNG_ENGINES}`;
+
+    console.log(`[SearXNG] Searching ${searchType} for port ${port}...`);
 
     const urlObj = new URL(searchUrl);
     const options = {
@@ -919,35 +926,89 @@ async function searchPortWithSearXNG(port) {
 
             // Try to identify service name from title or content
             if (!description && result.content) {
-              description = result.content.slice(0, 200);
+              description = result.content.slice(0, 300);
             }
 
-            // Look for common patterns
+            // Look for common patterns - service identification
             if (content.includes('dns') || title.includes('dns')) {
               serviceName = 'dns';
-              commonUses.push('DNS queries', 'Name resolution');
+              if (!commonUses.includes('DNS queries')) commonUses.push('DNS queries', 'Name resolution');
             }
             if (content.includes('dhcp') || title.includes('dhcp')) {
               serviceName = 'dhcp';
-              commonUses.push('IP address assignment', 'Network configuration');
+              if (!commonUses.includes('IP address assignment')) commonUses.push('IP address assignment', 'Network configuration');
             }
             if (content.includes('http') || title.includes('http') || content.includes('web')) {
-              commonUses.push('Web services', 'HTTP traffic');
+              if (!commonUses.includes('Web services')) commonUses.push('Web services', 'HTTP traffic');
             }
             if (content.includes('streaming') || content.includes('media')) {
-              commonUses.push('Media streaming', 'Video/Audio');
+              if (!commonUses.includes('Media streaming')) commonUses.push('Media streaming', 'Video/Audio');
             }
             if (content.includes('gaming') || content.includes('game')) {
-              commonUses.push('Gaming', 'Online multiplayer');
+              if (!commonUses.includes('Gaming')) commonUses.push('Gaming', 'Online multiplayer');
             }
             if (content.includes('voip') || content.includes('sip')) {
-              commonUses.push('VoIP', 'Voice over IP');
+              if (!commonUses.includes('VoIP')) commonUses.push('VoIP', 'Voice over IP');
             }
             if (content.includes('vpn') || content.includes('tunnel')) {
-              commonUses.push('VPN', 'Secure tunneling');
+              if (!commonUses.includes('VPN')) commonUses.push('VPN', 'Secure tunneling');
             }
-            if (content.includes('vulnerability') || content.includes('exploit') || content.includes('security')) {
-              risks.push('Potential security concerns found');
+            if (content.includes('database') || content.includes('sql')) {
+              if (!commonUses.includes('Database')) commonUses.push('Database access', 'Data storage');
+            }
+            if (content.includes('email') || content.includes('mail') || content.includes('smtp')) {
+              if (!commonUses.includes('Email')) commonUses.push('Email services', 'Mail transfer');
+            }
+            if (content.includes('file') || content.includes('transfer')) {
+              if (!commonUses.includes('File transfer')) commonUses.push('File transfer', 'Data exchange');
+            }
+            if (content.includes('remote') || content.includes('desktop') || content.includes('access')) {
+              if (!commonUses.includes('Remote access')) commonUses.push('Remote access', 'Remote administration');
+            }
+
+            // Extract security risks from search results
+            if (content.includes('vulnerability') || content.includes('vulnerable')) {
+              risks.push('Known vulnerabilities exist');
+            }
+            if (content.includes('exploit') || content.includes('exploited')) {
+              risks.push('Active exploits reported');
+            }
+            if (content.includes('cve') || content.includes('cve-')) {
+              // Try to extract CVE IDs
+              const cveMatch = content.match(/cve-\d{4}-\d+/gi);
+              if (cveMatch) {
+                risks.push(`Related CVEs: ${cveMatch.slice(0, 3).join(', ').toUpperCase()}`);
+              }
+            }
+            if (content.includes('brute force') || content.includes('brute-force')) {
+              risks.push('Susceptible to brute force attacks');
+            }
+            if (content.includes('injection') || content.includes('xss') || content.includes('sql injection')) {
+              risks.push('Injection attack risks');
+            }
+            if (content.includes('denial of service') || content.includes('ddos') || content.includes('amplification')) {
+              risks.push('DoS/DDoS attack vector');
+            }
+            if (content.includes('unencrypted') || content.includes('cleartext') || content.includes('plaintext')) {
+              risks.push('Unencrypted/cleartext communication');
+            }
+            if (content.includes('authentication') && (content.includes('weak') || content.includes('bypass'))) {
+              risks.push('Authentication weaknesses');
+            }
+            if (content.includes('buffer overflow') || content.includes('overflow')) {
+              risks.push('Buffer overflow vulnerabilities');
+            }
+            if (content.includes('remote code execution') || content.includes('rce')) {
+              risks.push('Remote code execution risk');
+            }
+            if (content.includes('default') && (content.includes('password') || content.includes('credential'))) {
+              risks.push('Default credentials issue');
+            }
+            if (content.includes('man-in-the-middle') || content.includes('mitm')) {
+              risks.push('Man-in-the-middle attack risk');
+            }
+            if (content.includes('backdoor') || content.includes('malware')) {
+              risks.push('Potential backdoor/malware use');
             }
           }
 
@@ -956,12 +1017,17 @@ async function searchPortWithSearXNG(port) {
             commonUses.push('Network service', 'Application communication');
           }
 
-          console.log(`[SearXNG] ✓ Found info for port ${port}: ${serviceName}`);
+          // Default risks if none found
+          if (risks.length === 0 && searchType === 'risks') {
+            risks.push('Standard network service - review traffic patterns');
+          }
+
+          console.log(`[SearXNG] ✓ Found ${searchType} info for port ${port}: ${serviceName}, ${risks.length} risks, ${commonUses.length} uses`);
           resolve({
             service_name: serviceName,
             description: description || `Port ${port} - identified via web search`,
             common_uses: commonUses,
-            risks: risks.length > 0 ? risks : ['Standard network service - review traffic patterns'],
+            risks: risks,
             source: 'SearXNG Web Search'
           });
         } catch (e) {
@@ -990,66 +1056,63 @@ async function searchPortWithSearXNG(port) {
 async function getPortIntelligence(port) {
   const ianaInfo = IANA_PORTS[port];
 
+  // For IANA known ports - search SearXNG for risks and uses
   if (ianaInfo) {
-    // Add common uses based on service
-    const commonUsesMap = {
-      'ftp-data': ['File transfer', 'FTP data channel'],
-      'ftp': ['File transfer', 'FTP control'],
-      'ssh': ['Remote administration', 'Secure file transfer (SFTP)', 'Tunneling'],
-      'telnet': ['Legacy remote access', 'Device configuration'],
-      'smtp': ['Email sending', 'Mail relay'],
-      'dns': ['Domain name resolution', 'DNS queries'],
-      'dhcp': ['Automatic IP assignment', 'Network boot'],
-      'tftp': ['Simple file transfer', 'Network boot'],
-      'http': ['Web browsing', 'API services', 'Web applications'],
-      'pop3': ['Email retrieval', 'Mail client access'],
-      'ntp': ['Time synchronization', 'Clock sync'],
-      'rpc': ['Remote procedure calls', 'Windows services'],
-      'netbios-ns': ['Windows name resolution', 'NetBIOS'],
-      'netbios-dgm': ['Windows datagram service', 'NetBIOS'],
-      'netbios-ssn': ['Windows session service', 'NetBIOS'],
-      'imap': ['Email retrieval', 'Mail client access'],
-      'snmp': ['Network monitoring', 'Device management'],
-      'ldap': ['Directory services', 'Authentication'],
-      'https': ['Secure web browsing', 'API services', 'Web applications'],
-      'smb': ['File sharing', 'Printer sharing', 'Windows networking'],
-      'smtps': ['Secure email sending', 'Mail relay'],
-      'dhcpv6': ['IPv6 address assignment', 'IPv6 network config'],
-      'ldaps': ['Secure directory services', 'Secure authentication'],
-      'imaps': ['Secure email retrieval', 'Mail client access'],
-      'pop3s': ['Secure email retrieval', 'Mail client access'],
-      'mssql': ['Microsoft SQL Server', 'Database access'],
-      'oracle': ['Oracle Database', 'Database access'],
-      'ssdp': ['UPnP discovery', 'Device discovery'],
-      'mysql': ['MySQL Database', 'Database access'],
-      'rdp': ['Remote desktop', 'Windows remote access'],
-      'mdns': ['Bonjour/mDNS', 'Local name resolution', 'Apple services'],
-      'llmnr': ['Windows name resolution', 'Local network'],
-      'postgresql': ['PostgreSQL Database', 'Database access'],
-      'vnc': ['Remote desktop access', 'Screen sharing'],
-      'redis': ['In-memory database', 'Caching', 'Message broker'],
-      'http-proxy': ['Web proxy', 'Alternative HTTP port'],
-      'https-alt': ['Alternative HTTPS port', 'Web services'],
-      'elasticsearch': ['Search engine', 'Log analytics', 'Full-text search'],
-      'mongodb': ['MongoDB Database', 'NoSQL database'],
-    };
+    console.log(`[PortIntel] Port ${port} known as ${ianaInfo.name} - searching SearXNG for risks...`);
+
+    // Search SearXNG for security risks
+    const risksResult = await searchPortWithSearXNG(port, 'risks');
+    const usesResult = await searchPortWithSearXNG(port, 'uses');
+
+    // Combine SearXNG results with IANA base info
+    let commonUses = [];
+    let risks = [];
+    let description = ianaInfo.desc;
+    let source = 'IANA Port Registry';
+
+    if (usesResult) {
+      commonUses = usesResult.common_uses || [];
+      if (usesResult.description && usesResult.description.length > description.length) {
+        description = usesResult.description;
+      }
+      source = 'IANA + SearXNG Web Search';
+    }
+
+    if (risksResult) {
+      risks = risksResult.risks || [];
+      source = 'IANA + SearXNG Web Search';
+    }
+
+    // Fallback common uses if SearXNG didn't find any
+    if (commonUses.length === 0) {
+      commonUses = ['Network service', 'Application communication'];
+    }
+
+    // Fallback risks if SearXNG didn't find any
+    if (risks.length === 0) {
+      risks = ['Standard network service - review traffic patterns'];
+    }
+
+    console.log(`[PortIntel] ✓ Port ${port}: ${risks.length} risks, ${commonUses.length} uses found`);
 
     return {
       port: port,
       service_name: ianaInfo.name,
-      description: ianaInfo.desc,
+      description: description,
       secure_alternative: ianaInfo.secure,
-      common_uses: commonUsesMap[ianaInfo.name] || ['Network service'],
+      common_uses: commonUses,
+      risks: risks,
       risk: ianaInfo.risk,
-      reason: ianaInfo.desc,
+      reason: risks[0] || ianaInfo.desc,
       cve_id: null,
       cvss_score: null,
       cve_count: 0,
       all_cves: [],
-      source: 'IANA Port Registry',
+      source: source,
     };
   }
 
+  // Ephemeral ports - minimal SearXNG search
   if (port >= 49152 && port <= 65535) {
     return {
       port: port,
@@ -1057,6 +1120,7 @@ async function getPortIntelligence(port) {
       description: `Ephemeral port ${port} - client-side temporary connection`,
       secure_alternative: 'Usually client-side, low risk',
       common_uses: ['Client connections', 'Temporary connections', 'Outbound traffic'],
+      risks: ['Port scanning', 'Service fingerprinting', 'Application identification'],
       risk: 'LOW',
       reason: 'Ephemeral port - typically used for outbound client connections',
       cve_id: null,
@@ -1067,24 +1131,33 @@ async function getPortIntelligence(port) {
     };
   }
 
-  // Unknown port - search SearXNG
+  // Unknown port - search SearXNG for all info
   console.log(`[PortIntel] Unknown port ${port} - searching SearXNG...`);
-  const searxngResult = await searchPortWithSearXNG(port);
+  const [generalResult, risksResult] = await Promise.all([
+    searchPortWithSearXNG(port, 'general'),
+    searchPortWithSearXNG(port, 'risks')
+  ]);
 
-  if (searxngResult) {
+  if (generalResult || risksResult) {
+    const commonUses = generalResult?.common_uses || [];
+    const risks = risksResult?.risks || generalResult?.risks || [];
+    const description = generalResult?.description || `Port ${port} - identified via web search`;
+    const serviceName = generalResult?.service_name || 'unknown';
+
     return {
       port: port,
-      service_name: searxngResult.service_name,
-      description: searxngResult.description,
+      service_name: serviceName,
+      description: description,
       secure_alternative: 'Review traffic patterns and firewall rules',
-      common_uses: searxngResult.common_uses,
+      common_uses: commonUses.length > 0 ? commonUses : ['Network service'],
+      risks: risks.length > 0 ? risks : ['Unknown service - review carefully'],
       risk: 'MEDIUM',
-      reason: searxngResult.risks[0] || 'Unknown service - identified via web search',
+      reason: risks[0] || 'Unknown service - identified via web search',
       cve_id: null,
       cvss_score: null,
       cve_count: 0,
       all_cves: [],
-      source: searxngResult.source,
+      source: 'SearXNG Web Search',
     };
   }
 
@@ -1094,6 +1167,7 @@ async function getPortIntelligence(port) {
     description: `Port ${port} - unknown service`,
     secure_alternative: 'Investigate manually',
     common_uses: ['Unknown - requires manual investigation'],
+    risks: ['Unknown service', 'Potential backdoor', 'Manual investigation required'],
     risk: 'MEDIUM',
     reason: 'Unknown service - manual investigation recommended',
     cve_id: null,
@@ -1120,8 +1194,10 @@ RULES:
 • If you see suspicious patterns, explain WHY they're suspicious
 • For files/HTTP objects, list them with sizes and types
 • Format numbers with commas (e.g., "5,110 packets" not "5110")`;
-    
+
+    // Use OpenAI-compatible endpoint for better compatibility
     const postData = JSON.stringify({
+      model: CF_LLM_MODEL,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: prompt }
@@ -1129,14 +1205,12 @@ RULES:
       max_tokens: 800,
       stream: true
     });
-    
-    // URL-encode the model name (@ symbol and special chars)
-    const encodedModel = encodeURIComponent(CF_LLM_MODEL);
 
+    // OpenAI-compatible endpoint: /client/v4/accounts/{account_id}/ai/v1/chat/completions
     const options = {
       hostname: 'api.cloudflare.com',
       port: 443,
-      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${encodedModel}`,
+      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${CF_API_TOKEN}`,
@@ -1147,8 +1221,9 @@ RULES:
     };
 
     console.log(`[LLM-Stream] Starting streaming request to Cloudflare...`);
-    console.log(`[LLM-Stream] Model: ${CF_LLM_MODEL}, Encoded: ${encodedModel}`);
-    
+    console.log(`[LLM-Stream] Model: ${CF_LLM_MODEL}`);
+    console.log(`[LLM-Stream] Endpoint: /client/v4/accounts/.../ai/v1/chat/completions`);
+
     const corsHeaders = getCorsHeaders(origin);
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -1171,14 +1246,14 @@ RULES:
       
       let buffer = '';
       let fullResponse = '';
-      
+
       cfRes.on('data', (chunk) => {
         const text = chunk.toString();
         buffer += text;
-        
+
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
-        
+
         for (const line of lines) {
           if (line.startsWith('data: ')) {
             const data = line.slice(6).trim();
@@ -1188,9 +1263,11 @@ RULES:
             }
             try {
               const json = JSON.parse(data);
-              if (json.response) {
-                fullResponse += json.response;
-                res.write(`data: ${JSON.stringify({ token: json.response })}\n\n`);
+              // OpenAI-compatible format: choices[0].delta.content
+              const content = json.choices?.[0]?.delta?.content || json.response;
+              if (content) {
+                fullResponse += content;
+                res.write(`data: ${JSON.stringify({ token: content })}\n\n`);
               }
             } catch (e) { }
           }
@@ -1245,8 +1322,10 @@ RULES:
 • If you see suspicious patterns, explain WHY they're suspicious
 • For files/HTTP objects, list them with sizes and types
 • Format numbers with commas (e.g., "5,110 packets" not "5110")`;
-    
+
+    // Use OpenAI-compatible endpoint for better compatibility
     const postData = JSON.stringify({
+      model: CF_LLM_MODEL,
       messages: [
         { role: 'system', content: systemOverride || defaultSystem },
         { role: 'user', content: prompt }
@@ -1254,13 +1333,11 @@ RULES:
       max_tokens: 600
     });
 
-    // URL-encode the model name (@ symbol and special chars)
-    const encodedModel = encodeURIComponent(CF_LLM_MODEL);
-
+    // OpenAI-compatible endpoint: /client/v4/accounts/{account_id}/ai/v1/chat/completions
     const options = {
       hostname: 'api.cloudflare.com',
       port: 443,
-      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${encodedModel}`,
+      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${CF_API_TOKEN}`,
@@ -1271,7 +1348,7 @@ RULES:
     };
 
     console.log(`[LLM] Calling Cloudflare Workers AI: ${CF_LLM_MODEL}`);
-    
+
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
@@ -1282,12 +1359,14 @@ RULES:
             return resolve(null);
           }
           const json = JSON.parse(data);
-          
-          if (json.success && json.result?.response) {
-            console.log(`[LLM] ✓ Got response (${json.result.response.length} chars)`);
-            resolve(json.result.response);
+
+          // OpenAI-compatible format: choices[0].message.content
+          const content = json.choices?.[0]?.message?.content;
+          if (content) {
+            console.log(`[LLM] ✓ Got response (${content.length} chars)`);
+            resolve(content);
           } else {
-            console.error(`[LLM] Unexpected response format`);
+            console.error(`[LLM] Unexpected response format: ${JSON.stringify(json).slice(0, 200)}`);
             resolve(null);
           }
         } catch (e) {
@@ -1296,18 +1375,18 @@ RULES:
         }
       });
     });
-    
+
     req.on('error', (e) => {
       console.error(`[LLM] Request error: ${e.message}`);
       resolve(null);
     });
-    
+
     req.on('timeout', () => {
       req.destroy();
       console.error(`[LLM] Timeout after ${CF_LLM_TIMEOUT_MS}ms`);
       resolve(null);
     });
-    
+
     req.write(postData);
     req.end();
   });
@@ -1694,6 +1773,7 @@ const server = http.createServer(async (req, res) => {
           description: intel.description,
           secure_alternative: intel.secure_alternative,
           common_uses: intel.common_uses,
+          risks: intel.risks,
         };
       })
     );
@@ -1718,6 +1798,7 @@ const server = http.createServer(async (req, res) => {
         description: `${ephemeralPorts.length} ephemeral ports used for outbound connections`,
         secure_alternative: 'Client-side ports, typically low risk',
         common_uses: ['Client connections', 'Temporary connections', 'Outbound traffic'],
+        risks: ['Port scanning', 'Service fingerprinting', 'Application identification', 'Ephemeral port exhaustion'],
         source: 'IANA Port Registry',
         all_ports: portDetails, // ALL port numbers with their counts
         sample_ports: portList.slice(0, 10), // Keep sample for backward compatibility
