@@ -1411,8 +1411,9 @@ Here's **filename.jpg** pulled from the traffic:
 - Replace filename.jpg with the EXACT filename from HTTP OBJECTS (e.g. aspen.jpg), and size with the actual byte count.
 - The src must be literally IMAGE_URL_PLACEHOLDER:filename.jpg — do not change this format, do not add http://, do not make it a real URL. The frontend will resolve it automatically.
 - Every single time an image preview is requested, output the ![...](...) tag. Never substitute it with text like "(Extracted from HTTP traffic)" or "here's the preview" without the actual image tag.
-- If the user asks again, output the ![...](...) tag again. Never skip it.
-const userPrompt = `NETWORK DATA:
+- If the user asks again, output the ![...](...) tag again. Never skip it.`;
+
+    const userPrompt = `NETWORK DATA:
 ${fullContext}
 
 ${history ? `CONVERSATION HISTORY (last few messages for context):
