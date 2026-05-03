@@ -384,7 +384,7 @@ function getAllPorts(sessionId) {
     const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
     if (!fs.existsSync(pcapPath)) return resolve({});
     
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e tcp.dstport -e udp.dstport 2>/dev/null`;
+const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e tcp.srcport -e tcp.dstport -e udp.srcport -e udp.dstport 2>/dev/null`;
     
     console.log(`[TShark-Ports] Extracting all ports from PCAP...`);
     
@@ -398,12 +398,14 @@ function getAllPorts(sessionId) {
       const lines = stdout.trim().split('\n').filter(l => l.trim());
       
       for (const line of lines) {
-        const [tcpPort, udpPort] = line.split('\t');
-        const port = parseInt(tcpPort || udpPort);
-        if (port && port > 0) {
-          portCounts[port] = (portCounts[port] || 0) + 1;
-        }
-      }
+  const [tcpSrc, tcpDst, udpSrc, udpDst] = line.split('\t');
+  for (const p of [tcpSrc, tcpDst, udpSrc, udpDst]) {
+    const port = parseInt(p);
+    if (port && port > 0) {
+      portCounts[port] = (portCounts[port] || 0) + 1;
+    }
+  }
+}
       
       console.log(`[TShark-Ports] Found ${Object.keys(portCounts).length} unique ports from ${lines.length} packets`);
       resolve(portCounts);
