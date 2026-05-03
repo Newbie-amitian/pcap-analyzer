@@ -1318,12 +1318,14 @@ Respond with ONLY a JSON object (no markdown, no explanation):
             return resolve({ data_types: ['packets', 'protocols'], reasoning: 'Default fallback' });
           }
           const json = JSON.parse(data);
-          const content = json.choices?.[0]?.message?.content || '{}';
-          const parsed = JSON.parse(content);
-          console.log(`[LLM-Analyze] Need: ${parsed.data_types?.join(', ')}`);
-          resolve(parsed);
+const raw = json.choices?.[0]?.message?.content || '{}';
+// Strip markdown fences — Llama ignores response_format: json_object
+const clean = raw.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
+const parsed = JSON.parse(clean);
+console.log(`[LLM-Analyze] Need: ${parsed.data_types?.join(', ')}`);
+resolve(parsed);
         } catch (e) {
-          console.error(`[LLM-Analyze] Parse error: ${e.message}`);
+  console.error(`[LLM-Analyze] Parse error: ${e.message} | Raw: ${data.slice(0, 200)}`);
           resolve({ data_types: ['packets', 'protocols'], reasoning: 'Parse error fallback' });
         }
       });
