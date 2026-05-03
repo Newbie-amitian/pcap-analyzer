@@ -531,7 +531,7 @@ function getHttpRequests(sessionId, limit = 0) {
 
     // Use two separate tshark calls — one without -Y filter for host, one for method+uri
     // This avoids the http.request dissector crash on some pcaps
-    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e http.host -e http.request.method -e http.request.uri`;
+let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e frame.number -e http.host -e http.request.method -e http.request.uri`;
     if (limit > 0) cmd += ` -c ${limit}`;
     cmd += ' 2>/dev/null';
 
@@ -544,11 +544,13 @@ function getHttpRequests(sessionId, limit = 0) {
       const requests = [];
       const lines = stdout.trim().split('\n').filter(l => l.trim());
 
+      // AFTER:
       for (const line of lines) {
-        const [host, method, uri] = line.split('\t');
+        const [frameNum, host, method, uri] = line.split('\t');
         // Only include lines that have both a host and a method (actual HTTP requests)
         if (host && method) {
           requests.push({
+            frame_number: parseInt(frameNum) || null,
             host: host.trim(),
             method: method.trim() || 'GET',
             uri: uri ? uri.trim() : '/',
@@ -1387,7 +1389,8 @@ TONE RULES:
 - Keep it friendly and direct. You're a colleague, not a report generator.
 
 IMPORTANT CONTENT RULES:
-- When asked about "websites visited", "domains", or "sites accessed" — ALWAYS list ALL entries from the "ALL DOMAINS VISITED" section, not just HTTP requests. This includes DNS queries and HTTPS/TLS domains.
+- When asked about a SPECIFIC site or domain (e.g. "which packet has touropia"), answer ONLY about that site. Do NOT list all other domains unless explicitly asked.
+- When asked generally about "websites visited" or "domains", then list ALL entries from the "ALL DOMAINS VISITED" section.
 - When asked about downloaded files — list from the HTTP OBJECTS section.
 - Never limit your answer to just one data source when multiple are available.
 - When asked about protocols — ALWAYS include the packet count for each protocol from the PROTOCOLS section.
@@ -2050,7 +2053,9 @@ for (const s of tlsSni) if (s.server_name) allDomains.add(s.server_name);
 for (const r of httpRequests) if (r.host) allDomains.add(r.host);
 
 // All unique HTTP URIs
-const allUris = httpRequests.map(r => `${r.method} http://${r.host}${r.uri}`);
+const allUris = httpRequests.map(r =>
+  `#${r.frame_number || '?'} | ${r.method} http://${r.host}${r.uri}`
+);
 
 // Packets with numbers for lookup
 const packetList = packets.slice(0, 500).map(p =>
