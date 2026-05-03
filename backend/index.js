@@ -1926,8 +1926,15 @@ const [packets, protocols, ports, dnsQueries, tlsSni, httpObjects, httpRequests]
 ]);
 
       // Build comprehensive context
+// Build comprehensive context
       const contextSummary = `Total Packets: ${sessionData?.total_packets || packets.length}
+Protocols: ${Object.entries(protocols.protocols || {}).map(([p, c]) => `${p}(${c})`).join(', ')}
+Unique Ports: ${Object.keys(ports).length}
+DNS Queries: ${dnsQueries.length}
+TLS Domains: ${tlsSni.length}
+HTTP Objects: ${httpObjects.length}`;
 
+      // Step 1: Analyze prompt to decide what data is needed
       // Step 1: Analyze prompt to decide what data is needed
 const analysis = await analyzePromptForTshark(prompt, contextSummary);
 console.log(`[Agent-Stream] Analysis: ${analysis.reasoning}`);
