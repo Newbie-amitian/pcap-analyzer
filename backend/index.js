@@ -57,6 +57,8 @@ const b2 = new S3Client({
     accessKeyId: process.env.B2_KEY_ID,
     secretAccessKey: process.env.B2_APP_KEY,
   },
+  requestChecksumCalculation: 'WHEN_REQUIRED',
+  responseChecksumValidation: 'WHEN_REQUIRED',
 });
 
 async function downloadFromB2(b2Key, destPath) {
