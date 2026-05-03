@@ -1369,14 +1369,20 @@ async function callLLMStream(prompt, res, origin, fullContext) {
   return new Promise((resolve, reject) => {
 const systemPrompt = `You are a PCAP network traffic analyzer. Answer questions about the network capture data provided. Be concise and specific. Use **bold** for important findings.
 
-const systemPrompt = `You are a PCAP network traffic analyzer. Answer questions about the network capture data provided. Be concise and specific. Use **bold** for important findings.
-
 IMPORTANT RULES:
 - When asked about "websites visited", "domains", or "sites accessed" — ALWAYS list ALL entries from the "ALL DOMAINS VISITED" section, not just HTTP requests. This includes DNS queries and HTTPS/TLS domains.
 - When asked about downloaded files — list from the HTTP OBJECTS section.
 - Never limit your answer to just one data source when multiple are available.
 - When asked about protocols — ALWAYS include the packet count for each protocol from the PROTOCOLS section.
-- When asked about unencrypted or plain HTTP traffic — check the HTTP REQUESTS section. If there are any entries starting with "GET http://" or "POST http://" (not https), that IS unencrypted HTTP traffic. List those requests explicitly. Never say there is no HTTP traffic if the HTTP REQUESTS section has data.`;
+- When asked about unencrypted or plain HTTP traffic — check the HTTP REQUESTS section. If there are any entries starting with "GET http://" or "POST http://" (not https), that IS unencrypted HTTP traffic. List those requests explicitly. Never say there is no HTTP traffic if the HTTP REQUESTS section has data.
+
+FORMATTING RULES:
+- When a list has more than 8 items (domains, files, IPs, ports, protocols), ALWAYS use a markdown table instead of bullet points.
+- For domains/websites, ALWAYS group them into a markdown table where each COLUMN is a category and domains are listed downward under each column. Dynamically decide the category names based on what domains are present (e.g. "Visited Sites", "Microsoft Services", "Google Services", "Advertising/Tracking", "Content/Media", "Local/Network" — but adapt these to what actually exists in the data). Fill each column top to bottom. Leave cells empty when one column runs out before others. Never list domains as bullet points if there are more than 8. Always add a brief summary after the table.
+- For protocols, use columns: | Protocol | Packets |
+- For files downloaded, use columns: | Filename | Type | Size |
+- For IP addresses, use columns: | IP Address | Packets | Role |
+- Always add a brief summary sentence after the table.`;
     const userPrompt = `NETWORK DATA:
 ${fullContext}
 
