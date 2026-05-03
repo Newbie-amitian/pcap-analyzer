@@ -1210,7 +1210,7 @@ const server = http.createServer(async (req, res) => {
       // Get quick stats for immediate response
       const [quickTotal, quickProtos, quickDuration] = await Promise.all([
         getTruePacketCount(session_id),
-        getProtocolCounts(sessionId, 2000),
+        getProtocolCounts(session_id, 2000),
         new Promise((resolve) => {
           const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.time_relative 2>/dev/null | tail -1`;
           exec(cmd, { timeout: 10000 }, (err, stdout) => {
