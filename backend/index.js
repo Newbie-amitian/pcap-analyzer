@@ -80,6 +80,7 @@ if (!fs.existsSync(EXPORT_DIR)) fs.mkdirSync(EXPORT_DIR, { recursive: true });
 // ── Session store ──────────────────────────────────────────────
 const sessions = new Map();
 const imageStore = new Map();
+const portIntelCache = new Map(); // Cache for port intelligence
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 // ── Session Recovery ───────────────────────────────────────────
@@ -113,6 +114,7 @@ setInterval(() => {
       try { const p = path.join(EXPORT_DIR, id); if (fs.existsSync(p)) fs.rmSync(p, { recursive: true }); } catch (_) { }
       sessions.delete(id);
       imageStore.delete(id);
+      portIntelCache.delete(id);
       console.log(`[Session] Expired: ${id}`);
     }
   }
@@ -849,14 +851,18 @@ const IANA_PORTS = {
   443: { name: 'https', desc: 'HTTP Secure', risk: 'LOW', secure: 'Already secure' },
   445: { name: 'smb', desc: 'Server Message Block', risk: 'HIGH', secure: 'VPN only' },
   465: { name: 'smtps', desc: 'SMTP Secure', risk: 'LOW', secure: 'Already secure' },
+  547: { name: 'dhcpv6', desc: 'DHCPv6 Server', risk: 'LOW', secure: 'N/A' },
   587: { name: 'smtp-msa', desc: 'SMTP Message Submission', risk: 'MEDIUM', secure: 'STARTTLS' },
   636: { name: 'ldaps', desc: 'LDAP Secure', risk: 'LOW', secure: 'Already secure' },
   993: { name: 'imaps', desc: 'IMAP Secure', risk: 'LOW', secure: 'Already secure' },
   995: { name: 'pop3s', desc: 'POP3 Secure', risk: 'LOW', secure: 'Already secure' },
   1433: { name: 'mssql', desc: 'Microsoft SQL Server', risk: 'HIGH', secure: 'Encrypt connections' },
   1521: { name: 'oracle', desc: 'Oracle Database', risk: 'HIGH', secure: 'Encrypt connections' },
+  1900: { name: 'ssdp', desc: 'Simple Service Discovery Protocol (UPnP)', risk: 'MEDIUM', secure: 'Disable UPnP if unused' },
   3306: { name: 'mysql', desc: 'MySQL Database', risk: 'HIGH', secure: 'Bind localhost + TLS' },
   3389: { name: 'rdp', desc: 'Remote Desktop Protocol', risk: 'HIGH', secure: 'VPN + NLA' },
+  5353: { name: 'mdns', desc: 'Multicast DNS (Bonjour/mDNS)', risk: 'LOW', secure: 'Disable if unused' },
+  5355: { name: 'llmnr', desc: 'Link-Local Multicast Name Resolution', risk: 'MEDIUM', secure: 'Disable if unused' },
   5432: { name: 'postgresql', desc: 'PostgreSQL Database', risk: 'HIGH', secure: 'Bind localhost + TLS' },
   5900: { name: 'vnc', desc: 'Virtual Network Computing', risk: 'HIGH', secure: 'VPN + SSH tunnel' },
   6379: { name: 'redis', desc: 'Redis Database', risk: 'HIGH', secure: 'Bind localhost + AUTH' },
@@ -971,9 +977,13 @@ RULES:
     
     const req = https.request(options, (cfRes) => {
       if (cfRes.statusCode !== 200) {
-        console.error(`[LLM-Stream] Error ${cfRes.statusCode}`);
-        res.write(`data: ${JSON.stringify({ error: 'LLM request failed' })}\n\n`);
-        res.end();
+        let errorBody = '';
+        cfRes.on('data', chunk => errorBody += chunk);
+        cfRes.on('end', () => {
+          console.error(`[LLM-Stream] Error ${cfRes.statusCode}: ${errorBody.slice(0, 500)}`);
+          res.write(`data: ${JSON.stringify({ error: `LLM error: ${cfRes.statusCode}` })}\n\n`);
+          res.end();
+        });
         return resolve(null);
       }
       
@@ -1456,16 +1466,37 @@ const server = http.createServer(async (req, res) => {
       return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
     }
 
+    // Check cache first
+    const cached = portIntelCache.get(q.session_id);
+    if (cached) {
+      console.log(`[PortIntel] Returning cached results for ${q.session_id}`);
+      return respond(cached);
+    }
+
     // Get ports directly
     const portCounts = await getAllPorts(q.session_id);
     const portEntries = Object.entries(portCounts);
     console.log(`[PortIntel] Analyzing ${portEntries.length} unique ports`);
     
-    const alerts = await Promise.all(
-      portEntries.map(async ([port, count]) => {
-        const intel = await getPortIntelligence(parseInt(port));
+    // Separate ephemeral ports from service ports
+    const ephemeralPorts = [];
+    const servicePorts = [];
+    
+    for (const [port, count] of portEntries) {
+      const portNum = parseInt(port);
+      if (portNum >= 49152 && portNum <= 65535) {
+        ephemeralPorts.push({ port: portNum, count });
+      } else {
+        servicePorts.push({ port: portNum, count });
+      }
+    }
+    
+    // Get intelligence for service ports
+    const serviceAlerts = await Promise.all(
+      servicePorts.map(async ({ port, count }) => {
+        const intel = await getPortIntelligence(port);
         return {
-          port: parseInt(port),
+          port,
           count,
           risk: intel.risk,
           reason: intel.reason,
@@ -1482,18 +1513,50 @@ const server = http.createServer(async (req, res) => {
       })
     );
     
+    // Group ephemeral ports into a single entry
+    const alerts = [...serviceAlerts];
+    
+    if (ephemeralPorts.length > 0) {
+      const totalEphemeralPackets = ephemeralPorts.reduce((sum, p) => sum + p.count, 0);
+      const portList = ephemeralPorts.map(p => p.port).sort((a, b) => a - b);
+      
+      alerts.push({
+        port: 'ephemeral',
+        port_range: { min: portList[0], max: portList[portList.length - 1] },
+        port_count: ephemeralPorts.length,
+        count: totalEphemeralPackets,
+        risk: 'LOW',
+        reason: 'Ephemeral ports (49152-65535) are used for outbound client connections',
+        service_name: 'ephemeral',
+        description: `${ephemeralPorts.length} ephemeral ports used for outbound connections`,
+        secure_alternative: 'Client-side ports, typically low risk',
+        common_uses: ['Client connections', 'Temporary connections', 'Outbound traffic'],
+        source: 'IANA Port Registry',
+        sample_ports: portList.slice(0, 10),
+      });
+    }
+    
     const summary = { critical: 0, high: 0, medium: 0, low: 0 };
     for (const a of alerts) {
       const r = a.risk.toLowerCase();
       if (summary[r] !== undefined) summary[r]++;
     }
     
-    return respond({ 
+    const result = { 
       alerts, 
       summary,
       total_ports: portEntries.length,
-      timestamp: new Date().toISOString()
-    });
+      service_ports: servicePorts.length,
+      ephemeral_ports: ephemeralPorts.length,
+      timestamp: new Date().toISOString(),
+      cached: false
+    };
+    
+    // Cache the results
+    portIntelCache.set(q.session_id, { ...result, cached: true });
+    console.log(`[PortIntel] Cached results for ${q.session_id}`);
+    
+    return respond(result);
   }
 
   // ── Agent STREAMING endpoint ────────────────────────────────
