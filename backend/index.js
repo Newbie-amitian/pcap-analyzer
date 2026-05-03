@@ -1405,10 +1405,15 @@ IMAGE PREVIEW RULES:
   ![filename.jpg](IMAGE_URL_PLACEHOLDER:filename.jpg)
   *(Extracted from HTTP traffic — file size: X bytes)*
 - Never say you "cannot show" or "don't have access to" images. You can always show them using the format above.`
-    const userPrompt = `NETWORK DATA:
+const userPrompt = `NETWORK DATA:
 ${fullContext}
-QUESTION: ${prompt}
-Answer based on the data above:`;
+
+${history ? `CONVERSATION HISTORY (last few messages for context):
+${history}
+
+` : ''}CURRENT QUESTION: ${prompt}
+
+Answer based on the data and conversation history above:`;
 
     const postData = JSON.stringify({
       model: CF_LLM_MODEL,
@@ -1916,7 +1921,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await parseBody(req);
       const parsed = JSON.parse(body.toString());
-      const { prompt, session_id } = parsed || {};
+const { prompt, session_id, history } = parsed || {};
 
       if (!isValidSessionId(session_id)) {
         res.writeHead(400, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
