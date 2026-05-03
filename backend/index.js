@@ -1386,17 +1386,25 @@ IMPORTANT CONTENT RULES:
 - When asked about unencrypted or plain HTTP traffic — check the HTTP REQUESTS section. If there are any entries starting with "GET http://" or "POST http://" (not https), that IS unencrypted HTTP traffic. List those requests explicitly. Never say there is no HTTP traffic if the HTTP REQUESTS section has data.
 
 FORMATTING RULES:
-- When a list has more than 8 items (domains, files, IPs, ports, protocols), ALWAYS use a markdown table instead of bullet points.
-- For domains/websites, use ### for each category heading, then a plain comma-separated list of domains on the next line. No bullet points, no bold, no links, no tables:
+- NEVER use markdown tables. They do not render properly. Use plain text formatting only.
+- For files/objects, list them like this:
+  📄 **filename.jpg** — image/jpeg — 168480 bytes
+- For IP addresses, list them like this:
+  🖥 **192.168.1.1** — 240 packets — Client
+- For domains/websites, use ### for each category heading, then a plain comma-separated list on the next line:
   ### Microsoft Services
   site1.com, site2.com, site3.com
   ### Google Services
   site4.com, site5.com
-  Dynamically decide category names based on actual domains present (e.g. "Microsoft Services", "Google Services", "Advertising/Tracking", "Content/Media", "Local/Network"). Put EVERY domain into exactly one category. Never use bullet points or markdown tables for domains. Always add a brief summary sentence after the domain list.
-- For files downloaded, use columns: | Filename | Type | Size |
-- For IP addresses, use columns: | IP Address | Packets | Role |
-- Always add a brief summary sentence after any table.
-- Use **bold** for important findings or anything worth flagging.`;
+  Dynamically decide category names. Put EVERY domain in exactly one category. Never use bullet points or tables for domains. Always add a brief summary sentence after.
+- Use **bold** for important findings or anything worth flagging.
+
+IMAGE PREVIEW RULES:
+- If the user asks to "see", "show", "preview", or "display" an image/file from the HTTP OBJECTS section, respond with ONLY this exact markdown and nothing else (no table, no extra text before it):
+  Here's the preview of **filename.jpg**:
+  ![filename.jpg](IMAGE_URL_PLACEHOLDER:filename.jpg)
+  *(Extracted from HTTP traffic — file size: X bytes)*
+- Never say you "cannot show" or "don't have access to" images. You can always show them using the format above.`
     const userPrompt = `NETWORK DATA:
 ${fullContext}
 QUESTION: ${prompt}
