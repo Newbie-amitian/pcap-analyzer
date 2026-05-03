@@ -1369,10 +1369,14 @@ async function callLLMStream(prompt, res, origin, fullContext) {
   return new Promise((resolve, reject) => {
 const systemPrompt = `You are a PCAP network traffic analyzer. Answer questions about the network capture data provided. Be concise and specific. Use **bold** for important findings.
 
+const systemPrompt = `You are a PCAP network traffic analyzer. Answer questions about the network capture data provided. Be concise and specific. Use **bold** for important findings.
+
 IMPORTANT RULES:
 - When asked about "websites visited", "domains", or "sites accessed" — ALWAYS list ALL entries from the "ALL DOMAINS VISITED" section, not just HTTP requests. This includes DNS queries and HTTPS/TLS domains.
 - When asked about downloaded files — list from the HTTP OBJECTS section.
-- Never limit your answer to just one data source when multiple are available.`;
+- Never limit your answer to just one data source when multiple are available.
+- When asked about protocols — ALWAYS include the packet count for each protocol from the PROTOCOLS section.
+- When asked about unencrypted or plain HTTP traffic — check the HTTP REQUESTS section. If there are any entries starting with "GET http://" or "POST http://" (not https), that IS unencrypted HTTP traffic. List those requests explicitly. Never say there is no HTTP traffic if the HTTP REQUESTS section has data.`;
     const userPrompt = `NETWORK DATA:
 ${fullContext}
 
@@ -1929,14 +1933,20 @@ const sessionData = sessions.get(session_id);
 
 // Get ALL data types for comprehensive context
 // Get ALL data types for comprehensive context
+// ── Per-session data cache ──────────────────────────────────
+if (!sessions.get(session_id)._cache) {
+  sessions.get(session_id)._cache = {};
+}
+const cache = sessions.get(session_id)._cache;
+
 const [packets, protocols, ports, dnsQueries, tlsSni, httpObjects, httpRequests] = await Promise.all([
-  runTshark(session_id, '', DEFAULT_FIELDS, 500),
-  getProtocolCounts(session_id, 0),
-  getAllPorts(session_id),
-  getDnsQueries(session_id),
-  getTlsSni(session_id),
-  getHttpObjects(session_id),
-  getHttpRequests(session_id),
+  cache.packets    || runTshark(session_id, '', DEFAULT_FIELDS, 500).then(r => { cache.packets = r; return r; }),
+  cache.protocols  || getProtocolCounts(session_id, 0).then(r => { cache.protocols = r; return r; }),
+  cache.ports      || getAllPorts(session_id).then(r => { cache.ports = r; return r; }),
+  cache.dnsQueries || getDnsQueries(session_id).then(r => { cache.dnsQueries = r; return r; }),
+  cache.tlsSni     || getTlsSni(session_id).then(r => { cache.tlsSni = r; return r; }),
+  cache.httpObjects|| getHttpObjects(session_id).then(r => { cache.httpObjects = r; return r; }),
+  cache.httpRequests||getHttpRequests(session_id).then(r => { cache.httpRequests = r; return r; }),
 ]);
 
       // Build comprehensive context
