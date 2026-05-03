@@ -49,7 +49,7 @@ console.log(`   ALLOWED_ORIGIN = ${ALLOWED_ORIGIN}`);
 // ═══════════════════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════════════════
-const CF_LLM_MODEL = '@cf/meta/llama-3-8b-instruct';
+const CF_LLM_MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct';
 const CF_LLM_TIMEOUT_MS = 30000; // Increased for 2-step process
 const SEARXNG_TIMEOUT_MS = 10000;
 const SEARXNG_MAX_RESULTS = 5;
