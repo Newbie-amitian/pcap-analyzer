@@ -1105,201 +1105,105 @@ function callGroqLLMStream(messages, res) {
   });
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// TSHARK - FULL PROTOCOL EXTRACTION (Single Pass, All Protocols)
-// ═══════════════════════════════════════════════════════════════════
-// Step 1: get protocols actually present in this pcap
-function getPcapProtocols(pcapPath) {
-  return new Promise((resolve, reject) => {
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.protocols`;
-    exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return reject(new Error(`TShark protocol detection failed: ${err.message}`));
-      const protocols = new Set();
-      for (const line of stdout.trim().split('\n')) {
-        for (const proto of line.split(':')) {
-          if (proto.trim()) protocols.add(proto.trim().toLowerCase());
-        }
-      }
-      // always keep base fields
-      protocols.add('frame');
-      protocols.add('ip');
-      protocols.add('tcp');
-      protocols.add('udp');
-      console.log(`[TShark] Protocols in pcap: ${[...protocols].join(', ')}`);
-      resolve(protocols);
-    });
-  });
-}
-
-// Step 2: get all fields tshark supports for those protocols
-function getTSharkFieldsForProtocols(protocols) {
-  return new Promise((resolve, reject) => {
-    exec(`"${TSHARK_BIN}" -G fields`, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return reject(new Error(`TShark -G fields failed: ${err.message}`));
-
-      // always include these regardless of protocol detection
-      const BASE_FIELDS = [
-        'frame.number', 'frame.time_epoch', 'frame.len',
-        'ip.src', 'ip.dst', 'ip.proto',
-        'tcp.srcport', 'tcp.dstport', 'tcp.flags',
-        'udp.srcport', 'udp.dstport',
-        '_ws.col.Protocol', '_ws.col.Info',
-      ];
-
-      const fields = new Set(BASE_FIELDS);
-
- // Expand protocol names to handle mismatches between frame.protocols output
-            const expandedProtocols = new Set(protocols);
-
-
-    // DEBUG: sample what tshark -G fields actually looks like
-      const sampleLines = stdout.split('\n').filter(l => l.startsWith('F')).slice(0, 5);
-      console.log(`[TShark DEBUG] expandedProtocols: ${[...expandedProtocols].join(', ')}`);
-      console.log(`[TShark DEBUG] sample -G fields lines:\n${sampleLines.join('\n')}`);
-
-      for (const line of stdout.split('\n')) {
-        const parts = line.split('\t');
-        if (parts[0] !== 'F') continue;
-        const fieldName = parts[2];
-        const fieldProtocol = parts[4]?.toLowerCase();
-        if (fieldName && fieldProtocol && expandedProtocols.has(fieldProtocol)) {
-          fields.add(fieldName);
-        }
-      }
-
-      console.log(`[TShark] ${fields.size} fields matched for detected protocols`);
-      resolve([...fields]);
-    });
-  });
-}
-
 // Step 3: run extraction + bucket by protocol prefix dynamically
 function runTShark(pcapPath) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      // 1. detect protocols in pcap
-      const protocols = await getPcapProtocols(pcapPath);
+  return new Promise((resolve, reject) => {
+    const { spawn } = require('child_process');
+    const args = [
+      '-r', pcapPath,
+      '-T', 'json',
+      '--no-duplicate-keys',
+    ];
 
-      // 2. get fields for those protocols from tshark itself
-      const fields = await getTSharkFieldsForProtocols(protocols);
+    let stdout = '';
+    let stderr = '';
+    const proc = spawn(TSHARK_BIN, args);
+    console.log(`[TShark] Spawned PID: ${proc.pid} — JSON mode (fully dynamic, no field list)`);
 
-      // 3. run extraction — use spawn to avoid shell arg length limits with 4000+ fields
-      const { spawn } = require('child_process');
-      const args = [
-        '-r', pcapPath,
-        '-T', 'fields',
-        '-E', 'header=y',
-        '-E', 'separator=\t',
-        '-E', 'quote=n',
-        ...fields.flatMap(f => ['-e', f])
-      ];
+    const killTimer = setTimeout(() => {
+      console.error(`[TShark] TIMEOUT 120s — killing PID ${proc.pid}. stderr: ${stderr.slice(0, 500)}`);
+      proc.kill('SIGKILL');
+      reject(new Error('TShark timed out after 120s'));
+    }, 120000);
 
-let stdout = '';
-      let stderr = '';
-      const proc = spawn(TSHARK_BIN, args);
-      console.log(`[TShark] Spawned PID: ${proc.pid}, fields: ${fields.length}`);
+    proc.stdout.on('data', chunk => {
+      if (stdout.length === 0) console.log('[TShark] First stdout chunk received');
+      stdout += chunk.toString();
+    });
+    proc.stderr.on('data', chunk => stderr += chunk.toString());
+    proc.on('error', err => { clearTimeout(killTimer); reject(new Error(`TShark spawn failed: ${err.message}`)); });
+    proc.on('close', (code) => {
+      clearTimeout(killTimer);
+      if (code !== 0 && code !== null) return reject(new Error(`TShark exited ${code}: ${stderr}`));
 
-      const killTimer = setTimeout(() => {
-        console.error(`[TShark] TIMEOUT 120s — killing PID ${proc.pid}. stderr: ${stderr.slice(0, 500)}`);
-        proc.kill('SIGKILL');
-        reject(new Error('TShark timed out after 120s'));
-      }, 120000);
+      let rawPackets;
+      try {
+        rawPackets = JSON.parse(stdout);
+      } catch (e) {
+        return reject(new Error(`TShark JSON parse failed: ${e.message}`));
+      }
+      if (!Array.isArray(rawPackets) || rawPackets.length === 0) return resolve({ packets: [] });
 
-      proc.stdout.on('data', chunk => {
-        if (stdout.length === 0) console.log('[TShark] First stdout chunk received — process is running');
-        stdout += chunk.toString();
-      });
-      proc.stderr.on('data', chunk => stderr += chunk.toString());
-      proc.on('error', err => { clearTimeout(killTimer); reject(new Error(`TShark spawn failed: ${err.message}`)); });
-      proc.on('close', (code) => {
-        clearTimeout(killTimer);
-        if (code !== 0 && code !== null) return reject(new Error(`TShark exited ${code}: ${stderr}`));
-        const lines = stdout.trim().split('\n');
-        if (lines.length < 2) return resolve({});
+      const SKIP_PROTOS = new Set(['frame', 'ip', 'ipv6', 'tcp', 'udp', '_ws', 'eth']);
 
-        // 4. build column index from header row tshark gives us
-        const headers = lines[0].split('\t');
-        const col = {};
-        for (let i = 0; i < headers.length; i++) col[headers[i]] = i;
-        const g = (row, field) => row[col[field]] || '';
+      const buckets = {};
+      const packets = [];
 
-        // 5. bucket rows dynamically by protocol prefix — no hardcoded ifs
-        const buckets = {};
-        // group fields by their protocol prefix (e.g. 'dns', 'http', 'smb2')
-        const protocolFields = {};
-        for (const field of fields) {
-          const parts = field.split('.');
-          if (parts.length < 2) continue;
-          const proto = parts[0];
-          if (!protocolFields[proto]) protocolFields[proto] = [];
-          protocolFields[proto].push(field);
-        }
+      for (const rawPkt of rawPackets) {
+        const layers = rawPkt._source?.layers || {};
 
-        // skip base fields from bucketing
-        const SKIP_PROTOS = new Set(['frame', 'ip', 'tcp', 'udp', '_ws']);
+        const gv = (field) => {
+          const val = layers[field];
+          if (Array.isArray(val)) return val[0] || '';
+          return val || '';
+        };
 
-        const packets = [];
+        const pkt = {
+          frame_number: parseInt(gv('frame.number')) || 0,
+          timestamp:    parseFloat(gv('frame.time_epoch')) || 0,
+          length:       parseInt(gv('frame.len')) || 0,
+          src_ip:       gv('ip.src') || gv('ipv6.src'),
+          dst_ip:       gv('ip.dst') || gv('ipv6.dst'),
+          ip_proto:     gv('ip.proto'),
+          src_port:     parseInt(gv('tcp.srcport')) || parseInt(gv('udp.srcport')) || 0,
+          dst_port:     parseInt(gv('tcp.dstport')) || parseInt(gv('udp.dstport')) || 0,
+          tcp_flags:    gv('tcp.flags'),
+          protocol:     gv('_ws.col.Protocol'),
+          info:         gv('_ws.col.Info'),
+        };
+        packets.push(pkt);
 
-        for (let i = 1; i < lines.length; i++) {
-          const line = lines[i];
-          if (!line.trim()) continue;
-          const c = line.split('\t');
+        // Dynamically bucket by protocol — driven entirely by what fields exist in this packet
+        const seenProtos = new Set();
+        for (const fieldName of Object.keys(layers)) {
+          const proto = fieldName.split('.')[0];
+          if (SKIP_PROTOS.has(proto) || seenProtos.has(proto)) continue;
+          seenProtos.add(proto);
 
-          // always build base packet object
-          const pkt = {
-            frame_number: parseInt(g(c, 'frame.number')) || 0,
-            timestamp:    parseFloat(g(c, 'frame.time_epoch')) || 0,
-            length:       parseInt(g(c, 'frame.len')) || 0,
-            src_ip:       g(c, 'ip.src'),
-            dst_ip:       g(c, 'ip.dst'),
-            ip_proto:     g(c, 'ip.proto'),
-            src_port:     parseInt(g(c, 'tcp.srcport')) || parseInt(g(c, 'udp.srcport')) || 0,
-            dst_port:     parseInt(g(c, 'tcp.dstport')) || parseInt(g(c, 'udp.dstport')) || 0,
-            tcp_flags:    g(c, 'tcp.flags'),
-            protocol:     g(c, '_ws.col.Protocol'),
-            info:         g(c, '_ws.col.Info'),
+          const entry = {
+            src_ip: pkt.src_ip,
+            dst_ip: pkt.dst_ip,
+            src_port: pkt.src_port,
+            dst_port: pkt.dst_port,
+            timestamp: pkt.timestamp,
           };
-          packets.push(pkt);
 
-          // dynamically bucket by protocol — driven by field names, zero hardcoding
-          for (const [proto, protoFields] of Object.entries(protocolFields)) {
-            if (SKIP_PROTOS.has(proto)) continue;
-
-            // check if any field for this protocol has a value in this row
-            const entry = {};
-            let hasData = false;
-            for (const field of protoFields) {
-              const val = g(c, field);
-              if (val) hasData = true;
-              // field.name.subname → name_subname as key
-              const key = field.split('.').slice(1).join('_');
-              entry[key] = val;
-            }
-
-            if (hasData) {
-              if (!buckets[proto]) buckets[proto] = [];
-              buckets[proto].push({
-                ...entry,
-                src_ip: pkt.src_ip,
-                dst_ip: pkt.dst_ip,
-                src_port: pkt.src_port,
-                dst_port: pkt.dst_port,
-                timestamp: pkt.timestamp,
-              });
-            }
+          for (const [k, v] of Object.entries(layers)) {
+            if (!k.startsWith(proto + '.')) continue;
+            const key = k.slice(proto.length + 1).replace(/\./g, '_');
+            entry[key] = Array.isArray(v) ? v[0] : (v || '');
           }
+
+          if (!buckets[proto]) buckets[proto] = [];
+          buckets[proto].push(entry);
         }
+      }
 
-        console.log(`[TShark] Extracted packets: ${packets.length}, protocol buckets: ${Object.keys(buckets).join(', ')}`);
-        resolve({ packets, ...buckets });
-      });
-
-    } catch (e) {
-      reject(e);
-    }
+      console.log(`[TShark] Extracted packets: ${packets.length}, protocol buckets: ${Object.keys(buckets).join(', ')}`);
+      resolve({ packets, ...buckets });
+    });
   });
-}
-// ═══════════════════════════════════════════════════════════════════
+}// ═══════════════════════════════════════════════════════════════════
 // MINISEARCH - Port Index Builder
 // Used ONLY for unknown ports (outside the 45 hardcoded protocols)
 // ═══════════════════════════════════════════════════════════════════
