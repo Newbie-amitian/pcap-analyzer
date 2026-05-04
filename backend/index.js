@@ -1188,13 +1188,25 @@ function runTShark(pcapPath) {
       // 2. get fields for those protocols from tshark itself
       const fields = await getTSharkFieldsForProtocols(protocols);
 
-      // 3. run extraction
-      const fieldArgs = fields.map(f => `-e ${f}`).join(' ');
-      const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E header=y -E separator=\\t -E quote=n ${fieldArgs}`;
+      // 3. run extraction — use spawn to avoid shell arg length limits with 4000+ fields
+      const { spawn } = require('child_process');
+      const args = [
+        '-r', pcapPath,
+        '-T', 'fields',
+        '-E', 'header=y',
+        '-E', 'separator=\t',
+        '-E', 'quote=n',
+        ...fields.flatMap(f => ['-e', f])
+      ];
 
-      exec(cmd, { maxBuffer: 200 * 1024 * 1024 }, (err, stdout) => {
-        if (err) return reject(new Error(`TShark failed: ${err.message}`));
-
+      let stdout = '';
+      let stderr = '';
+      const proc = spawn(TSHARK_BIN, args, { timeout: 120000 });
+      proc.stdout.on('data', chunk => stdout += chunk.toString());
+      proc.stderr.on('data', chunk => stderr += chunk.toString());
+      proc.on('error', err => reject(new Error(`TShark spawn failed: ${err.message}`)));
+      proc.on('close', (code) => {
+        if (code !== 0) return reject(new Error(`TShark exited ${code}: ${stderr}`));
         const lines = stdout.trim().split('\n');
         if (lines.length < 2) return resolve({});
 
