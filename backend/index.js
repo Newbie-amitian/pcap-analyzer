@@ -1166,7 +1166,7 @@ function getTSharkFieldsForProtocols(protocols) {
         const parts = line.split('\t');
         if (parts[0] !== 'F') continue;
         const fieldName = parts[2];
-        const fieldProtocol = parts[3]?.toLowerCase();
+        const fieldProtocol = parts[4]?.toLowerCase();
         if (fieldName && fieldProtocol && expandedProtocols.has(fieldProtocol)) {
           fields.add(fieldName);
         }
