@@ -1472,9 +1472,13 @@ async function exportHttpObjects(sessionId, pcapPath) {
     if (!fs.existsSync(typeDir)) fs.mkdirSync(typeDir, { recursive: true });
 
     const proc = spawn(TSHARK_BIN, [
-      '-r', pcapPath,
-      '--export-objects', `${type},${typeDir}`,
-    ]);
+  '-r', pcapPath,
+  '--export-objects', `${type},${typeDir}`,
+  '--no-duplicate-keys',
+  '-o', 'console.log.level:warning',
+], {
+  env: { ...process.env, WIRESHARK_RUN_FROM_BUILD: '1' }
+});
 
     let stderr = '';
     proc.stderr.on('data', chunk => stderr += chunk.toString());
