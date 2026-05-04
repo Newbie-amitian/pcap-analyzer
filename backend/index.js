@@ -12,9 +12,11 @@ const zlib = require('zlib');
 // ═══════════════════════════════════════════════════════════════════
 const SEARXNG_URL = process.env.SEARXNG_URL;
 
-// Cloudflare Workers AI credentials
-const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
-const CF_API_TOKEN = process.env.CF_API_TOKEN;
+// Google Gemini AI
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const GEMINI_MODEL = 'gemini-2.0-flash';
 
 // ALLOWED_ORIGIN: Your frontend URL (default: localhost for local dev)
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
@@ -22,8 +24,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
 // Validate required env vars on startup
 const missingVars = [];
 if (!SEARXNG_URL) missingVars.push('SEARXNG_URL');
-if (!CF_ACCOUNT_ID) missingVars.push('CF_ACCOUNT_ID');
-if (!CF_API_TOKEN) missingVars.push('CF_API_TOKEN');
+if (!GEMINI_API_KEY) missingVars.push('GEMINI_API_KEY');
 
 if (missingVars.length > 0) {
   console.error('═══════════════════════════════════════════════════════════════');
@@ -42,8 +43,7 @@ if (missingVars.length > 0) {
 
 console.log('✅ Environment variables loaded:');
 console.log(`   SEARXNG_URL    = ${SEARXNG_URL}`);
-console.log(`   CF_ACCOUNT_ID  = ${CF_ACCOUNT_ID}`);
-console.log(`   CF_API_TOKEN   = ${CF_API_TOKEN ? CF_API_TOKEN.slice(0, 10) + '...' : 'NOT SET'}`);
+console.log(`   GEMINI_API_KEY = ${GEMINI_API_KEY ? GEMINI_API_KEY.slice(0, 10) + '...' : 'NOT SET'}`);
 console.log(`   ALLOWED_ORIGIN = ${ALLOWED_ORIGIN}`);
 
 // ── Backblaze B2 Client (S3-compatible) ───────────────────────
@@ -91,8 +91,6 @@ async function deleteFromB2(b2Key) {
 // ═══════════════════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════════════════
-const CF_LLM_MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct';
-const CF_LLM_TIMEOUT_MS = 30000; // Increased for 2-step process
 const SEARXNG_TIMEOUT_MS = 10000;
 const SEARXNG_MAX_RESULTS = 5;
 const SEARXNG_ENGINES = 'google,bing,duckduckgo,startpage';
@@ -1348,8 +1346,9 @@ async function getEphemeralPortIntelligence(ephemeralPorts) {
 
 // Step 1: Analyze prompt to decide what TShark command to run
 async function analyzePromptForTshark(prompt, contextSummary) {
-  return new Promise((resolve) => {
-   const analysisPrompt = `You are a PCAP network analysis assistant. Classify the user's message and decide what to do.
+  try {
+    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+    const analysisPrompt = `You are a PCAP network analysis assistant. Classify the user's message and decide what to do.
 
 AVAILABLE DATA TYPES:
 - packets: Basic packet list (src_ip, dst_ip, protocol, ports, info)
@@ -1379,81 +1378,33 @@ Respond with ONLY a JSON object (no markdown, no explanation):
   "reasoning": "brief explanation"
 }`;
 
-    const postData = JSON.stringify({
-      model: CF_LLM_MODEL,
-      messages: [
-        { role: 'user', content: analysisPrompt }
-      ],
-      max_tokens: 200,
-      response_format: { type: "json_object" }
-    });
-
-    const options = {
-      hostname: 'api.cloudflare.com',
-      port: 443,
-      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${CF_API_TOKEN}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData),
-      },
-      timeout: 15000,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          if (res.statusCode !== 200) {
-            console.error(`[LLM-Analyze] Error ${res.statusCode}`);
-            return resolve({ data_types: ['packets', 'protocols'], reasoning: 'Default fallback' });
-          }
-          // AFTER:
-const json = JSON.parse(data);
-const raw = json.choices?.[0]?.message?.content;
-let parsed;
-try {
-  if (typeof raw === 'object' && raw !== null) {
-    parsed = raw;
-  } else {
-    const clean = (raw || '{}').replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
-    const jsonMatch = clean.match(/\{[\s\S]*\}/);
-    parsed = JSON.parse(jsonMatch ? jsonMatch[0] : '{}');
+    const result = await model.generateContent(analysisPrompt);
+    const raw = result.response.text();
+    const clean = (raw || '{}').replace(/```json|```/gi, '').trim();
+    const match = clean.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(match ? match[0] : '{}');
+    console.log(`[LLM-Analyze] Intent: ${parsed.intent}, Need: ${parsed.data_types?.join(', ')}`);
+    return parsed;
+  } catch (e) {
+    console.error(`[LLM-Analyze] Gemini error: ${e.message}`);
+    return { data_types: ['packets', 'protocols'], reasoning: 'Fallback' };
   }
-} catch (parseErr) {
-  console.error(`[LLM-Analyze] JSON parse failed: ${parseErr.message}`);
-  parsed = { data_types: ['packets', 'protocols'], reasoning: 'JSON parse fallback' };
 }
-console.log(`[LLM-Analyze] Need: ${parsed.data_types?.join(', ')}`);
-resolve(parsed);
-        } catch (e) {
-  console.error(`[LLM-Analyze] Parse error: ${e.message} | Raw: ${data.slice(0, 200)}`);
-          resolve({ data_types: ['packets', 'protocols'], reasoning: 'Parse error fallback' });
-        }
-      });
-    });
-
-    req.on('error', (e) => {
-      console.error(`[LLM-Analyze] Request error: ${e.message}`);
-      resolve({ data_types: ['packets', 'protocols'], reasoning: 'Request error fallback' });
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ data_types: ['packets', 'protocols'], reasoning: 'Timeout fallback' });
-    });
-
-    req.write(postData);
-    req.end();
-  });
-}
-
+// Step 2: Generate final response with all context
 // Step 2: Generate final response with all context
 async function callLLMStream(prompt, res, origin, fullContext, history = '') {
-  return new Promise((resolve, reject) => {
-const systemPrompt = `You are PacketSight's friendly network analyst — sharp, knowledgeable, but casual. Like a security-savvy colleague explaining things over coffee.
+  const corsHeaders = getCorsHeaders(origin);
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    ...corsHeaders,
+  });
+
+  try {
+    const model = genAI.getGenerativeModel({
+      model: GEMINI_MODEL,
+      systemInstruction: `You are PacketSight's friendly network analyst — sharp, knowledgeable, but casual. Like a security-savvy colleague explaining things over coffee.
 
 RESPONSE STRUCTURE (always follow this):
 1. Start with 1-2 natural, conversational sentences that directly answer what was asked. Use phrases like "Looks like...", "You've got...", "I can see...", "Interestingly..." — never start with a heading, bullet, or robotic opener like "Based on the data provided."
@@ -1498,208 +1449,54 @@ Here's **filename.jpg** pulled from the traffic:
 - Replace filename.jpg with the EXACT filename from HTTP OBJECTS (e.g. aspen.jpg), and size with the actual byte count.
 - The src must be literally IMAGE_URL_PLACEHOLDER:filename.jpg — do not change this format, do not add http://, do not make it a real URL. The frontend will resolve it automatically.
 - Every single time an image preview is requested, output the ![...](...) tag. Never substitute it with text like "(Extracted from HTTP traffic)" or "here's the preview" without the actual image tag.
-- If the user asks again, output the ![...](...) tag again. Never skip it.`;
-
-    const userPrompt = `NETWORK DATA:
-${fullContext}
-
-${history ? `CONVERSATION HISTORY (last few messages for context):
-${history}
-
-` : ''}CURRENT QUESTION: ${prompt}
-
-Answer based on the data and conversation history above:`;
-
-    const postData = JSON.stringify({
-      model: CF_LLM_MODEL,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt }
-      ],
-      max_tokens: 800,
-      stream: true
+- If the user asks again, output the ![...](...) tag again. Never skip it.`,
     });
+
+    const userPrompt = `NETWORK DATA:\n${fullContext}\n\n${history ? `CONVERSATION HISTORY (last few messages for context):\n${history}\n\n` : ''}CURRENT QUESTION: ${prompt}\n\nAnswer based on the data and conversation history above:`;
 
     console.log(`[LLM-Stream] Prompt size: ${userPrompt.length} chars`);
+    console.log(`[LLM-Stream] Starting Gemini streaming request...`);
 
-    const options = {
-      hostname: 'api.cloudflare.com',
-      port: 443,
-      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${CF_API_TOKEN}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData),
-      },
-      timeout: CF_LLM_TIMEOUT_MS,
-    };
+    const result = await model.generateContentStream(userPrompt);
 
-    console.log(`[LLM-Stream] Starting streaming request...`);
-
-    const corsHeaders = getCorsHeaders(origin);
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      ...corsHeaders,
-    });
-    
-    const req = https.request(options, (cfRes) => {
-      if (cfRes.statusCode !== 200) {
-        let errorBody = '';
-        cfRes.on('data', chunk => errorBody += chunk);
-        cfRes.on('end', () => {
-          console.error(`[LLM-Stream] Error ${cfRes.statusCode}: ${errorBody.slice(0, 1000)}`);
-          res.write(`data: ${JSON.stringify({ error: `LLM error: ${cfRes.statusCode} - ${errorBody.slice(0, 200)}` })}\n\n`);
-          res.end();
-        });
-        return resolve(null);
+    for await (const chunk of result.stream) {
+      const token = chunk.text();
+      if (token) {
+        res.write(`data: ${JSON.stringify({ token })}\n\n`);
       }
-      
-      let buffer = '';
-      let fullResponse = '';
+    }
 
-      cfRes.on('data', (chunk) => {
-        const text = chunk.toString();
-        buffer += text;
-
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6).trim();
-            if (data === '[DONE]') {
-              res.write('data: [DONE]\n\n');
-              continue;
-            }
-            try {
-              const json = JSON.parse(data);
-              const content = json.choices?.[0]?.delta?.content || json.response;
-              if (content) {
-                fullResponse += content;
-                res.write(`data: ${JSON.stringify({ token: content })}\n\n`);
-              }
-            } catch (e) { 
-              console.error(`[LLM-Stream] Parse error: ${e.message} on line: ${line.slice(0, 100)}`);
-            }
-          }
-        }
-      });
-      
-      cfRes.on('end', () => {
-        console.log(`[LLM-Stream] ✓ Complete (${fullResponse.length} chars)`);
-        if (fullResponse.length === 0) {
-          console.error(`[LLM-Stream] WARNING: Empty response!`);
-        }
-        res.write('data: [DONE]\n\n');
-        res.end();
-        resolve(fullResponse);
-      });
-      
-      cfRes.on('error', (e) => {
-        console.error(`[LLM-Stream] Response error: ${e.message}`);
-        res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
-        res.end();
-        resolve(null);
-      });
-    });
-    
-    req.on('error', (e) => {
-      console.error(`[LLM-Stream] Request error: ${e.message}`);
-      res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
-      res.end();
-      resolve(null);
-    });
-    
-    req.on('timeout', () => {
-      req.destroy();
-      console.error(`[LLM-Stream] Timeout`);
-      res.write(`data: ${JSON.stringify({ error: 'Request timeout' })}\n\n`);
-      res.end();
-      resolve(null);
-    });
-    
-    req.write(postData);
-    req.end();
-  });
+    res.write('data: [DONE]\n\n');
+    res.end();
+    console.log(`[LLM-Stream] ✓ Complete`);
+  } catch (e) {
+    console.error(`[LLM-Stream] Gemini error: ${e.message}`);
+    res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+    res.end();
+  }
 }
-
 async function callLLM(prompt, systemOverride = null) {
-  return new Promise((resolve, reject) => {
-    const defaultSystem = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
+  const defaultSystem = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
 
 RULES:
-• Give DETAILED, INTELLIGENT responses
-• Use **bold** for emphasis
-• Be specific with IPs, ports, protocols, and packet counts`;
+- Give DETAILED, INTELLIGENT responses
+- Use **bold** for emphasis
+- Be specific with IPs, ports, protocols, and packet counts`;
 
-    const postData = JSON.stringify({
-      model: CF_LLM_MODEL,
-      messages: [
-        { role: 'system', content: systemOverride || defaultSystem },
-        { role: 'user', content: prompt }
-      ],
-      max_tokens: 800
+  try {
+    const model = genAI.getGenerativeModel({
+      model: GEMINI_MODEL,
+      systemInstruction: systemOverride || defaultSystem,
     });
-
-    const options = {
-      hostname: 'api.cloudflare.com',
-      port: 443,
-      path: `/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${CF_API_TOKEN}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData),
-      },
-      timeout: CF_LLM_TIMEOUT_MS,
-    };
-
-    console.log(`[LLM] Calling Cloudflare Workers AI: ${CF_LLM_MODEL}`);
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          if (res.statusCode !== 200) {
-            console.error(`[LLM] Error ${res.statusCode}: ${data.slice(0, 300)}`);
-            return resolve(null);
-          }
-          const json = JSON.parse(data);
-          const content = json.choices?.[0]?.message?.content;
-          if (content) {
-            console.log(`[LLM] ✓ Got response (${content.length} chars)`);
-            resolve(content);
-          } else {
-            console.error(`[LLM] Unexpected response format`);
-            resolve(null);
-          }
-        } catch (e) {
-          console.error(`[LLM] Parse error: ${e.message}`);
-          resolve(null);
-        }
-      });
-    });
-
-    req.on('error', (e) => {
-      console.error(`[LLM] Request error: ${e.message}`);
-      resolve(null);
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      console.error(`[LLM] Timeout`);
-      resolve(null);
-    });
-
-    req.write(postData);
-    req.end();
-  });
+    const result = await model.generateContent(prompt);
+    const text = result.response.text();
+    console.log(`[LLM] ✓ Got response (${text.length} chars)`);
+    return text;
+  } catch (e) {
+    console.error(`[LLM] Gemini error: ${e.message}`);
+    return null;
+  }
 }
-
 // ═══════════════════════════════════════════════════════════════════
 // Main Server
 // ═══════════════════════════════════════════════════════════════════
@@ -2446,6 +2243,6 @@ server.listen(PORT, () => {
   console.log('═══════════════════════════════════════════════════════════════');
   console.log(`🚀 PCAP Analyzer Backend running on port ${PORT}`);
   console.log(`📊 Engine: TShark + SearXNG (NO AI for port intel)`);
-  console.log(`🤖 LLM: Cloudflare Workers AI (${CF_LLM_MODEL})`);
+console.log(`🤖 LLM: Google Gemini (${GEMINI_MODEL})`);
   console.log('═══════════════════════════════════════════════════════════════');
 });
