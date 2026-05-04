@@ -1145,13 +1145,24 @@ function getTSharkFieldsForProtocols(protocols) {
 
       const fields = new Set(BASE_FIELDS);
 
+ // Expand protocol names to handle mismatches between frame.protocols output
+      // and tshark's internal field registry names
+      // e.g. "data-text-lines" → also try "data", "text", "lines"
+      // e.g. "ipv6.hopopts" → also try "ipv6", "hopopts"
+      const expandedProtocols = new Set();
+      for (const p of protocols) {
+        expandedProtocols.add(p);
+        for (const part of p.split(/[-_.]/)) {
+          if (part.length > 1) expandedProtocols.add(part);
+        }
+      }
+
       for (const line of stdout.split('\n')) {
         const parts = line.split('\t');
-        // tshark -G fields format: F <name> <field> <protocol> <type> ...
         if (parts[0] !== 'F') continue;
         const fieldName = parts[2];
-        const protocol = parts[3]?.toLowerCase();
-        if (protocol && protocols.has(protocol) && fieldName) {
+        const fieldProtocol = parts[3]?.toLowerCase();
+        if (fieldName && fieldProtocol && expandedProtocols.has(fieldProtocol)) {
           fields.add(fieldName);
         }
       }
