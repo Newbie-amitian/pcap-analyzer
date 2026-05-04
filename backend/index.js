@@ -1158,6 +1158,11 @@ function runTShark(pcapPath) {
           return val || '';
         };
 
+        // DEBUG: log first packet's layer keys to see actual field names
+        if (packets.length === 0) {
+          console.log('[TShark DEBUG] First packet layer keys:', Object.keys(layers).slice(0, 30).join(', '));
+        }
+
         const pkt = {
           frame_number: parseInt(gv('frame.number')) || 0,
           timestamp:    parseFloat(gv('frame.time_epoch')) || 0,
@@ -1165,11 +1170,11 @@ function runTShark(pcapPath) {
           src_ip:       gv('ip.src') || gv('ipv6.src'),
           dst_ip:       gv('ip.dst') || gv('ipv6.dst'),
           ip_proto:     gv('ip.proto'),
-          src_port:     parseInt(gv('tcp.srcport')) || parseInt(gv('udp.srcport')) || 0,
-          dst_port:     parseInt(gv('tcp.dstport')) || parseInt(gv('udp.dstport')) || 0,
+          src_port:     parseInt(gv('tcp.srcport')) || parseInt(gv('tcp.src_port')) || parseInt(gv('udp.srcport')) || parseInt(gv('udp.src_port')) || 0,
+          dst_port:     parseInt(gv('tcp.dstport')) || parseInt(gv('tcp.dst_port')) || parseInt(gv('udp.dstport')) || parseInt(gv('udp.dst_port')) || 0,
           tcp_flags:    gv('tcp.flags'),
-          protocol:     gv('_ws.col.Protocol'),
-          info:         gv('_ws.col.Info'),
+          protocol:     gv('_ws.col.Protocol') || gv('_ws_col_Protocol'),
+          info:         gv('_ws.col.Info') || gv('_ws_col_Info'),
         };
         packets.push(pkt);
 
