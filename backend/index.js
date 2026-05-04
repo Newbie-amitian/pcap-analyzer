@@ -1583,6 +1583,7 @@ console.log(`[Analysis] Parsed ${packets.length} packets`);
     .filter(([proto]) => proto !== 'packets')
     .map(([proto, data]) => [proto, Array.isArray(data) && data.length > 0])
 ),
+    };
     // 9. Build port intelligence (hybrid risks + tags)
     const portIntel = [];
     for (const port of [...ports].sort((a, b) => a - b)) {
