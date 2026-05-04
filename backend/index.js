@@ -1516,58 +1516,56 @@ Here's **filename.jpg** pulled from the traffic:
       return res.end();
     }
 
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
     let buffer = '';
 
-// Replace this block:
-response.body.on('data', (chunk) => { ... });
-response.body.on('end', () => { ... });
-response.body.on('error', (e) => { ... });
-
-// With this:
-const reader = response.body.getReader();
-const decoder = new TextDecoder();
-let buffer = '';
-
-const pump = async () => {
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        res.write('data: [DONE]\n\n');
-        res.end();
-        console.log(`[LLM-Stream] ✓ Complete`);
-        return;
-      }
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') {
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
             res.write('data: [DONE]\n\n');
             res.end();
+            console.log(`[LLM-Stream] ✓ Complete`);
             return;
           }
-          try {
-            const json = JSON.parse(data);
-            const token = json.choices?.[0]?.delta?.content;
-            if (token) res.write(`data: ${JSON.stringify({ token })}\n\n`);
-          } catch (_) {}
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6).trim();
+              if (data === '[DONE]') {
+                res.write('data: [DONE]\n\n');
+                res.end();
+                return;
+              }
+              try {
+                const json = JSON.parse(data);
+                const token = json.choices?.[0]?.delta?.content;
+                if (token) res.write(`data: ${JSON.stringify({ token })}\n\n`);
+              } catch (_) {}
+            }
+          }
         }
+      } catch (e) {
+        console.error(`[LLM-Stream] Stream error: ${e.message}`);
+        res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+        res.end();
       }
-    }
+    };
+
+    pump();
+
   } catch (e) {
-    console.error(`[LLM-Stream] Stream error: ${e.message}`);
+    console.error(`[LLM-Stream] Groq error: ${e.message}`);
     res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
     res.end();
   }
-};
-
-pump();
-
+}
 async function callLLM(prompt, systemOverride = null) {
   const defaultSystem = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
 
