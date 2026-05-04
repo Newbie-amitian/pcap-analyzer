@@ -141,8 +141,11 @@ async function fetchIANARegistry() {
 
   ianaFetchPromise = new Promise((resolve) => {
     console.log('[IANA] Fetching official registry from iana.org...');
-    https.get(IANA_CSV_URL, { timeout: 30000, headers: { 'Accept': 'text/csv' } }, (res) => {
-      if (res.statusCode !== 200) {
+https.get(IANA_CSV_URL, { timeout: 30000, headers: { 
+      'Accept': 'text/csv,text/plain,*/*',
+      'User-Agent': 'Mozilla/5.0 (compatible; PCAP-Analyzer/1.0; +https://github.com/your-repo)',
+      'Accept-Language': 'en-US,en;q=0.9',
+    } }, (res) => {      if (res.statusCode !== 200) {
         console.error(`[IANA] HTTP ${res.statusCode}`);
         ianaFetchPromise = null;
         return resolve(new Map());
