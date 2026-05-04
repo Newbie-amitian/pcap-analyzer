@@ -1199,27 +1199,26 @@ function runTShark(pcapPath) {
         ...fields.flatMap(f => ['-e', f])
       ];
 
-      let stdout = '';
+let stdout = '';
       let stderr = '';
-      console.log(`[TShark] Spawning with ${args.length} args (${fields.length} fields)...`);
       const proc = spawn(TSHARK_BIN, args);
-      let procStarted = false;
-      proc.stdout.on('data', chunk => { 
-        if (!procStarted) { procStarted = true; console.log('[TShark] Process started, receiving output...'); }
-        stdout += chunk.toString(); 
-      });
-      proc.stderr.on('data', chunk => { stderr += chunk.toString(); });
+      console.log(`[TShark] Spawned PID: ${proc.pid}, fields: ${fields.length}`);
 
-      // Manual timeout since spawn doesn't support it reliably
-      const spawnTimeout = setTimeout(() => {
-        console.error(`[TShark] TIMEOUT after 120s — killing process. stderr: ${stderr.slice(0, 500)}`);
+      const killTimer = setTimeout(() => {
+        console.error(`[TShark] TIMEOUT 120s — killing PID ${proc.pid}. stderr: ${stderr.slice(0, 500)}`);
         proc.kill('SIGKILL');
+        reject(new Error('TShark timed out after 120s'));
       }, 120000);
+
+      proc.stdout.on('data', chunk => {
+        if (stdout.length === 0) console.log('[TShark] First stdout chunk received — process is running');
+        stdout += chunk.toString();
+      });
+      proc.stderr.on('data', chunk => stderr += chunk.toString());
+      proc.on('error', err => { clearTimeout(killTimer); reject(new Error(`TShark spawn failed: ${err.message}`)); });
       proc.on('close', (code) => {
-        clearTimeout(spawnTimeout);
-      proc.on('error', err => reject(new Error(`TShark spawn failed: ${err.message}`)));
-      proc.on('close', (code) => {
-        if (code !== 0) return reject(new Error(`TShark exited ${code}: ${stderr}`));
+        clearTimeout(killTimer);
+        if (code !== 0 && code !== null) return reject(new Error(`TShark exited ${code}: ${stderr}`));
         const lines = stdout.trim().split('\n');
         if (lines.length < 2) return resolve({});
 
