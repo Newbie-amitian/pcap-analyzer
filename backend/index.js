@@ -1159,8 +1159,10 @@ function runTShark(pcapPath) {
         };
 
         // DEBUG: log first packet's layer keys to see actual field names
-        if (packets.length === 0) {
+if (packets.length === 0) {
           console.log('[TShark DEBUG] First packet layer keys:', Object.keys(layers).slice(0, 30).join(', '));
+          console.log('[TShark DEBUG] udp fields:', JSON.stringify(Object.fromEntries(Object.entries(layers).filter(([k]) => k.startsWith('udp')))));
+          console.log('[TShark DEBUG] tcp fields:', JSON.stringify(Object.fromEntries(Object.entries(layers).filter(([k]) => k.startsWith('tcp')))));
         }
 
         const pkt = {
