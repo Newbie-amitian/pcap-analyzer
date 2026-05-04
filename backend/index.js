@@ -1483,11 +1483,18 @@ Here's **filename.jpg** pulled from the traffic:
       }),
     });
 
-    const reader = response.body;
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`[LLM-Stream] Groq HTTP error ${response.status}: ${errText}`);
+      res.write(`data: ${JSON.stringify({ error: `Groq error: ${response.status}` })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+
     let buffer = '';
 
-    for await (const chunk of reader) {
-      buffer += Buffer.from(chunk).toString();
+    response.body.on('data', (chunk) => {
+      buffer += Buffer.isBuffer(chunk) ? chunk.toString() : chunk;
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
@@ -1496,8 +1503,6 @@ Here's **filename.jpg** pulled from the traffic:
           const data = line.slice(6).trim();
           if (data === '[DONE]') {
             res.write('data: [DONE]\n\n');
-            res.end();
-            console.log(`[LLM-Stream] ✓ Complete`);
             return;
           }
           try {
@@ -1507,16 +1512,28 @@ Here's **filename.jpg** pulled from the traffic:
           } catch (_) {}
         }
       }
-    }
+    });
 
-    res.write('data: [DONE]\n\n');
-    res.end();
+    response.body.on('end', () => {
+      console.log(`[LLM-Stream] ✓ Complete`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+
+    response.body.on('error', (e) => {
+      console.error(`[LLM-Stream] Stream error: ${e.message}`);
+      res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+      res.end();
+    });
+
   } catch (e) {
     console.error(`[LLM-Stream] Groq error: ${e.message}`);
     res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
     res.end();
   }
-}async function callLLM(prompt, systemOverride = null) {
+}
+
+async function callLLM(prompt, systemOverride = null) {
   const defaultSystem = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
 
 RULES:
