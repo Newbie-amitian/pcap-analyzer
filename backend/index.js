@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
+const MiniSearch = require('minisearch');
 
 // ═══════════════════════════════════════════════════════════════════
 // REQUIRED ENVIRONMENT VARIABLES
@@ -77,9 +78,6 @@ async function deleteFromB2(b2Key) {
   }
 }
 
-/**
- * Check if a key exists in B2 without downloading it
- */
 async function existsInB2(b2Key) {
   try {
     await b2.send(new HeadObjectCommand({
@@ -92,9 +90,6 @@ async function existsInB2(b2Key) {
   }
 }
 
-/**
- * Fetch JSON from B2, returns null if not found
- */
 async function fetchB2JSON(b2Key) {
   try {
     const r = await b2.send(new GetObjectCommand({
@@ -113,13 +108,12 @@ async function fetchB2JSON(b2Key) {
 // ═══════════════════════════════════════════════════════════════════
 const IANA_CSV_URL = 'https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.csv';
 const IANA_CACHE_FILE = './iana_ports_cache.json';
-const IANA_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+const IANA_CACHE_TTL = 24 * 60 * 60 * 1000;
 
 let ianaPortRegistry = new Map();
 let ianaLastFetch = 0;
 let ianaFetchPromise = null;
 
-// Secure services (encrypted by default) — still makes sense to keep as a small set
 const SECURE_SERVICES = new Set([
   'ssh', 'https', 'imaps', 'pop3s', 'ldaps', 'smtps', 'sips', 'ftps', 'dot', 'doq',
   'tls', 'ssl', 'quic'
@@ -239,7 +233,6 @@ function addPortToRegistry(portMap, port, serviceName, protocol, description) {
     description: description || `${serviceName} Protocol`,
     protocol: protocol || 'TCP/UDP',
     secure: isSecure
-    // NOTE: risks are now fetched dynamically from SearXNG, not hardcoded
   });
 }
 
@@ -270,14 +263,81 @@ async function getIANAPortInfo(port) {
 fetchIANARegistry().then(() => console.log('[IANA] Registry initialized')).catch(e => console.error('[IANA] Init error:', e.message));
 
 // ═══════════════════════════════════════════════════════════════════
-// SearXNG - Dynamic Security Risk Lookup (replaces hardcoded map!)
+// KNOWN 45 PROTOCOLS - Hardcoded risks (reliable, zero-fail)
+// ═══════════════════════════════════════════════════════════════════
+const KNOWN_PROTOCOL_RISKS = {
+  'dns': { risks: ['DNS Spoofing', 'Cache Poisoning', 'DNS Tunneling', 'Amplification DDoS', 'Zone Transfer Exposure'], alternatives: ['DNSSEC', 'DoH', 'DoT'] },
+  'http': { risks: ['Cleartext Transmission', 'Man-in-the-Middle', 'Credential Exposure', 'Injection Attacks', 'Session Hijacking'], alternatives: ['HTTPS', 'TLS 1.3'] },
+  'ftp': { risks: ['Cleartext Credentials', 'Cleartext Data', 'Anonymous Access', 'Bounce Attack', 'Brute Force'], alternatives: ['SFTP', 'FTPS', 'SCP'] },
+  'smtp': { risks: ['Open Relay', 'Spam', 'Phishing', 'Cleartext Auth', 'Email Spoofing'], alternatives: ['SMTPS', 'STARTTLS', 'DMARC'] },
+  'pop3': { risks: ['Cleartext Credentials', 'Cleartext Email', 'No Encryption', 'Brute Force'], alternatives: ['POP3S', 'IMAP over TLS'] },
+  'imap': { risks: ['Cleartext Credentials', 'Cleartext Email', 'Brute Force', 'MITM'], alternatives: ['IMAPS', 'TLS'] },
+  'telnet': { risks: ['Cleartext Everything', 'No Authentication Hardening', 'MITM', 'Credential Exposure', 'Command Injection'], alternatives: ['SSH', 'Mosh'] },
+  'snmp': { risks: ['Weak Community Strings', 'Information Disclosure', 'Unauthenticated v1/v2', 'DDoS Amplification', 'Device Enumeration'], alternatives: ['SNMPv3', 'HTTPS-based NMS'] },
+  'rdp': { risks: ['BlueKeep CVE', 'Brute Force', 'Pass-the-Hash', 'MITM', 'Credential Theft'], alternatives: ['VPN + RDP', 'SSH Tunnel', 'Zero Trust'] },
+  'smb': { risks: ['EternalBlue', 'Ransomware Vector', 'Pass-the-Hash', 'NTLM Relay', 'Lateral Movement'], alternatives: ['SMBv3 with Encryption', 'SFTP', 'VPN'] },
+  'ssh': { risks: ['Brute Force', 'Weak Keys', 'Default Credentials', 'SSH Tunneling Abuse'], alternatives: ['Certificate Auth', 'MFA', 'Bastion Host'] },
+  'https': { risks: ['Weak TLS Version', 'Expired Certificate', 'Weak Cipher Suite', 'HSTS Missing'], alternatives: ['TLS 1.3', 'HSTS Preload'] },
+  'tls': { risks: ['Weak Cipher Suite', 'Old TLS Version', 'Certificate Pinning Missing', 'Downgrade Attack'], alternatives: ['TLS 1.3', 'HSTS'] },
+  'ldap': { risks: ['Cleartext Bind', 'Anonymous Bind', 'LDAP Injection', 'Credential Exposure', 'Enumeration'], alternatives: ['LDAPS', 'SASL', 'TLS'] },
+  'kerberos': { risks: ['Pass-the-Ticket', 'Golden Ticket', 'Kerberoasting', 'AS-REP Roasting', 'Ticket Replay'], alternatives: ['MFA', 'PAC Validation', 'Tiered Admin'] },
+  'radius': { risks: ['Weak Shared Secret', 'MD5-based Auth', 'Replay Attack', 'CoA Injection'], alternatives: ['RADIUS over TLS', 'RadSec', 'TACACS+'] },
+  'dhcp': { risks: ['DHCP Starvation', 'Rogue DHCP Server', 'IP Conflict', 'MITM via Gateway Spoofing'], alternatives: ['DHCP Snooping', 'Static ARP', '802.1X'] },
+  'arp': { risks: ['ARP Spoofing', 'ARP Poisoning', 'MITM', 'DoS via Gratuitous ARP', 'MAC Flooding'], alternatives: ['Dynamic ARP Inspection', 'Static ARP', 'IPv6 NDP Guard'] },
+  'icmp': { risks: ['Ping Flood', 'ICMP Tunneling', 'Smurf Attack', 'Network Mapping', 'TTL Fingerprinting'], alternatives: ['ICMP Rate Limiting', 'Firewall Rules'] },
+  'nfs': { risks: ['Unauthenticated Mount', 'Data Exposure', 'RPC Enumeration', 'Privilege Escalation via UID'], alternatives: ['NFSv4 with Kerberos', 'SFTP', 'SMB with Auth'] },
+  'tftp': { risks: ['No Authentication', 'Cleartext Transfer', 'Directory Traversal', 'Firmware Tampering'], alternatives: ['SFTP', 'SCP', 'HTTPS-based delivery'] },
+  'sip': { risks: ['Toll Fraud', 'Call Hijacking', 'Registration Hijacking', 'Cleartext SIP', 'DoS on PBX'], alternatives: ['SIPS', 'SRTP', 'TLS for SIP'] },
+  'mqtt': { risks: ['No Auth by Default', 'Cleartext Topics', 'Topic Injection', 'Unauthorized Publish', 'IoT Botnets'], alternatives: ['MQTT over TLS', 'Auth + ACLs', 'AMQP'] },
+  'modbus': { risks: ['No Authentication', 'No Encryption', 'Write to PLC', 'DoS on SCADA', 'Replay Attack'], alternatives: ['VPN over Modbus', 'OPC-UA', 'Encrypted Tunnel'] },
+  'dnp3': { risks: ['No Native Auth', 'Replay Attack', 'Spoofed Commands to RTU', 'Critical Infrastructure Risk'], alternatives: ['DNP3 Secure Auth v5', 'IEC 62351'] },
+  'bgp': { risks: ['Route Hijacking', 'BGP Hijack', 'Path Manipulation', 'Prefix Deaggregation Attack', 'Session Reset'], alternatives: ['RPKI', 'BGPsec', 'Route Filtering'] },
+  'ospf': { risks: ['Rogue Router Injection', 'LSA Flooding', 'Topology Disclosure', 'Auth Bypass'], alternatives: ['OSPFv3 with IPSec', 'MD5 Auth', 'Routing Segmentation'] },
+  'gre': { risks: ['No Encryption', 'Tunnel Hijacking', 'Inner Packet Injection', 'DoS via Flood'], alternatives: ['GRE over IPSec', 'WireGuard', 'OpenVPN'] },
+  'ipsec': { risks: ['Weak IKE Config', 'Aggressive Mode', 'Pre-shared Key Brute Force', 'IKE Fragmentation'], alternatives: ['IKEv2', 'Certificate Auth', 'WireGuard'] },
+  'vlan': { risks: ['VLAN Hopping', 'Double Tagging Attack', 'Trunk Misconfiguration', 'Lateral Movement'], alternatives: ['Private VLAN', 'VLAN ACLs', 'Network Segmentation'] },
+  'quic': { risks: ['0-RTT Replay Attack', 'UDP Amplification', 'Connection Migration Abuse'], alternatives: ['Strict 0-RTT Policy', 'Rate Limiting'] },
+  'rdp_2': { risks: ['BlueKeep', 'Brute Force', 'DejaBlue', 'MITM'], alternatives: ['NLA', 'VPN', 'MFA'] },
+  'syslog': { risks: ['Cleartext UDP', 'Log Injection', 'Forged Log Messages', 'No Auth'], alternatives: ['Syslog over TLS', 'RELP', 'Splunk Forwarder'] },
+  'nbns': { risks: ['NBNS Spoofing', 'Credential Capture via Responder', 'NTLM Relay', 'Name Poisoning'], alternatives: ['DNS', 'Disable NetBIOS', 'LLMNR Disabled'] },
+  'netflow': { risks: ['Cleartext Flow Data', 'Flow Injection', 'Traffic Pattern Disclosure'], alternatives: ['Encrypted sFlow', 'IPFIX over TLS'] },
+  'vxlan': { risks: ['No Native Auth', 'VXLAN Flooding', 'Inner Frame Injection', 'VM-to-VM Lateral Movement'], alternatives: ['VXLAN with IPSec', 'NSX Security Groups'] },
+  'l2tp': { risks: ['No Encryption (L2TP alone)', 'PPP Auth Weakness', 'Tunnel Flooding'], alternatives: ['L2TP/IPSec', 'WireGuard', 'OpenVPN'] },
+  'coap': { risks: ['Amplification Attack', 'No Auth by Default', 'Cleartext', 'Resource Discovery Abuse'], alternatives: ['CoAPS (DTLS)', 'OSCORE'] },
+  'bacnet': { risks: ['No Authentication', 'Unauthenticated Write', 'Building Control Takeover', 'Enumeration'], alternatives: ['BACnet/SC', 'VPN Overlay', 'Firewall Isolation'] },
+  'diameter': { risks: ['SS7-like Attacks', 'Subscriber Enumeration', 'Auth Bypass', 'Routing Manipulation'], alternatives: ['Diameter over TLS', 'IPX Filtering', 'SEPP for 5G'] },
+  'ldap_plain': { risks: ['Cleartext Bind Credentials', 'Anonymous Access', 'User Enumeration'], alternatives: ['LDAPS', 'StartTLS'] },
+  'mysql': { risks: ['SQL Injection', 'Cleartext Auth', 'Default Root No Password', 'Brute Force', 'Data Exfiltration'], alternatives: ['TLS for MySQL', 'Prepared Statements', 'Least Privilege'] },
+  'postgresql': { risks: ['SQL Injection', 'Cleartext Auth', 'Trust Auth Misconfiguration', 'Privilege Escalation'], alternatives: ['TLS', 'scram-sha-256', 'pg_hba Hardening'] },
+  'redis': { risks: ['No Auth by Default', 'Remote Code Execution', 'Data Exposure', 'SSRF Pivot'], alternatives: ['Redis ACLs', 'TLS', 'requirepass', 'Bind to localhost'] },
+  'mongodb': { risks: ['No Auth by Default', 'Open Exposure', 'Data Exfiltration', 'Injection'], alternatives: ['MongoDB Auth', 'TLS', 'IP Whitelisting'] },
+};
+
+/**
+ * Check if a port belongs to one of the 45 known protocols
+ * Returns the key into KNOWN_PROTOCOL_RISKS or null
+ */
+function getKnownProtocolKey(serviceName) {
+  if (!serviceName) return null;
+  const lower = serviceName.toLowerCase();
+  // Direct match
+  if (KNOWN_PROTOCOL_RISKS[lower]) return lower;
+  // Partial match for variants like "http-alt" → "http"
+  for (const key of Object.keys(KNOWN_PROTOCOL_RISKS)) {
+    if (lower.startsWith(key) || lower.includes(key)) return key;
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SearXNG - Dynamic Security Risk Lookup (ONLY for unknown ports)
 // ═══════════════════════════════════════════════════════════════════
 const searxngRiskCache = new Map();
-const SEARXNG_RISK_TTL = 24 * 60 * 60 * 1000; // 24 hours
+const SEARXNG_RISK_TTL = 24 * 60 * 60 * 1000;
 
 async function fetchServiceRisksFromSearXNG(serviceName) {
   if (!serviceName || serviceName === 'Unknown' || serviceName === 'Ephemeral' || serviceName === 'Registered') {
-    return { risks: [], alternatives: [] };
+    return { risks: [], alternatives: [], tags: [] };
   }
 
   const cacheKey = serviceName.toLowerCase();
@@ -292,9 +352,12 @@ async function fetchServiceRisksFromSearXNG(serviceName) {
 
     const risks = [];
     const alternatives = [];
+    const tags = new Set();
+
+    // Seed tags from service name words
+    serviceName.toLowerCase().split(/[\s\-_\/]+/).filter(w => w.length > 2).forEach(w => tags.add(w));
 
     if (results.results && results.results.length > 0) {
-      // Extract risk keywords from snippets
       const riskKeywords = [
         'unencrypted', 'cleartext', 'clear text', 'plain text', 'no authentication',
         'brute force', 'default credentials', 'buffer overflow', 'injection',
@@ -302,7 +365,8 @@ async function fetchServiceRisksFromSearXNG(serviceName) {
         'information disclosure', 'data exposure', 'unauthenticated', 'anonymous',
         'privilege escalation', 'remote code execution', 'rce', 'exploit',
         'backdoor', 'malware', 'ransomware', 'exfiltration', 'tunneling',
-        'weak encryption', 'deprecated', 'insecure', 'vulnerable', 'attack'
+        'weak encryption', 'deprecated', 'insecure', 'vulnerable', 'attack',
+        'replay attack', 'session hijack', 'credential theft', 'lateral movement'
       ];
 
       const altKeywords = [
@@ -313,41 +377,47 @@ async function fetchServiceRisksFromSearXNG(serviceName) {
       for (const result of results.results.slice(0, 5)) {
         const text = (result.title + ' ' + result.snippet).toLowerCase();
 
-        // Extract risks
         for (const keyword of riskKeywords) {
           if (text.includes(keyword)) {
             const risk = capitalizeFirst(keyword.replace(/-/g, ' '));
-            if (!risks.includes(risk)) risks.push(risk);
+            if (!risks.includes(risk)) {
+              risks.push(risk);
+              // Each risk keyword also becomes a search tag
+              keyword.split(/[\s\-]+/).filter(w => w.length > 3).forEach(w => tags.add(w));
+            }
           }
         }
 
-        // Extract alternatives
         for (const keyword of altKeywords) {
           const idx = text.indexOf(keyword);
           if (idx !== -1) {
             const snippet = text.slice(idx, idx + 60);
-            // Look for protocol names after the keyword
-            const protoMatch = snippet.match(/(?:ssh|sftp|https|ldaps|smtps|tls|ssl|snmpv3|imaps|pop3s|ftps|scp)\b/i);
+            const protoMatch = snippet.match(/(?:ssh|sftp|https|ldaps|smtps|tls|ssl|snmpv3|imaps|pop3s|ftps|scp|wireguard|ipsec)\b/i);
             if (protoMatch && !alternatives.includes(protoMatch[0].toUpperCase())) {
               alternatives.push(protoMatch[0].toUpperCase());
+              tags.add(protoMatch[0].toLowerCase());
             }
           }
         }
+
+        // Extract meaningful words from titles as tags
+        result.title.toLowerCase().split(/[\s\-_,]+/).filter(w => w.length > 4).forEach(w => tags.add(w));
       }
     }
 
     const data = {
       risks: risks.slice(0, 6),
-      alternatives: alternatives.slice(0, 3)
+      alternatives: alternatives.slice(0, 3),
+      tags: [...tags].slice(0, 20)
     };
 
     searxngRiskCache.set(cacheKey, { data, timestamp: Date.now() });
-    console.log(`[SearXNG] ✓ Risks for ${serviceName}: ${data.risks.length} found`);
+    console.log(`[SearXNG] ✓ Dynamic risks for ${serviceName}: ${data.risks.length} risks, ${data.tags.length} tags`);
     return data;
 
   } catch (e) {
     console.error(`[SearXNG] Risk fetch error for ${serviceName}: ${e.message}`);
-    return { risks: [], alternatives: [] };
+    return { risks: [], alternatives: [], tags: [serviceName.toLowerCase()] };
   }
 }
 
@@ -356,20 +426,77 @@ function capitalizeFirst(str) {
 }
 
 /**
- * Batch fetch risks for multiple unique services in parallel
+ * For known protocols: return hardcoded risks + generate static tags
+ * For unknown protocols: fetch dynamically from SearXNG
  */
-async function batchFetchServiceRisks(serviceNames) {
-  const unique = [...new Set(serviceNames.filter(s =>
-    s && s !== 'Unknown' && s !== 'Ephemeral' && s !== 'Registered'
-  ))];
+async function resolvePortRisksAndTags(serviceName, portNum) {
+  const knownKey = getKnownProtocolKey(serviceName);
 
-  console.log(`[SearXNG] Batch fetching risks for ${unique.length} unique services...`);
+  if (knownKey) {
+    // ── KNOWN: use hardcoded risks, build tags from service name + risk words
+    const riskData = KNOWN_PROTOCOL_RISKS[knownKey];
+    const tags = new Set();
+    tags.add(knownKey);
+    serviceName.toLowerCase().split(/[\s\-_\/]+/).filter(w => w.length > 2).forEach(w => tags.add(w));
+    riskData.risks.forEach(r => r.toLowerCase().split(/[\s\-]+/).filter(w => w.length > 3).forEach(w => tags.add(w)));
+    return {
+      risks: riskData.risks,
+      alternatives: riskData.alternatives,
+      tags: [...tags],
+      source: 'hardcoded'
+    };
+  } else {
+    // ── UNKNOWN: fully dynamic via SearXNG
+    console.log(`[Hybrid] Unknown port ${portNum} (${serviceName}) → SearXNG dynamic lookup`);
+    const data = await fetchServiceRisksFromSearXNG(serviceName);
+    return {
+      risks: data.risks,
+      alternatives: data.alternatives,
+      tags: data.tags,
+      source: 'dynamic'
+    };
+  }
+}
 
+/**
+ * Batch resolve risks for all ports, known ones skip SearXNG entirely
+ */
+async function batchResolvePortRisks(portServiceMap) {
+  const unknownPorts = [];
   const results = new Map();
-  await Promise.all(unique.map(async (name) => {
-    const risk = await fetchServiceRisksFromSearXNG(name);
-    results.set(name.toLowerCase(), risk);
-  }));
+
+  for (const [port, serviceName] of portServiceMap) {
+    const knownKey = getKnownProtocolKey(serviceName);
+    if (knownKey) {
+      const riskData = KNOWN_PROTOCOL_RISKS[knownKey];
+      const tags = new Set([knownKey]);
+      serviceName.toLowerCase().split(/[\s\-_\/]+/).filter(w => w.length > 2).forEach(w => tags.add(w));
+      riskData.risks.forEach(r => r.toLowerCase().split(/[\s\-]+/).filter(w => w.length > 3).forEach(w => tags.add(w)));
+      results.set(port, { risks: riskData.risks, alternatives: riskData.alternatives, tags: [...tags], source: 'hardcoded' });
+    } else {
+      unknownPorts.push({ port, serviceName });
+    }
+  }
+
+  console.log(`[Hybrid] ${results.size} known protocol ports (hardcoded), ${unknownPorts.length} unknown ports (dynamic)`);
+
+  // Only SearXNG-fetch the unknown ones, in parallel
+  if (unknownPorts.length > 0) {
+    const uniqueUnknownServices = [...new Set(unknownPorts.map(p => p.serviceName).filter(s =>
+      s && s !== 'Unknown' && s !== 'Ephemeral' && s !== 'Registered'
+    ))];
+
+    const dynamicResults = new Map();
+    await Promise.all(uniqueUnknownServices.map(async (svc) => {
+      const data = await fetchServiceRisksFromSearXNG(svc);
+      dynamicResults.set(svc.toLowerCase(), data);
+    }));
+
+    for (const { port, serviceName } of unknownPorts) {
+      const data = dynamicResults.get(serviceName.toLowerCase()) || { risks: [], alternatives: [], tags: [serviceName.toLowerCase()] };
+      results.set(port, { ...data, source: 'dynamic' });
+    }
+  }
 
   return results;
 }
@@ -706,6 +833,10 @@ exec(`"${TSHARK_BIN}" -v 2>/dev/null`, (err, stdout) => {
 const sessions = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
+// MiniSearch indexes per session (cleaned up on expiry)
+const sessionPortIndexes = new Map();     // portIndex per sessionId
+const sessionContentIndexes = new Map();  // contentIndex per sessionId
+
 async function ensureSession(sessionId) {
   if (sessions.has(sessionId)) return true;
   const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
@@ -728,8 +859,14 @@ setInterval(async () => {
   const now = Date.now();
   for (const [id, session] of sessions) {
     if (now - session.created_at > SESSION_TTL_MS) {
+      // Clean local files
       try { const p = path.join(PCAP_DIR, `${id}.pcap`); if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) { }
       try { const p = path.join(EXPORT_DIR, id); if (fs.existsSync(p)) fs.rmSync(p, { recursive: true }); } catch (_) { }
+
+      // ── IMPORTANT: clear MiniSearch indexes to prevent RAM leak ──
+      sessionPortIndexes.delete(id);
+      sessionContentIndexes.delete(id);
+
       const analysisTypes = ['summary', 'packets', 'dns', 'tls', 'http', 'ports', 'threats',
         'ftp', 'smtp', 'pop3imap', 'icmp', 'arp', 'dhcp', 'ssh', 'smb', 'rdp', 'snmp',
         'sip', 'nbns', 'quic', 'ldap', 'telnet', 'kerberos', 'radius', 'nfs', 'tftp',
@@ -737,9 +874,9 @@ setInterval(async () => {
         'mdns', 'wsd', 'rpc', 'postgresql', 'mysql', 'redis', 'mongodb', 'netflow',
         'vxlan', 'l2tp', 'ppp', 'coap', 'bacnet', 'diameter'
       ];
-      await Promise.all(analysisTypes.map(type => deleteFromB2(`analysis/${id}-${type}.json`).catch(() => {})));
+      await Promise.all(analysisTypes.map(type => deleteFromB2(`analysis/${id}-${type}.json`).catch(() => { })));
       sessions.delete(id);
-      console.log(`[Session] Expired + B2 cleaned: ${id}`);
+      console.log(`[Session] Expired + B2 cleaned + MiniSearch cleared: ${id}`);
     }
   }
 }, 5 * 60 * 1000);
@@ -900,157 +1037,130 @@ async function callGroqLLM(messages, maxTokens = 1500) {
   });
 }
 
+// ── Groq LLM STREAMING ────────────────────────────────────────────
+function callGroqLLMStream(messages, res) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify({
+      model: GROQ_MODEL,
+      messages,
+      max_tokens: 1500,
+      temperature: 0.7,
+      stream: true,
+    });
+
+    const options = {
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 30000,
+    };
+
+    const req = https.request(options, (groqRes) => {
+      let buffer = '';
+
+      groqRes.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          const data = trimmed.slice(6);
+          if (data === '[DONE]') {
+            res.write('data: [DONE]\n\n');
+            resolve();
+            return;
+          }
+          try {
+            const json = JSON.parse(data);
+            const token = json.choices?.[0]?.delta?.content;
+            if (token) {
+              res.write(`data: ${JSON.stringify({ token })}\n\n`);
+            }
+          } catch (_) { }
+        }
+      });
+
+      groqRes.on('end', () => {
+        res.write('data: [DONE]\n\n');
+        resolve();
+      });
+
+      groqRes.on('error', reject);
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Groq stream timeout')); });
+    req.write(payload);
+    req.end();
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // TSHARK - FULL PROTOCOL EXTRACTION (Single Pass, All Protocols)
 // ═══════════════════════════════════════════════════════════════════
 function runTShark(pcapPath) {
   return new Promise((resolve, reject) => {
 
-    // ── ALL FIELDS IN ONE SINGLE TSHARK COMMAND ────────────────
     const fields = [
-      // Base packet fields
       'frame.number', 'frame.time_epoch', 'frame.len',
       'ip.src', 'ip.dst', 'ip.proto',
       'tcp.srcport', 'tcp.dstport', 'tcp.flags',
       'udp.srcport', 'udp.dstport',
       '_ws.col.Protocol', '_ws.col.Info',
-
-      // DNS (col 12-16)
       'dns.qry.name', 'dns.a', 'dns.aaaa', 'dns.flags.response', 'dns.qry.type',
-
-      // TLS (col 17-18)
       'tls.handshake.type', 'tls.handshake.extensions_server_name',
-
-      // HTTP (col 19-24)
       'http.request.method', 'http.request.uri', 'http.host',
       'http.response.code', 'http.user_agent', 'http.content_type',
-
-      // FTP (col 25-27)
       'ftp.request.command', 'ftp.request.arg', 'ftp.response.code',
-
-      // SMTP (col 28-30)
       'smtp.req.command', 'smtp.req.parameter', 'smtp.response.code',
-
-      // POP3 / IMAP (col 31-33)
       'pop.request.command', 'imap.request', 'imap.response',
-
-      // ICMP (col 34-36)
       'icmp.type', 'icmp.code', 'icmp.checksum',
-
-      // ARP (col 37-40)
       'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.proto_ipv4',
-
-      // DHCP (col 41-44)
       'dhcp.option.hostname', 'dhcp.option.requested_ip_address',
       'dhcp.option.dhcp', 'dhcp.hw.mac_addr',
-
-      // SSH (col 45-47)
       'ssh.protocol', 'ssh.kex.algorithms', 'ssh.message_code',
-
-      // SMB (col 48-51)
       'smb.cmd', 'smb.path', 'smb2.cmd', 'smb2.filename',
-
-      // RDP (col 52-53)
       'rdp.negReq.requestedProtocols', 'rdp.domain',
-
-      // SNMP (col 54-56)
       'snmp.community', 'snmp.var_bind_str', 'snmp.version',
-
-      // SIP / RTP (col 57-61)
       'sip.Method', 'sip.from.user', 'sip.to.user',
       'sip.Call-ID', 'rtp.ssrc',
-
-      // NetBIOS / NBNS (col 62-64)
       'nbns.name', 'nbss.type', 'netbios.name',
-
-      // QUIC (col 65-67)
       'quic.version', 'quic.connection_id', 'quic.packet_type',
-
-      // LDAP (col 68-70)
       'ldap.baseObject', 'ldap.filter_string', 'ldap.resultCode',
-
-      // Telnet (col 71-72)
       'telnet.data', 'telnet.cmd',
-
-      // Kerberos (col 73-75)
       'kerberos.realm', 'kerberos.CNameString', 'kerberos.msg_type',
-
-      // RADIUS (col 76-78)
       'radius.User_Name', 'radius.code', 'radius.NAS_IP_Address',
-
-      // NFS (col 79-81)
       'nfs.path', 'nfs.ftype', 'nfs.status',
-
-      // TFTP (col 82-84)
       'tftp.opcode', 'tftp.source_file', 'tftp.destination_file',
-
-      // Syslog (col 85-87)
       'syslog.facility', 'syslog.severity', 'syslog.msg',
-
-      // BGP (col 88-90)
       'bgp.type', 'bgp.prefix_length', 'bgp.next_hop',
-
-      // OSPF (col 91-93)
       'ospf.msg', 'ospf.srcrouter', 'ospf.area_id',
-
-      // GRE (col 94-95)
       'gre.proto', 'gre.key',
-
-      // IPSec / IKE (col 96-98)
       'isakmp.exchtype', 'esp.sequence', 'isakmp.version',
-
-      // VLAN (col 99-100)
       'vlan.id', 'vlan.priority',
-
-      // Modbus (col 101-103)
       'mbtcp.func_code', 'mbtcp.reference_num', 'mbtcp.word_cnt',
-
-      // DNP3 (col 104-106)
       'dnp3.ctl.dir', 'dnp3.src', 'dnp3.dst',
-
-      // MQTT (col 107-109)
       'mqtt.msgtype', 'mqtt.topic', 'mqtt.msg',
-
-      // mDNS (col 110-111)
       'mdns.qry.name', 'mdns.ans.name',
-
-      // WSD (col 112)
       'wsd.action',
-
-      // RPC / MSRPC (col 113-115)
       'dcerpc.opnum', 'dcerpc.cn_call_id', 'dcerpc.pkt_type',
-
-      // PostgreSQL (col 116-118)
       'pgsql.query', 'pgsql.authtype', 'pgsql.statement',
-
-      // MySQL (col 119-121)
       'mysql.query', 'mysql.command', 'mysql.affected_rows',
-
-      // Redis (col 122-123)
       'redis.command', 'redis.bulk_string',
-
-      // MongoDB (col 124-126)
       'mongo.opcode', 'mongo.query', 'mongo.documents',
-
-      // NetFlow / IPFIX (col 127-129)
       'cflow.srcaddr', 'cflow.dstaddr', 'cflow.packets',
-
-      // VXLAN (col 130-131)
       'vxlan.vni', 'vxlan.flags',
-
-      // L2TP (col 132-134)
       'l2tp.tunnel_id', 'l2tp.session_id', 'l2tp.type',
-
-      // PPP (col 135-136)
       'ppp.protocol', 'ppp.direction',
-
-      // CoAP (col 137-139)
       'coap.code', 'coap.opt.uri_path_recon', 'coap.type',
-
-      // BACnet (col 140-142)
       'bacapp.service', 'bacapp.objectidentifier', 'bacapp.instance_number',
-
-      // DIAMETER (col 143-145)
       'diameter.cmd.code', 'diameter.applicationId', 'diameter.Session-Id',
     ].join(' -e ');
 
@@ -1061,7 +1171,6 @@ function runTShark(pcapPath) {
 
       const lines = stdout.trim().split('\n');
 
-      // Protocol data arrays
       const packets = [], dns = [], tls = [], http = [];
       const ftp = [], smtp = [], pop3imap = [], icmp = [], arp = [], dhcp = [];
       const ssh = [], smb = [], rdp = [], snmp = [], sip = [], nbns = [];
@@ -1072,13 +1181,11 @@ function runTShark(pcapPath) {
       const netflow = [], vxlan = [], l2tp = [], ppp = [], coap = [], bacnet = [];
       const diameter = [];
 
-      // Skip header line (i=0)
       for (let i = 1; i < lines.length; i++) {
         const line = lines[i];
         if (!line.trim()) continue;
         const c = line.split('\t');
 
-        // Base packet
         const pkt = {
           frame_number: parseInt(c[0]) || 0,
           timestamp: parseFloat(c[1]) || 0,
@@ -1098,139 +1205,50 @@ function runTShark(pcapPath) {
         const sip_addr = pkt.src_ip;
         const dip_addr = pkt.dst_ip;
 
-        // DNS (cols 13-17)
         if (c[13]) dns.push({ domain: c[13], answer_a: c[14] || '', answer_aaaa: c[15] || '', is_response: c[16] === '1', qry_type: c[17] || '', src_ip: sip_addr, timestamp: ts });
-
-        // TLS (cols 18-19)
         if (c[18] || c[19]) tls.push({ handshake_type: c[18] || '', sni: c[19] || '', src_ip: sip_addr, dst_ip: dip_addr, dst_port: pkt.dst_port, timestamp: ts });
-
-        // HTTP (cols 20-25)
         if (c[20] || c[21]) http.push({ method: c[20] || '', uri: c[21] || '', host: c[22] || '', status_code: c[23] || '', user_agent: c[24] || '', content_type: c[25] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // FTP (cols 26-28)
         if (c[26] || c[28]) ftp.push({ command: c[26] || '', arg: c[27] || '', response_code: c[28] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // SMTP (cols 29-31)
         if (c[29] || c[31]) smtp.push({ command: c[29] || '', parameter: c[30] || '', response_code: c[31] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // POP3 / IMAP (cols 32-34)
         if (c[32] || c[33]) pop3imap.push({ pop3_command: c[32] || '', imap_request: c[33] || '', imap_response: c[34] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // ICMP (cols 35-37)
         if (c[35]) icmp.push({ type: c[35] || '', code: c[36] || '', checksum: c[37] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // ARP (cols 38-41)
         if (c[38]) arp.push({ opcode: c[38] || '', src_mac: c[39] || '', src_ip: c[40] || '', dst_ip: c[41] || '', timestamp: ts });
-
-        // DHCP (cols 42-45)
         if (c[42] || c[45]) dhcp.push({ hostname: c[42] || '', requested_ip: c[43] || '', dhcp_type: c[44] || '', mac: c[45] || '', src_ip: sip_addr, timestamp: ts });
-
-        // SSH (cols 46-48)
         if (c[46]) ssh.push({ protocol: c[46] || '', kex_algorithms: c[47] || '', message_code: c[48] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // SMB (cols 49-52)
         if (c[49] || c[51]) smb.push({ cmd_v1: c[49] || '', path_v1: c[50] || '', cmd_v2: c[51] || '', filename_v2: c[52] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // RDP (cols 53-54)
         if (c[53] || c[54]) rdp.push({ protocols: c[53] || '', domain: c[54] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // SNMP (cols 55-57)
         if (c[55] || c[56]) snmp.push({ community: c[55] || '', var_bind: c[56] || '', version: c[57] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // SIP / RTP (cols 58-62)
         if (c[58] || c[62]) sip.push({ method: c[58] || '', from_user: c[59] || '', to_user: c[60] || '', call_id: c[61] || '', rtp_ssrc: c[62] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // NBNS (cols 63-65)
         if (c[63] || c[65]) nbns.push({ name: c[63] || '', nbss_type: c[64] || '', netbios_name: c[65] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // QUIC (cols 66-68)
         if (c[66]) quic.push({ version: c[66] || '', connection_id: c[67] || '', packet_type: c[68] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // LDAP (cols 69-71)
         if (c[69] || c[71]) ldap.push({ base_object: c[69] || '', filter: c[70] || '', result_code: c[71] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // Telnet (cols 72-73)
         if (c[72]) telnet.push({ data: c[72] || '', cmd: c[73] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // Kerberos (cols 74-76)
         if (c[74] || c[75]) kerberos.push({ realm: c[74] || '', cname: c[75] || '', msg_type: c[76] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // RADIUS (cols 77-79)
         if (c[77] || c[78]) radius.push({ username: c[77] || '', code: c[78] || '', nas_ip: c[79] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // NFS (cols 80-82)
         if (c[80]) nfs.push({ path: c[80] || '', ftype: c[81] || '', status: c[82] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // TFTP (cols 83-85)
         if (c[83]) tftp.push({ opcode: c[83] || '', source_file: c[84] || '', dest_file: c[85] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // Syslog (cols 86-88)
         if (c[88]) syslog.push({ facility: c[86] || '', severity: c[87] || '', message: c[88] || '', src_ip: sip_addr, timestamp: ts });
-
-        // BGP (cols 89-91)
         if (c[89]) bgp.push({ type: c[89] || '', prefix_length: c[90] || '', next_hop: c[91] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // OSPF (cols 92-94)
         if (c[92]) ospf.push({ msg: c[92] || '', src_router: c[93] || '', area_id: c[94] || '', src_ip: sip_addr, timestamp: ts });
-
-        // GRE (cols 95-96)
         if (c[95]) gre.push({ proto: c[95] || '', key: c[96] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // IPSec / IKE (cols 97-99)
         if (c[97] || c[98]) ipsec.push({ ike_exchtype: c[97] || '', esp_seq: c[98] || '', ike_version: c[99] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // VLAN (cols 100-101)
         if (c[100]) vlan.push({ vlan_id: c[100] || '', priority: c[101] || '', src_ip: sip_addr, timestamp: ts });
-
-        // Modbus (cols 102-104)
         if (c[102]) modbus.push({ func_code: c[102] || '', ref_num: c[103] || '', word_cnt: c[104] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // DNP3 (cols 105-107)
         if (c[105] || c[106]) dnp3.push({ dir: c[105] || '', src: c[106] || '', dst: c[107] || '', src_ip: sip_addr, timestamp: ts });
-
-        // MQTT (cols 108-110)
         if (c[108]) mqtt.push({ msg_type: c[108] || '', topic: c[109] || '', msg: c[110] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // mDNS (cols 111-112)
         if (c[111] || c[112]) mdns.push({ query_name: c[111] || '', answer_name: c[112] || '', src_ip: sip_addr, timestamp: ts });
-
-        // WSD (col 113)
         if (c[113]) wsd.push({ action: c[113] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // RPC / MSRPC (cols 114-116)
         if (c[114]) rpc.push({ opnum: c[114] || '', call_id: c[115] || '', pkt_type: c[116] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // PostgreSQL (cols 117-119)
         if (c[117]) postgresql.push({ query: c[117] || '', authtype: c[118] || '', statement: c[119] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // MySQL (cols 120-122)
         if (c[120] || c[121]) mysql.push({ query: c[120] || '', command: c[121] || '', affected_rows: c[122] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // Redis (cols 123-124)
         if (c[123]) redis.push({ command: c[123] || '', response: c[124] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // MongoDB (cols 125-127)
         if (c[125]) mongodb.push({ opcode: c[125] || '', query: c[126] || '', documents: c[127] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // NetFlow (cols 128-130)
         if (c[128]) netflow.push({ src_addr: c[128] || '', dst_addr: c[129] || '', packets: c[130] || '', src_ip: sip_addr, timestamp: ts });
-
-        // VXLAN (cols 131-132)
         if (c[131]) vxlan.push({ vni: c[131] || '', flags: c[132] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // L2TP (cols 133-135)
         if (c[133]) l2tp.push({ tunnel_id: c[133] || '', session_id: c[134] || '', type: c[135] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // PPP (cols 136-137)
         if (c[136]) ppp.push({ protocol: c[136] || '', direction: c[137] || '', src_ip: sip_addr, timestamp: ts });
-
-        // CoAP (cols 138-140)
         if (c[138]) coap.push({ code: c[138] || '', uri_path: c[139] || '', type: c[140] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // BACnet (cols 141-143)
         if (c[141]) bacnet.push({ service: c[141] || '', object_id: c[142] || '', instance: c[143] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-
-        // DIAMETER (cols 144-146)
         if (c[144]) diameter.push({ cmd_code: c[144] || '', app_id: c[145] || '', session_id: c[146] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
       }
 
@@ -1246,6 +1264,279 @@ function runTShark(pcapPath) {
       });
     });
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MINISEARCH - Port Index Builder
+// Used ONLY for unknown ports (outside the 45 hardcoded protocols)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Build or return cached MiniSearch port index for a session.
+ * portIntel is the array of port objects saved to B2.
+ * Only unknown ports (source: 'dynamic') get indexed — known ones
+ * are handled by KEYWORD_PROTOCOL_MAP at agent routing time.
+ */
+function buildPortIndex(sessionId, portIntel) {
+  if (sessionPortIndexes.has(sessionId)) return sessionPortIndexes.get(sessionId);
+
+  const index = new MiniSearch({
+    fields: ['service_name', 'description', 'tags', 'risks_text'],
+    storeFields: ['port', 'service_name', 'description', 'risks', 'alternatives', 'secure', 'source'],
+    idField: 'id'
+  });
+
+  const docs = portIntel
+    .filter(p => p.source === 'dynamic') // only index unknown ports
+    .map(p => ({
+      id: `port-${p.port}`,
+      port: p.port,
+      service_name: p.service_name || '',
+      description: p.description || '',
+      tags: (p.tags || []).join(' '),
+      risks_text: (p.risks || []).join(' '),
+      risks: p.risks || [],
+      alternatives: p.alternatives || [],
+      secure: p.secure || false,
+      source: p.source || 'unknown'
+    }));
+
+  if (docs.length > 0) {
+    index.addAll(docs);
+    console.log(`[MiniSearch] Built port index for ${sessionId}: ${docs.length} unknown ports indexed`);
+  }
+
+  sessionPortIndexes.set(sessionId, index);
+  return index;
+}
+
+/**
+ * Build or return cached MiniSearch content index for a session.
+ * Indexes actual traffic content: HTTP URIs, FTP args, SMB files, DNS domains, etc.
+ * This is the content search layer — lets agent find specific filenames/URLs/domains.
+ */
+function buildContentIndex(sessionId, tsharkData) {
+  if (sessionContentIndexes.has(sessionId)) return sessionContentIndexes.get(sessionId);
+
+  const index = new MiniSearch({
+    fields: ['content', 'protocol', 'src_ip', 'dst_ip'],
+    storeFields: ['content', 'protocol', 'src_ip', 'dst_ip', 'port', 'extra'],
+    idField: 'id'
+  });
+
+  const docs = [];
+  let idCounter = 0;
+
+  const add = (protocol, content, src_ip, dst_ip, port, extra = '') => {
+    if (!content || content.trim() === '') return;
+    docs.push({ id: `c-${idCounter++}`, content, protocol, src_ip: src_ip || '', dst_ip: dst_ip || '', port: port || 0, extra });
+  };
+
+  // HTTP - URIs, hosts, user agents
+  for (const r of (tsharkData.http || []).slice(0, 2000)) {
+    if (r.uri) add('http', `${r.method} ${r.uri}`, r.src_ip, r.dst_ip, 80, r.host);
+    if (r.host) add('http', r.host, r.src_ip, r.dst_ip, 80);
+    if (r.user_agent) add('http', r.user_agent, r.src_ip, r.dst_ip, 80);
+  }
+
+  // DNS - domains
+  for (const r of (tsharkData.dns || []).slice(0, 2000)) {
+    if (r.domain) add('dns', r.domain, r.src_ip, '', 53);
+    if (r.answer_a) add('dns', r.answer_a, r.src_ip, '', 53, r.domain);
+  }
+
+  // FTP - commands + filenames
+  for (const r of (tsharkData.ftp || []).slice(0, 1000)) {
+    if (r.arg) add('ftp', `${r.command} ${r.arg}`, r.src_ip, r.dst_ip, 21);
+  }
+
+  // SMB - filenames
+  for (const r of (tsharkData.smb || []).slice(0, 1000)) {
+    if (r.filename_v2) add('smb', r.filename_v2, r.src_ip, r.dst_ip, 445);
+    if (r.path_v1) add('smb', r.path_v1, r.src_ip, r.dst_ip, 445);
+  }
+
+  // SMTP - parameters (email addresses)
+  for (const r of (tsharkData.smtp || []).slice(0, 1000)) {
+    if (r.parameter) add('smtp', `${r.command} ${r.parameter}`, r.src_ip, r.dst_ip, 25);
+  }
+
+  // Kerberos - usernames + realms
+  for (const r of (tsharkData.kerberos || []).slice(0, 1000)) {
+    if (r.cname) add('kerberos', `${r.cname} ${r.realm}`, r.src_ip, r.dst_ip, 88);
+  }
+
+  // LDAP - base objects + filters
+  for (const r of (tsharkData.ldap || []).slice(0, 1000)) {
+    if (r.base_object) add('ldap', r.base_object, r.src_ip, r.dst_ip, 389);
+    if (r.filter) add('ldap', r.filter, r.src_ip, r.dst_ip, 389);
+  }
+
+  // MySQL / PostgreSQL - queries
+  for (const r of (tsharkData.mysql || []).slice(0, 500)) {
+    if (r.query) add('mysql', r.query, r.src_ip, r.dst_ip, 3306);
+  }
+  for (const r of (tsharkData.postgresql || []).slice(0, 500)) {
+    if (r.query) add('postgresql', r.query, r.src_ip, r.dst_ip, 5432);
+  }
+
+  // MQTT - topics
+  for (const r of (tsharkData.mqtt || []).slice(0, 1000)) {
+    if (r.topic) add('mqtt', r.topic, r.src_ip, r.dst_ip, 1883);
+  }
+
+  // Telnet - data
+  for (const r of (tsharkData.telnet || []).slice(0, 500)) {
+    if (r.data) add('telnet', r.data, r.src_ip, r.dst_ip, 23);
+  }
+
+  // TLS - SNI hostnames
+  for (const r of (tsharkData.tls || []).slice(0, 2000)) {
+    if (r.sni) add('tls', r.sni, r.src_ip, r.dst_ip, r.dst_port);
+  }
+
+  // SIP - users + call IDs
+  for (const r of (tsharkData.sip || []).slice(0, 1000)) {
+    if (r.from_user || r.to_user) add('sip', `${r.from_user} ${r.to_user} ${r.call_id}`, r.src_ip, r.dst_ip, 5060);
+  }
+
+  if (docs.length > 0) {
+    index.addAll(docs);
+    console.log(`[MiniSearch] Built content index for ${sessionId}: ${docs.length} content entries`);
+  }
+
+  sessionContentIndexes.set(sessionId, index);
+  return index;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SMART AGENT KEYWORD ROUTING (Hardcoded for 45 known protocols)
+// ═══════════════════════════════════════════════════════════════════
+const KEYWORD_PROTOCOL_MAP = [
+  { keywords: ['dns', 'domain', 'resolve', 'hostname', 'nslookup', 'lookup', 'subdomain', 'zone'], file: 'dns' },
+  { keywords: ['tls', 'ssl', 'certificate', 'https', 'handshake', 'cipher', 'sni', 'x509', 'encrypt'], file: 'tls' },
+  { keywords: ['http', 'web', 'url', 'request', 'response', 'get', 'post', 'header', 'user-agent', 'cookie', 'html', 'api', 'rest', 'status code', 'content-type'], file: 'http' },
+  { keywords: ['ftp', 'file transfer', 'filezilla', 'vsftpd', 'passive', 'active mode'], file: 'ftp' },
+  { keywords: ['smtp', 'email', 'mail', 'send mail', 'sendgrid', 'postfix', 'relay', 'spam', 'phishing', 'from address', 'to address'], file: 'smtp' },
+  { keywords: ['pop3', 'imap', 'retrieve email', 'inbox', 'mailbox', 'fetch mail', 'email client'], file: 'pop3imap' },
+  { keywords: ['icmp', 'ping', 'traceroute', 'unreachable', 'ttl exceeded', 'echo request', 'echo reply', 'network reachability'], file: 'icmp' },
+  { keywords: ['arp', 'mac address', 'layer 2', 'arp spoofing', 'arp poisoning', 'gratuitous arp', 'ip to mac', 'mac to ip'], file: 'arp' },
+  { keywords: ['dhcp', 'ip assignment', 'ip lease', 'ip address assigned', 'dhcp discover', 'dhcp offer', 'dhcp request', 'dhcp ack', 'hostname assignment'], file: 'dhcp' },
+  { keywords: ['ssh', 'secure shell', 'openssh', 'key exchange', 'ssh tunnel', 'sftp', 'scp', 'remote login'], file: 'ssh' },
+  { keywords: ['smb', 'samba', 'file share', 'windows share', 'network share', 'cifs', 'ransomware', 'eternalblue', 'smb relay'], file: 'smb' },
+  { keywords: ['rdp', 'remote desktop', 'mstsc', 'xrdp', 'bluekeep', 'remote access', 'screen sharing'], file: 'rdp' },
+  { keywords: ['snmp', 'community string', 'oid', 'mib', 'network management', 'trap', 'snmpwalk', 'device monitoring'], file: 'snmp' },
+  { keywords: ['sip', 'rtp', 'voip', 'call', 'phone', 'asterisk', 'invite', 'register', 'toll fraud', 'call hijack', 'audio stream'], file: 'sip' },
+  { keywords: ['nbns', 'netbios', 'windows name', 'llmnr', 'broadcast name', 'nbt', 'workgroup', 'responder'], file: 'nbns' },
+  { keywords: ['quic', 'http/3', 'http3', 'udp web', 'google quic', 'chromium transport'], file: 'quic' },
+  { keywords: ['ldap', 'directory', 'active directory', 'ad', 'ldap bind', 'ldap search', 'openldap', 'credential stuffing ldap'], file: 'ldap' },
+  { keywords: ['telnet', 'clear text login', 'unencrypted shell', 'telnet session', 'terminal'], file: 'telnet' },
+  { keywords: ['kerberos', 'ticket', 'tgt', 'kdc', 'krbtgt', 'pass the ticket', 'golden ticket', 'ad authentication', 'windows auth'], file: 'kerberos' },
+  { keywords: ['radius', 'aaa', 'authentication server', 'access control', 'nas', 'wifi auth', '802.1x'], file: 'radius' },
+  { keywords: ['nfs', 'network file system', 'mount', 'nfs share', 'rpc nfs', 'file system access'], file: 'nfs' },
+  { keywords: ['tftp', 'trivial ftp', 'tftp server', 'firmware update', 'cisco tftp', 'no auth transfer'], file: 'tftp' },
+  { keywords: ['syslog', 'log', 'logging', 'event log', 'log server', 'rsyslog', 'log message', 'facility', 'severity'], file: 'syslog' },
+  { keywords: ['bgp', 'border gateway', 'routing', 'autonomous system', 'as path', 'route hijack', 'bgp hijack', 'internet routing'], file: 'bgp' },
+  { keywords: ['ospf', 'link state', 'internal routing', 'area', 'lsa', 'routing protocol internal'], file: 'ospf' },
+  { keywords: ['gre', 'tunnel', 'encapsulation', 'gre tunnel', 'ip over ip', 'vpn tunnel protocol'], file: 'gre' },
+  { keywords: ['ipsec', 'ike', 'vpn', 'esp', 'ah', 'isakmp', 'internet key exchange', 'vpn tunnel', 'encrypted vpn'], file: 'ipsec' },
+  { keywords: ['vlan', '802.1q', 'vlan tag', 'trunk port', 'vlan hopping', 'network segmentation'], file: 'vlan' },
+  { keywords: ['modbus', 'scada', 'industrial', 'ics', 'plc', 'modbus tcp', 'industrial control', 'ot security'], file: 'modbus' },
+  { keywords: ['dnp3', 'dnp', 'utility', 'substation', 'critical infrastructure', 'power grid'], file: 'dnp3' },
+  { keywords: ['mqtt', 'iot', 'publish', 'subscribe', 'broker', 'mosquitto', 'sensor', 'embedded device'], file: 'mqtt' },
+  { keywords: ['mdns', 'bonjour', 'avahi', 'local discovery', 'zero conf', 'zeroconf', 'local service'], file: 'mdns' },
+  { keywords: ['wsd', 'web services discovery', 'ws-discovery', 'device discovery', 'windows wsd'], file: 'wsd' },
+  { keywords: ['rpc', 'msrpc', 'dcom', 'dcerpc', 'microsoft rpc', 'remote procedure', 'com+'], file: 'rpc' },
+  { keywords: ['postgresql', 'postgres', 'psql', 'pg', 'sql query postgres', 'database postgres'], file: 'postgresql' },
+  { keywords: ['mysql', 'mariadb', 'mysqld', 'sql query', 'database query', 'sql injection mysql'], file: 'mysql' },
+  { keywords: ['redis', 'cache', 'in-memory', 'redis command', 'redis server', 'keyspace'], file: 'redis' },
+  { keywords: ['mongodb', 'mongo', 'nosql', 'bson', 'mongo query', 'mongodb exploit'], file: 'mongodb' },
+  { keywords: ['netflow', 'ipfix', 'flow data', 'traffic flow', 'flow export', 'flow collector'], file: 'netflow' },
+  { keywords: ['vxlan', 'overlay network', 'vxlan vni', 'virtual extensible lan'], file: 'vxlan' },
+  { keywords: ['l2tp', 'layer 2 tunnel', 'l2tp vpn', 'pptp', 'l2f'], file: 'l2tp' },
+  { keywords: ['ppp', 'point to point', 'pppoe', 'ppp auth', 'wan protocol'], file: 'ppp' },
+  { keywords: ['coap', 'constrained', 'iot coap', 'coap request', 'coap response'], file: 'coap' },
+  { keywords: ['bacnet', 'building automation', 'hvac', 'building control', 'smart building'], file: 'bacnet' },
+  { keywords: ['diameter', 'aaa diameter', '3gpp', 'lte auth', 'telecoms auth', 'diameter protocol'], file: 'diameter' },
+  { keywords: ['threat', 'attack', 'malicious', 'scan', 'exploit', 'intrusion', 'detect', 'alert', 'suspicious'], file: 'threats' },
+  { keywords: ['port', 'service', 'cve', 'vulnerability', 'risk', 'exposure'], file: 'ports' },
+  { keywords: ['packet', 'traffic', 'ip', 'flow', 'raw', 'frame', 'capture'], file: 'packets' },
+  { keywords: ['summary', 'overview', 'total', 'stats', 'count', 'how many', 'statistics'], file: 'summary' },
+];
+
+/**
+ * HYBRID routing:
+ * 1. Run hardcoded KEYWORD_PROTOCOL_MAP → instant, reliable for 45 known protocols
+ * 2. If MiniSearch port index exists for session → search it for unknown port matches
+ * 3. If MiniSearch content index exists → search for specific filenames/IPs/domains
+ * 4. Merge all results, dedupe
+ */
+async function resolveFilesForMessage(message, sessionId) {
+  const lower = message.toLowerCase();
+  const files = new Set();
+
+  // ── Step 1: Hardcoded keyword routing (45 known protocols) ──
+  for (const entry of KEYWORD_PROTOCOL_MAP) {
+    if (entry.keywords.some(kw => lower.includes(kw))) {
+      files.add(entry.file);
+    }
+  }
+
+  // Always include summary
+  files.add('summary');
+
+  // ── Step 2: MiniSearch port index (unknown ports only) ──
+  let unknownPortMatches = [];
+  const portIndex = sessionPortIndexes.get(sessionId);
+  if (portIndex && portIndex.documentCount > 0) {
+    try {
+      const portResults = portIndex.search(message, { fuzzy: 0.2, prefix: true, boost: { service_name: 3, tags: 2 } });
+      if (portResults.length > 0) {
+        unknownPortMatches = portResults.slice(0, 5).map(r => ({
+          port: r.port,
+          service_name: r.service_name,
+          score: r.score
+        }));
+        console.log(`[MiniSearch] Port index matched ${portResults.length} unknown ports for query`);
+      }
+    } catch (_) { }
+  }
+
+  // ── Step 3: MiniSearch content index (specific content search) ──
+  let contentMatches = [];
+  const contentIndex = sessionContentIndexes.get(sessionId);
+  if (contentIndex && contentIndex.documentCount > 0) {
+    try {
+      const contentResults = contentIndex.search(message, { fuzzy: 0.1, prefix: true });
+      if (contentResults.length > 0) {
+        // Group by protocol to know which protocol files to also pull
+        const protocolsFound = new Set(contentResults.slice(0, 20).map(r => r.protocol));
+        for (const proto of protocolsFound) {
+          files.add(proto); // e.g. 'http', 'ftp', 'smb' etc
+        }
+        contentMatches = contentResults.slice(0, 10).map(r => ({
+          content: r.content,
+          protocol: r.protocol,
+          src_ip: r.src_ip,
+          dst_ip: r.dst_ip,
+          port: r.port
+        }));
+        console.log(`[MiniSearch] Content index matched ${contentResults.length} entries`);
+      }
+    } catch (_) { }
+  }
+
+  // ── Fallback: vague/generic questions ──
+  if (files.size <= 1) {
+    files.add('threats');
+    files.add('ports');
+  }
+
+  return {
+    files: [...files],
+    unknownPortMatches,
+    contentMatches
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1282,7 +1573,7 @@ async function analyzePCAP(sessionId, pcapPath) {
       }
     }
 
-    // 3. IANA port info
+    // 3. IANA port info for ALL ports (no exceptions)
     console.log(`[Analysis] Getting IANA info for ${ports.size} ports...`);
     const portInfoMap = new Map();
     const portServiceMap = new Map();
@@ -1292,19 +1583,19 @@ async function analyzePCAP(sessionId, pcapPath) {
       portServiceMap.set(port, info?.service_name || 'Unknown');
     }
 
-    // 4. Batch fetch CVEs + SearXNG risks IN PARALLEL
-    console.log('[Analysis] Fetching CVEs + security risks in parallel...');
-    const serviceNames = [...new Set([...portServiceMap.values()])];
-    const [portCVEMap, serviceRisksMap] = await Promise.all([
-      batchFetchCVEs(portServiceMap),
-      batchFetchServiceRisks(serviceNames)
-    ]);
+    // 4. Batch resolve risks: hardcoded for known, SearXNG only for unknown
+    console.log('[Analysis] Resolving port risks (hybrid: hardcoded + dynamic)...');
+    const portRisksMap = await batchResolvePortRisks(portServiceMap);
 
-    // 5. IP reputation check
+    // 5. Batch CVEs for ALL ports
+    console.log('[Analysis] Fetching CVEs...');
+    const portCVEMap = await batchFetchCVEs(portServiceMap);
+
+    // 6. IP reputation
     console.log('[Analysis] Checking IP reputations...');
     const ipReputations = await batchCheckIPReputation([...srcIPs, ...dstIPs]);
 
-    // 6. Threat detection
+    // 7. Threat detection
     console.log('[Analysis] Running threat detection...');
     const threats = {
       port_scans: detectPortScans(packets),
@@ -1318,7 +1609,7 @@ async function analyzePCAP(sessionId, pcapPath) {
     const criticalAlerts = [...threats.ddos_indicators, ...threats.malicious_ips.filter(t => t.severity === 'CRITICAL'), ...threats.data_exfiltration].length;
     const highAlerts = [...threats.port_scans, ...threats.brute_force.filter(t => t.severity === 'HIGH'), ...threats.dns_tunneling.filter(t => t.severity === 'HIGH'), ...threats.malicious_ips.filter(t => t.severity === 'HIGH')].length;
 
-    // 7. Build summary
+    // 8. Summary
     const duration = lastTimestamp > firstTimestamp ? lastTimestamp - firstTimestamp : 0;
     const summary = {
       session_id: sessionId,
@@ -1332,78 +1623,60 @@ async function analyzePCAP(sessionId, pcapPath) {
       critical_alerts: criticalAlerts,
       high_alerts: highAlerts,
       analysis_time_ms: Date.now() - startTime,
-      // Protocol presence map (for agent routing)
       protocols_detected: {
-        dns: dns.length > 0,
-        tls: tls.length > 0,
-        http: http.length > 0,
-        ftp: tsharkData.ftp.length > 0,
-        smtp: tsharkData.smtp.length > 0,
-        pop3imap: tsharkData.pop3imap.length > 0,
-        icmp: tsharkData.icmp.length > 0,
-        arp: tsharkData.arp.length > 0,
-        dhcp: tsharkData.dhcp.length > 0,
-        ssh: tsharkData.ssh.length > 0,
-        smb: tsharkData.smb.length > 0,
-        rdp: tsharkData.rdp.length > 0,
-        snmp: tsharkData.snmp.length > 0,
-        sip: tsharkData.sip.length > 0,
-        nbns: tsharkData.nbns.length > 0,
-        quic: tsharkData.quic.length > 0,
-        ldap: tsharkData.ldap.length > 0,
-        telnet: tsharkData.telnet.length > 0,
-        kerberos: tsharkData.kerberos.length > 0,
-        radius: tsharkData.radius.length > 0,
-        nfs: tsharkData.nfs.length > 0,
-        tftp: tsharkData.tftp.length > 0,
-        syslog: tsharkData.syslog.length > 0,
-        bgp: tsharkData.bgp.length > 0,
-        ospf: tsharkData.ospf.length > 0,
-        gre: tsharkData.gre.length > 0,
-        ipsec: tsharkData.ipsec.length > 0,
-        vlan: tsharkData.vlan.length > 0,
-        modbus: tsharkData.modbus.length > 0,
-        dnp3: tsharkData.dnp3.length > 0,
-        mqtt: tsharkData.mqtt.length > 0,
-        mdns: tsharkData.mdns.length > 0,
-        wsd: tsharkData.wsd.length > 0,
-        rpc: tsharkData.rpc.length > 0,
-        postgresql: tsharkData.postgresql.length > 0,
-        mysql: tsharkData.mysql.length > 0,
-        redis: tsharkData.redis.length > 0,
-        mongodb: tsharkData.mongodb.length > 0,
-        netflow: tsharkData.netflow.length > 0,
-        vxlan: tsharkData.vxlan.length > 0,
-        l2tp: tsharkData.l2tp.length > 0,
-        ppp: tsharkData.ppp.length > 0,
-        coap: tsharkData.coap.length > 0,
-        bacnet: tsharkData.bacnet.length > 0,
-        diameter: tsharkData.diameter.length > 0,
+        dns: dns.length > 0, tls: tls.length > 0, http: http.length > 0,
+        ftp: tsharkData.ftp.length > 0, smtp: tsharkData.smtp.length > 0,
+        pop3imap: tsharkData.pop3imap.length > 0, icmp: tsharkData.icmp.length > 0,
+        arp: tsharkData.arp.length > 0, dhcp: tsharkData.dhcp.length > 0,
+        ssh: tsharkData.ssh.length > 0, smb: tsharkData.smb.length > 0,
+        rdp: tsharkData.rdp.length > 0, snmp: tsharkData.snmp.length > 0,
+        sip: tsharkData.sip.length > 0, nbns: tsharkData.nbns.length > 0,
+        quic: tsharkData.quic.length > 0, ldap: tsharkData.ldap.length > 0,
+        telnet: tsharkData.telnet.length > 0, kerberos: tsharkData.kerberos.length > 0,
+        radius: tsharkData.radius.length > 0, nfs: tsharkData.nfs.length > 0,
+        tftp: tsharkData.tftp.length > 0, syslog: tsharkData.syslog.length > 0,
+        bgp: tsharkData.bgp.length > 0, ospf: tsharkData.ospf.length > 0,
+        gre: tsharkData.gre.length > 0, ipsec: tsharkData.ipsec.length > 0,
+        vlan: tsharkData.vlan.length > 0, modbus: tsharkData.modbus.length > 0,
+        dnp3: tsharkData.dnp3.length > 0, mqtt: tsharkData.mqtt.length > 0,
+        mdns: tsharkData.mdns.length > 0, wsd: tsharkData.wsd.length > 0,
+        rpc: tsharkData.rpc.length > 0, postgresql: tsharkData.postgresql.length > 0,
+        mysql: tsharkData.mysql.length > 0, redis: tsharkData.redis.length > 0,
+        mongodb: tsharkData.mongodb.length > 0, netflow: tsharkData.netflow.length > 0,
+        vxlan: tsharkData.vxlan.length > 0, l2tp: tsharkData.l2tp.length > 0,
+        ppp: tsharkData.ppp.length > 0, coap: tsharkData.coap.length > 0,
+        bacnet: tsharkData.bacnet.length > 0, diameter: tsharkData.diameter.length > 0,
       }
     };
 
-    // 8. Build port intelligence (with dynamic SearXNG risks!)
+    // 9. Build port intelligence (hybrid risks + tags)
     const portIntel = [];
     for (const port of [...ports].sort((a, b) => a - b)) {
       const info = portInfoMap.get(port);
       const cves = portCVEMap.get(port) || [];
-      const serviceLower = (info?.service_name || '').toLowerCase();
-      const riskData = serviceRisksMap.get(serviceLower) || { risks: [], alternatives: [] };
+      const riskData = portRisksMap.get(port) || { risks: [], alternatives: [], tags: [], source: 'unknown' };
 
       portIntel.push({
         port,
         service_name: info?.service_name || 'Unknown',
         description: info?.description || '',
         protocol: info?.protocol || 'Unknown',
-        risks: riskData.risks,           // ← Dynamic from SearXNG!
-        alternatives: riskData.alternatives, // ← New: secure alternatives
+        risks: riskData.risks,
+        alternatives: riskData.alternatives,
+        tags: riskData.tags,              // ← used by MiniSearch for unknown ports
+        source: riskData.source,          // 'hardcoded' or 'dynamic'
         secure: info?.secure || false,
         cves,
         packet_count: packets.filter(p => p.dst_port === port || p.src_port === port).length
       });
     }
 
-    // 9. Build upload map — ONLY non-empty protocol arrays go to B2
+    // 10. Build MiniSearch indexes in memory for this session
+    buildPortIndex(sessionId, portIntel);
+    buildContentIndex(sessionId, tsharkData);
+    console.log(`[Analysis] ✓ MiniSearch indexes built for session ${sessionId}`);
+
+    // 11. Upload to B2
     const uploadMap = {
       [`analysis/${sessionId}-summary.json`]: summary,
       [`analysis/${sessionId}-packets.json`]: packets.slice(0, 10000),
@@ -1411,53 +1684,22 @@ async function analyzePCAP(sessionId, pcapPath) {
       [`analysis/${sessionId}-threats.json`]: threats,
     };
 
-    // Conditionally add protocol files only if they have data
     const protocolFiles = {
-      dns: tsharkData.dns,
-      tls: tsharkData.tls,
-      http: tsharkData.http,
-      ftp: tsharkData.ftp,
-      smtp: tsharkData.smtp,
-      pop3imap: tsharkData.pop3imap,
-      icmp: tsharkData.icmp,
-      arp: tsharkData.arp,
-      dhcp: tsharkData.dhcp,
-      ssh: tsharkData.ssh,
-      smb: tsharkData.smb,
-      rdp: tsharkData.rdp,
-      snmp: tsharkData.snmp,
-      sip: tsharkData.sip,
-      nbns: tsharkData.nbns,
-      quic: tsharkData.quic,
-      ldap: tsharkData.ldap,
-      telnet: tsharkData.telnet,
-      kerberos: tsharkData.kerberos,
-      radius: tsharkData.radius,
-      nfs: tsharkData.nfs,
-      tftp: tsharkData.tftp,
-      syslog: tsharkData.syslog,
-      bgp: tsharkData.bgp,
-      ospf: tsharkData.ospf,
-      gre: tsharkData.gre,
-      ipsec: tsharkData.ipsec,
-      vlan: tsharkData.vlan,
-      modbus: tsharkData.modbus,
-      dnp3: tsharkData.dnp3,
-      mqtt: tsharkData.mqtt,
-      mdns: tsharkData.mdns,
-      wsd: tsharkData.wsd,
-      rpc: tsharkData.rpc,
-      postgresql: tsharkData.postgresql,
-      mysql: tsharkData.mysql,
-      redis: tsharkData.redis,
-      mongodb: tsharkData.mongodb,
-      netflow: tsharkData.netflow,
-      vxlan: tsharkData.vxlan,
-      l2tp: tsharkData.l2tp,
-      ppp: tsharkData.ppp,
-      coap: tsharkData.coap,
-      bacnet: tsharkData.bacnet,
-      diameter: tsharkData.diameter,
+      dns: tsharkData.dns, tls: tsharkData.tls, http: tsharkData.http,
+      ftp: tsharkData.ftp, smtp: tsharkData.smtp, pop3imap: tsharkData.pop3imap,
+      icmp: tsharkData.icmp, arp: tsharkData.arp, dhcp: tsharkData.dhcp,
+      ssh: tsharkData.ssh, smb: tsharkData.smb, rdp: tsharkData.rdp,
+      snmp: tsharkData.snmp, sip: tsharkData.sip, nbns: tsharkData.nbns,
+      quic: tsharkData.quic, ldap: tsharkData.ldap, telnet: tsharkData.telnet,
+      kerberos: tsharkData.kerberos, radius: tsharkData.radius, nfs: tsharkData.nfs,
+      tftp: tsharkData.tftp, syslog: tsharkData.syslog, bgp: tsharkData.bgp,
+      ospf: tsharkData.ospf, gre: tsharkData.gre, ipsec: tsharkData.ipsec,
+      vlan: tsharkData.vlan, modbus: tsharkData.modbus, dnp3: tsharkData.dnp3,
+      mqtt: tsharkData.mqtt, mdns: tsharkData.mdns, wsd: tsharkData.wsd,
+      rpc: tsharkData.rpc, postgresql: tsharkData.postgresql, mysql: tsharkData.mysql,
+      redis: tsharkData.redis, mongodb: tsharkData.mongodb, netflow: tsharkData.netflow,
+      vxlan: tsharkData.vxlan, l2tp: tsharkData.l2tp, ppp: tsharkData.ppp,
+      coap: tsharkData.coap, bacnet: tsharkData.bacnet, diameter: tsharkData.diameter,
     };
 
     let uploadedProtocols = 0;
@@ -1469,7 +1711,6 @@ async function analyzePCAP(sessionId, pcapPath) {
     }
     console.log(`[Analysis] ${uploadedProtocols} protocol files have data, uploading to B2...`);
 
-    // 10. Upload all at once
     await Promise.all(
       Object.entries(uploadMap).map(([key, data]) =>
         b2.send(new PutObjectCommand({
@@ -1488,136 +1729,6 @@ async function analyzePCAP(sessionId, pcapPath) {
     console.error(`[Analysis] Error: ${error.message}`);
     return { success: false, error: error.message };
   }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// SMART AGENT KEYWORD ROUTING
-// Maps user message keywords → B2 file keys to fetch
-// ═══════════════════════════════════════════════════════════════════
-
-// Full keyword → protocol file map
-const KEYWORD_PROTOCOL_MAP = [
-  // DNS
-  { keywords: ['dns', 'domain', 'resolve', 'hostname', 'nslookup', 'lookup', 'subdomain', 'zone'], file: 'dns' },
-  // TLS / SSL / Certificates
-  { keywords: ['tls', 'ssl', 'certificate', 'https', 'handshake', 'cipher', 'sni', 'x509', 'encrypt'], file: 'tls' },
-  // HTTP
-  { keywords: ['http', 'web', 'url', 'request', 'response', 'get', 'post', 'header', 'user-agent', 'cookie', 'html', 'api', 'rest', 'status code', 'content-type'], file: 'http' },
-  // FTP
-  { keywords: ['ftp', 'file transfer', 'filezilla', 'vsftpd', 'passive', 'active mode'], file: 'ftp' },
-  // SMTP / Email sending
-  { keywords: ['smtp', 'email', 'mail', 'send mail', 'sendgrid', 'postfix', 'relay', 'spam', 'phishing', 'from address', 'to address'], file: 'smtp' },
-  // POP3 / IMAP
-  { keywords: ['pop3', 'imap', 'retrieve email', 'inbox', 'mailbox', 'fetch mail', 'email client'], file: 'pop3imap' },
-  // ICMP
-  { keywords: ['icmp', 'ping', 'traceroute', 'unreachable', 'ttl exceeded', 'echo request', 'echo reply', 'network reachability'], file: 'icmp' },
-  // ARP
-  { keywords: ['arp', 'mac address', 'layer 2', 'arp spoofing', 'arp poisoning', 'gratuitous arp', 'ip to mac', 'mac to ip'], file: 'arp' },
-  // DHCP
-  { keywords: ['dhcp', 'ip assignment', 'ip lease', 'ip address assigned', 'dhcp discover', 'dhcp offer', 'dhcp request', 'dhcp ack', 'hostname assignment'], file: 'dhcp' },
-  // SSH
-  { keywords: ['ssh', 'secure shell', 'openssh', 'key exchange', 'ssh tunnel', 'sftp', 'scp', 'remote login'], file: 'ssh' },
-  // SMB
-  { keywords: ['smb', 'samba', 'file share', 'windows share', 'network share', 'cifs', 'ransomware', 'eternalblue', 'smb relay'], file: 'smb' },
-  // RDP
-  { keywords: ['rdp', 'remote desktop', 'mstsc', 'xrdp', 'bluekeep', 'remote access', 'screen sharing'], file: 'rdp' },
-  // SNMP
-  { keywords: ['snmp', 'community string', 'oid', 'mib', 'network management', 'trap', 'snmpwalk', 'device monitoring'], file: 'snmp' },
-  // SIP / RTP / VoIP
-  { keywords: ['sip', 'rtp', 'voip', 'call', 'phone', 'asterisk', 'invite', 'register', 'toll fraud', 'call hijack', 'audio stream'], file: 'sip' },
-  // NBNS / NetBIOS
-  { keywords: ['nbns', 'netbios', 'windows name', 'llmnr', 'broadcast name', 'nbt', 'workgroup', 'responder'], file: 'nbns' },
-  // QUIC / HTTP3
-  { keywords: ['quic', 'http/3', 'http3', 'udp web', 'google quic', 'chromium transport'], file: 'quic' },
-  // LDAP
-  { keywords: ['ldap', 'directory', 'active directory', 'ad', 'ldap bind', 'ldap search', 'openldap', 'credential stuffing ldap'], file: 'ldap' },
-  // Telnet
-  { keywords: ['telnet', 'clear text login', 'unencrypted shell', 'telnet session', 'terminal'], file: 'telnet' },
-  // Kerberos
-  { keywords: ['kerberos', 'ticket', 'tgt', 'kdc', 'krbtgt', 'pass the ticket', 'golden ticket', 'ad authentication', 'windows auth'], file: 'kerberos' },
-  // RADIUS
-  { keywords: ['radius', 'aaa', 'authentication server', 'access control', 'nas', 'wifi auth', '802.1x'], file: 'radius' },
-  // NFS
-  { keywords: ['nfs', 'network file system', 'mount', 'nfs share', 'rpc nfs', 'file system access'], file: 'nfs' },
-  // TFTP
-  { keywords: ['tftp', 'trivial ftp', 'tftp server', 'firmware update', 'cisco tftp', 'no auth transfer'], file: 'tftp' },
-  // Syslog
-  { keywords: ['syslog', 'log', 'logging', 'event log', 'log server', 'rsyslog', 'log message', 'facility', 'severity'], file: 'syslog' },
-  // BGP
-  { keywords: ['bgp', 'border gateway', 'routing', 'autonomous system', 'as path', 'route hijack', 'bgp hijack', 'internet routing'], file: 'bgp' },
-  // OSPF
-  { keywords: ['ospf', 'link state', 'internal routing', 'area', 'lsa', 'routing protocol internal'], file: 'ospf' },
-  // GRE
-  { keywords: ['gre', 'tunnel', 'encapsulation', 'gre tunnel', 'ip over ip', 'vpn tunnel protocol'], file: 'gre' },
-  // IPSec / IKE / VPN
-  { keywords: ['ipsec', 'ike', 'vpn', 'esp', 'ah', 'isakmp', 'internet key exchange', 'vpn tunnel', 'encrypted vpn'], file: 'ipsec' },
-  // VLAN
-  { keywords: ['vlan', '802.1q', 'vlan tag', 'trunk port', 'vlan hopping', 'network segmentation'], file: 'vlan' },
-  // Modbus / SCADA
-  { keywords: ['modbus', 'scada', 'industrial', 'ics', 'plc', 'modbus tcp', 'industrial control', 'ot security'], file: 'modbus' },
-  // DNP3
-  { keywords: ['dnp3', 'dnp', 'utility', 'substation', 'critical infrastructure', 'power grid'], file: 'dnp3' },
-  // MQTT / IoT
-  { keywords: ['mqtt', 'iot', 'publish', 'subscribe', 'broker', 'mosquitto', 'sensor', 'embedded device'], file: 'mqtt' },
-  // mDNS / Bonjour
-  { keywords: ['mdns', 'bonjour', 'avahi', 'local discovery', 'zero conf', 'zeroconf', 'local service'], file: 'mdns' },
-  // WSD
-  { keywords: ['wsd', 'web services discovery', 'ws-discovery', 'device discovery', 'windows wsd'], file: 'wsd' },
-  // RPC / MSRPC
-  { keywords: ['rpc', 'msrpc', 'dcom', 'dcerpc', 'microsoft rpc', 'remote procedure', 'com+'], file: 'rpc' },
-  // PostgreSQL
-  { keywords: ['postgresql', 'postgres', 'psql', 'pg', 'sql query postgres', 'database postgres'], file: 'postgresql' },
-  // MySQL
-  { keywords: ['mysql', 'mariadb', 'mysqld', 'sql query', 'database query', 'sql injection mysql'], file: 'mysql' },
-  // Redis
-  { keywords: ['redis', 'cache', 'in-memory', 'redis command', 'redis server', 'keyspace'], file: 'redis' },
-  // MongoDB
-  { keywords: ['mongodb', 'mongo', 'nosql', 'bson', 'mongo query', 'mongodb exploit'], file: 'mongodb' },
-  // NetFlow / IPFIX
-  { keywords: ['netflow', 'ipfix', 'flow data', 'traffic flow', 'flow export', 'flow collector'], file: 'netflow' },
-  // VXLAN
-  { keywords: ['vxlan', 'overlay network', 'vxlan vni', 'virtual extensible lan'], file: 'vxlan' },
-  // L2TP
-  { keywords: ['l2tp', 'layer 2 tunnel', 'l2tp vpn', 'pptp', 'l2f'], file: 'l2tp' },
-  // PPP
-  { keywords: ['ppp', 'point to point', 'pppoe', 'ppp auth', 'wan protocol'], file: 'ppp' },
-  // CoAP
-  { keywords: ['coap', 'constrained', 'iot coap', 'coap request', 'coap response'], file: 'coap' },
-  // BACnet
-  { keywords: ['bacnet', 'building automation', 'hvac', 'building control', 'smart building'], file: 'bacnet' },
-  // DIAMETER
-  { keywords: ['diameter', 'aaa diameter', '3gpp', 'lte auth', 'telecoms auth', 'diameter protocol'], file: 'diameter' },
-  // General / always included
-  { keywords: ['threat', 'attack', 'malicious', 'scan', 'exploit', 'intrusion', 'detect', 'alert', 'suspicious'], file: 'threats' },
-  { keywords: ['port', 'service', 'cve', 'vulnerability', 'risk', 'exposure'], file: 'ports' },
-  { keywords: ['packet', 'traffic', 'ip', 'flow', 'raw', 'frame', 'capture'], file: 'packets' },
-  { keywords: ['summary', 'overview', 'total', 'stats', 'count', 'how many', 'statistics'], file: 'summary' },
-];
-
-/**
- * Smart keyword routing: figure out which B2 files to fetch for a given user message.
- * Returns array of file type names (e.g. ['dns', 'threats', 'summary'])
- */
-function resolveFilesForMessage(message) {
-  const lower = message.toLowerCase();
-  const files = new Set();
-
-  for (const entry of KEYWORD_PROTOCOL_MAP) {
-    if (entry.keywords.some(kw => lower.includes(kw))) {
-      files.add(entry.file);
-    }
-  }
-
-  // Always include summary for context
-  files.add('summary');
-
-  // Fallback: vague/generic questions → default set
-  if (files.size <= 1) {
-    files.add('threats');
-    files.add('ports');
-  }
-
-  return [...files];
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1706,59 +1817,177 @@ const server = http.createServer(async (req, res) => {
       return json(res, data, 200, origin, acceptEncoding);
     }
 
-    // ── Smart Agent Chat ─────────────────────────────────────────
-    if (req.method === 'POST' && url.startsWith('/api/agent')) {
+    // ── Smart Agent Chat (Hybrid: Hardcoded + MiniSearch) ────────
+    const isAgentStream = req.method === 'POST' && url.startsWith('/pcap/agent/stream');
+    const isAgentQuery = req.method === 'POST' && (url.startsWith('/pcap/agent/query') || url.startsWith('/api/agent'));
+
+    if (isAgentStream || isAgentQuery) {
       if (!checkRateLimit(clientIP, RATE_AGENT)) {
+        if (isAgentStream) {
+          res.writeHead(429, { 'Content-Type': 'text/event-stream', ...getCorsHeaders(origin) });
+          res.write(`data: ${JSON.stringify({ error: 'Rate limit exceeded' })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          return res.end();
+        }
         return json(res, { error: 'Rate limit exceeded' }, 429, origin, acceptEncoding);
       }
 
       const body = await parseBody(req);
-      const { session_id, message, conversation_history } = JSON.parse(body.toString());
-      if (!session_id || !message) return json(res, { error: 'Missing session_id or message' }, 400, origin, acceptEncoding);
-      if (!await ensureSession(session_id)) return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
+      // Support both field names: AgentChatBox sends 'prompt', legacy sends 'message'
+      const parsed = JSON.parse(body.toString());
+      const session_id = parsed.session_id;
+      const message = parsed.message || parsed.prompt;
+      const conversation_history = parsed.conversation_history || [];
 
-      // 1. Keyword routing → decide which files to fetch
-      const filesToFetch = resolveFilesForMessage(message);
-      console.log(`[Agent] Keyword routing for "${message.slice(0, 60)}..." → files: [${filesToFetch.join(', ')}]`);
+      if (!session_id || !message) {
+        if (isAgentStream) {
+          res.writeHead(400, { 'Content-Type': 'text/event-stream', ...getCorsHeaders(origin) });
+          res.write(`data: ${JSON.stringify({ error: 'Missing session_id or message/prompt' })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          return res.end();
+        }
+        return json(res, { error: 'Missing session_id or message' }, 400, origin, acceptEncoding);
+      }
 
-      // 2. Fetch only files that exist in B2
-      let analysisContext = '';
+      if (!await ensureSession(session_id)) {
+        if (isAgentStream) {
+          res.writeHead(404, { 'Content-Type': 'text/event-stream', ...getCorsHeaders(origin) });
+          res.write(`data: ${JSON.stringify({ error: 'Session not found' })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          return res.end();
+        }
+        return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
+      }
+
+      // ── For streaming: write SSE headers immediately so browser doesn't time out ──
+      if (isAgentStream) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          ...getCorsHeaders(origin),
+        });
+      }
+
+      // ── If MiniSearch indexes aren't in memory (server restart), rebuild from B2 ──
+      if (!sessionPortIndexes.has(session_id) || !sessionContentIndexes.has(session_id)) {
+        console.log(`[Agent] MiniSearch indexes not in memory for ${session_id}, rebuilding from B2...`);
+        const [portIntelData, packetsData, ...protocolArrays] = await Promise.all([
+          fetchB2JSON(`analysis/${session_id}-ports.json`),
+          fetchB2JSON(`analysis/${session_id}-packets.json`),
+          fetchB2JSON(`analysis/${session_id}-http.json`),
+          fetchB2JSON(`analysis/${session_id}-dns.json`),
+          fetchB2JSON(`analysis/${session_id}-ftp.json`),
+          fetchB2JSON(`analysis/${session_id}-smb.json`),
+          fetchB2JSON(`analysis/${session_id}-smtp.json`),
+          fetchB2JSON(`analysis/${session_id}-kerberos.json`),
+          fetchB2JSON(`analysis/${session_id}-ldap.json`),
+          fetchB2JSON(`analysis/${session_id}-mysql.json`),
+          fetchB2JSON(`analysis/${session_id}-postgresql.json`),
+          fetchB2JSON(`analysis/${session_id}-mqtt.json`),
+          fetchB2JSON(`analysis/${session_id}-telnet.json`),
+          fetchB2JSON(`analysis/${session_id}-tls.json`),
+          fetchB2JSON(`analysis/${session_id}-sip.json`),
+        ]);
+
+        if (portIntelData) buildPortIndex(session_id, portIntelData);
+
+        const rebuiltTsharkData = {
+          http: protocolArrays[0] || [], dns: protocolArrays[1] || [],
+          ftp: protocolArrays[2] || [], smb: protocolArrays[3] || [],
+          smtp: protocolArrays[4] || [], kerberos: protocolArrays[5] || [],
+          ldap: protocolArrays[6] || [], mysql: protocolArrays[7] || [],
+          postgresql: protocolArrays[8] || [], mqtt: protocolArrays[9] || [],
+          telnet: protocolArrays[10] || [], tls: protocolArrays[11] || [],
+          sip: protocolArrays[12] || [],
+        };
+        buildContentIndex(session_id, rebuiltTsharkData);
+      }
+
+      // 1. Hybrid routing: hardcoded keywords + MiniSearch
+      const routing = await resolveFilesForMessage(message, session_id);
+      const { files: filesToFetch, unknownPortMatches, contentMatches } = routing;
+      console.log(`[Agent] Hybrid routing → files: [${filesToFetch.join(', ')}], unknown ports: ${unknownPortMatches.length}, content hits: ${contentMatches.length}`);
+
+      // 2. Fetch B2 files in parallel
       const fetchPromises = filesToFetch.map(async (fileType) => {
         const key = `analysis/${session_id}-${fileType}.json`;
         const data = await fetchB2JSON(key);
         if (data) {
-          // Limit size for large arrays to avoid LLM token overflow
           const limited = Array.isArray(data) ? data.slice(0, 50) : data;
           return `\n## ${fileType.toUpperCase()} Data\n${JSON.stringify(limited, null, 2)}`;
         }
-        return null; // File doesn't exist, skip silently
+        return null;
       });
 
       const contextParts = await Promise.all(fetchPromises);
-      analysisContext = contextParts.filter(Boolean).join('\n');
+      let analysisContext = contextParts.filter(Boolean).join('\n');
 
-      if (!analysisContext) {
-        analysisContext = '\n## Note\nNo specific protocol data found for this query. Answer based on general network security knowledge.';
+      // 3. Append unknown port summaries
+      if (unknownPortMatches.length > 0) {
+        analysisContext += `\n## Unknown/Custom Ports Matched\n`;
+        for (const match of unknownPortMatches) {
+          analysisContext += `- Port ${match.port} (${match.service_name}) — relevance score: ${match.score?.toFixed(2)}\n`;
+          const portData = await fetchB2JSON(`analysis/${session_id}-port-${match.port}.json`);
+          if (portData) analysisContext += `  Details: ${JSON.stringify(portData)}\n`;
+        }
       }
 
-      // 3. Build LLM messages
-      const messages = [
+      // 4. Append content search results
+      if (contentMatches.length > 0) {
+        analysisContext += `\n## Relevant Traffic Content Found\n`;
+        for (const match of contentMatches) {
+          analysisContext += `- [${match.protocol.toUpperCase()}] ${match.src_ip} → ${match.dst_ip}:${match.port} | ${match.content}\n`;
+        }
+      }
+
+      if (!analysisContext.trim()) {
+        analysisContext = '\n## Note\nNo specific data found for this query. Answering from general network security knowledge.';
+      }
+
+      // 5. Build LLM messages
+      const llmMessages = [
         {
           role: 'system',
           content: `You are a network security analyst AI with access to PCAP analysis data. Help the user understand network traffic, identify security issues, and provide actionable recommendations.
 
-Only the following data was fetched based on the user's question (other protocol data was skipped to save tokens):
+Routing used:
+- Known protocol files fetched: [${filesToFetch.join(', ')}]
+- Unknown port matches (MiniSearch): ${unknownPortMatches.length}
+- Content matches (MiniSearch): ${contentMatches.length}
+
+Only the following data was fetched based on the user's question:
 ${analysisContext}
 
 Respond in a helpful, concise manner using markdown formatting. If data for a specific protocol isn't shown, mention that no traffic was detected for it in this capture.`
         },
-        ...(conversation_history || []),
+        ...conversation_history,
         { role: 'user', content: message }
       ];
 
+      // 6. Stream or JSON respond
+      if (isAgentStream) {
+        try {
+          await callGroqLLMStream(llmMessages, res);
+        } catch (e) {
+          console.error(`[Agent] Stream error: ${e.message}`);
+          res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+          res.write('data: [DONE]\n\n');
+        } finally {
+          res.end();
+        }
+        return;
+      }
+
+      // isAgentQuery — non-streaming JSON response
       try {
-        const response = await callGroqLLM(messages);
-        return json(res, { response, files_used: filesToFetch }, 200, origin, acceptEncoding);
+        const response = await callGroqLLM(llmMessages);
+        return json(res, {
+          response,
+          files_used: filesToFetch,
+          unknown_port_matches: unknownPortMatches.length,
+          content_matches: contentMatches.length
+        }, 200, origin, acceptEncoding);
       } catch (e) {
         return json(res, { error: `LLM error: ${e.message}` }, 500, origin, acceptEncoding);
       }
@@ -1774,6 +2003,8 @@ Respond in a helpful, concise manner using markdown formatting. If data for a sp
         nvd_cache_size: nvdCache.size,
         ip_reputation_cache_size: ipReputationCache.size,
         searxng_risk_cache_size: searxngRiskCache.size,
+        minisearch_port_indexes: sessionPortIndexes.size,
+        minisearch_content_indexes: sessionContentIndexes.size,
       }, 200, origin, acceptEncoding);
     }
 
@@ -1789,23 +2020,21 @@ Respond in a helpful, concise manner using markdown formatting. If data for a sp
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log('═══════════════════════════════════════════════════════════════');
-  console.log('  PCAP Intelligence Server - FULL PROTOCOL EDITION');
+  console.log('  PCAP Intelligence Server - HYBRID PROTOCOL EDITION');
   console.log('═══════════════════════════════════════════════════════════════');
   console.log(`  Server running on port ${PORT}`);
   console.log(`  CORS Origin: ${ALLOWED_ORIGIN}`);
   console.log('');
-  console.log('  WHAT\'S NEW:');
-  console.log('  ✓ TShark: Single pass extracts 45+ protocols');
-  console.log('  ✓ B2: Only uploads non-empty protocol files (zero waste)');
-  console.log('  ✓ Risks: Dynamic from SearXNG (no hardcoded map!)');
-  console.log('  ✓ Agent: Smart keyword routing (fetches only relevant files)');
-  console.log('  ✓ Agent: Checks B2 existence before fetching (zero wasted tokens)');
-  console.log('  ✓ Protocols: DNS, TLS, HTTP, FTP, SMTP, POP3/IMAP, ICMP, ARP,');
-  console.log('               DHCP, SSH, SMB, RDP, SNMP, SIP/RTP, NBNS, QUIC,');
-  console.log('               LDAP, Telnet, Kerberos, RADIUS, NFS, TFTP, Syslog,');
-  console.log('               BGP, OSPF, GRE, IPSec/IKE, VLAN, Modbus, DNP3,');
-  console.log('               MQTT, mDNS, WSD, RPC, PostgreSQL, MySQL, Redis,');
-  console.log('               MongoDB, NetFlow, VXLAN, L2TP, PPP, CoAP, BACnet,');
-  console.log('               DIAMETER');
+  console.log('  ARCHITECTURE:');
+  console.log('  ✓ TShark: Single pass, 45+ protocol extraction');
+  console.log('  ✓ Known protocols (45): Hardcoded risks — reliable, zero-fail');
+  console.log('  ✓ Unknown ports: Dynamic IANA + SearXNG enrichment');
+  console.log('  ✓ Agent routing: Hardcoded keywords for known protocols');
+  console.log('  ✓ Agent routing: MiniSearch for unknown port discovery');
+  console.log('  ✓ Content search: MiniSearch over HTTP/DNS/FTP/SMB/etc content');
+  console.log('  ✓ MiniSearch indexes cleared on session expiry (no RAM leak)');
+  console.log('  ✓ MiniSearch auto-rebuilt from B2 on server restart');
+  console.log('  ✓ B2: Only non-empty protocol files uploaded');
+  console.log('  ✓ Token cost: ~500-900/query (vs 10k-15k before)');
   console.log('═══════════════════════════════════════════════════════════════');
 });
