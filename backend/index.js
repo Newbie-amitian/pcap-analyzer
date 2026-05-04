@@ -1105,166 +1105,165 @@ function callGroqLLMStream(messages, res) {
 // ═══════════════════════════════════════════════════════════════════
 // TSHARK - FULL PROTOCOL EXTRACTION (Single Pass, All Protocols)
 // ═══════════════════════════════════════════════════════════════════
-function runTShark(pcapPath) {
+// Step 1: get protocols actually present in this pcap
+function getPcapProtocols(pcapPath) {
   return new Promise((resolve, reject) => {
-
-    const fields = [
-      'frame.number', 'frame.time_epoch', 'frame.len',
-      'ip.src', 'ip.dst', 'ip.proto',
-      'tcp.srcport', 'tcp.dstport', 'tcp.flags',
-      'udp.srcport', 'udp.dstport',
-      '_ws.col.Protocol', '_ws.col.Info',
-      'dns.qry.name', 'dns.a', 'dns.aaaa', 'dns.flags.response', 'dns.qry.type',
-      'tls.handshake.type', 'tls.handshake.extensions_server_name',
-      'http.request.method', 'http.request.uri', 'http.host',
-      'http.response.code', 'http.user_agent', 'http.content_type',
-      'ftp.request.command', 'ftp.request.arg', 'ftp.response.code',
-      'smtp.req.command', 'smtp.req.parameter', 'smtp.response.code',
-      'pop.request.command', 'imap.request', 'imap.response',
-      'icmp.type', 'icmp.code', 'icmp.checksum',
-      'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.proto_ipv4',
-      'dhcp.option.hostname', 'dhcp.option.requested_ip_address',
-      'dhcp.option.dhcp', 'dhcp.hw.mac_addr',
-      'ssh.protocol', 'ssh.kex.algorithms', 'ssh.message_code',
-      'smb.cmd', 'smb.path', 'smb2.cmd', 'smb2.filename',
-      'rdp.negReq.requestedProtocols', 'rdp.domain',
-      'snmp.community', 'snmp.var_bind_str', 'snmp.version',
-      'sip.Method', 'sip.from.user', 'sip.to.user',
-      'sip.Call-ID', 'rtp.ssrc',
-      'nbns.name', 'nbss.type', 'netbios.name',
-      'quic.version', 'quic.connection_id', 'quic.packet_type',
-      'ldap.baseObject', 'ldap.filter_string', 'ldap.resultCode',
-      'telnet.data', 'telnet.cmd',
-      'kerberos.realm', 'kerberos.CNameString', 'kerberos.msg_type',
-      'radius.User_Name', 'radius.code', 'radius.NAS_IP_Address',
-      'nfs.path', 'nfs.ftype', 'nfs.status',
-      'tftp.opcode', 'tftp.source_file', 'tftp.destination_file',
-      'syslog.facility', 'syslog.severity', 'syslog.msg',
-      'bgp.type', 'bgp.prefix_length', 'bgp.next_hop',
-      'ospf.msg', 'ospf.srcrouter', 'ospf.area_id',
-      'gre.proto', 'gre.key',
-      'isakmp.exchtype', 'esp.sequence', 'isakmp.version',
-      'vlan.id', 'vlan.priority',
-      'mbtcp.func_code', 'mbtcp.reference_num', 'mbtcp.word_cnt',
-      'dnp3.ctl.dir', 'dnp3.src', 'dnp3.dst',
-      'mqtt.msgtype', 'mqtt.topic', 'mqtt.msg',
-      'mdns.qry.name', 'mdns.ans.name',
-      'wsd.action',
-      'dcerpc.opnum', 'dcerpc.cn_call_id', 'dcerpc.pkt_type',
-      'pgsql.query', 'pgsql.authtype', 'pgsql.statement',
-      'mysql.query', 'mysql.command', 'mysql.affected_rows',
-      'redis.command', 'redis.bulk_string',
-      'mongo.opcode', 'mongo.query', 'mongo.documents',
-      'cflow.srcaddr', 'cflow.dstaddr', 'cflow.packets',
-      'vxlan.vni', 'vxlan.flags',
-      'l2tp.tunnel_id', 'l2tp.session_id', 'l2tp.type',
-      'ppp.protocol', 'ppp.direction',
-      'coap.code', 'coap.opt.uri_path_recon', 'coap.type',
-      'bacapp.service', 'bacapp.objectidentifier', 'bacapp.instance_number',
-      'diameter.cmd.code', 'diameter.applicationId', 'diameter.Session-Id',
-    ].join(' -e ');
-
-const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E header=y -E separator=\\t -E quote=n -e ${fields}`;
-    exec(cmd, { maxBuffer: 200 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return reject(new Error(`TShark failed: ${err.message}`));
-
-      const lines = stdout.trim().split('\n');
-
-      const packets = [], dns = [], tls = [], http = [];
-      const ftp = [], smtp = [], pop3imap = [], icmp = [], arp = [], dhcp = [];
-      const ssh = [], smb = [], rdp = [], snmp = [], sip = [], nbns = [];
-      const quic = [], ldap = [], telnet = [], kerberos = [], radius = [], nfs = [];
-      const tftp = [], syslog = [], bgp = [], ospf = [], gre = [], ipsec = [];
-      const vlan = [], modbus = [], dnp3 = [], mqtt = [], mdns = [], wsd = [];
-      const rpc = [], postgresql = [], mysql = [], redis = [], mongodb = [];
-      const netflow = [], vxlan = [], l2tp = [], ppp = [], coap = [], bacnet = [];
-      const diameter = [];
-
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i];
-        if (!line.trim()) continue;
-        const c = line.split('\t');
-
-        const pkt = {
-          frame_number: parseInt(c[0]) || 0,
-          timestamp: parseFloat(c[1]) || 0,
-          length: parseInt(c[2]) || 0,
-          src_ip: c[3] || '',
-          dst_ip: c[4] || '',
-          ip_proto: c[5] || '',
-          src_port: parseInt(c[6]) || parseInt(c[9]) || 0,
-          dst_port: parseInt(c[7]) || parseInt(c[10]) || 0,
-          tcp_flags: c[8] || '',
-          protocol: c[11] || '',
-          info: c[12] || ''
-        };
-        packets.push(pkt);
-
-        const ts = pkt.timestamp;
-        const sip_addr = pkt.src_ip;
-        const dip_addr = pkt.dst_ip;
-
-        if (c[13]) dns.push({ domain: c[13], answer_a: c[14] || '', answer_aaaa: c[15] || '', is_response: c[16] === '1', qry_type: c[17] || '', src_ip: sip_addr, timestamp: ts });
-        if (c[18] || c[19]) tls.push({ handshake_type: c[18] || '', sni: c[19] || '', src_ip: sip_addr, dst_ip: dip_addr, dst_port: pkt.dst_port, timestamp: ts });
-        if (c[20] || c[21]) http.push({ method: c[20] || '', uri: c[21] || '', host: c[22] || '', status_code: c[23] || '', user_agent: c[24] || '', content_type: c[25] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[26] || c[28]) ftp.push({ command: c[26] || '', arg: c[27] || '', response_code: c[28] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[29] || c[31]) smtp.push({ command: c[29] || '', parameter: c[30] || '', response_code: c[31] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[32] || c[33]) pop3imap.push({ pop3_command: c[32] || '', imap_request: c[33] || '', imap_response: c[34] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[35]) icmp.push({ type: c[35] || '', code: c[36] || '', checksum: c[37] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[38]) arp.push({ opcode: c[38] || '', src_mac: c[39] || '', src_ip: c[40] || '', dst_ip: c[41] || '', timestamp: ts });
-        if (c[42] || c[45]) dhcp.push({ hostname: c[42] || '', requested_ip: c[43] || '', dhcp_type: c[44] || '', mac: c[45] || '', src_ip: sip_addr, timestamp: ts });
-        if (c[46]) ssh.push({ protocol: c[46] || '', kex_algorithms: c[47] || '', message_code: c[48] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[49] || c[51]) smb.push({ cmd_v1: c[49] || '', path_v1: c[50] || '', cmd_v2: c[51] || '', filename_v2: c[52] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[53] || c[54]) rdp.push({ protocols: c[53] || '', domain: c[54] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[55] || c[56]) snmp.push({ community: c[55] || '', var_bind: c[56] || '', version: c[57] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[58] || c[62]) sip.push({ method: c[58] || '', from_user: c[59] || '', to_user: c[60] || '', call_id: c[61] || '', rtp_ssrc: c[62] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[63] || c[65]) nbns.push({ name: c[63] || '', nbss_type: c[64] || '', netbios_name: c[65] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[66]) quic.push({ version: c[66] || '', connection_id: c[67] || '', packet_type: c[68] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[69] || c[71]) ldap.push({ base_object: c[69] || '', filter: c[70] || '', result_code: c[71] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[72]) telnet.push({ data: c[72] || '', cmd: c[73] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[74] || c[75]) kerberos.push({ realm: c[74] || '', cname: c[75] || '', msg_type: c[76] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[77] || c[78]) radius.push({ username: c[77] || '', code: c[78] || '', nas_ip: c[79] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[80]) nfs.push({ path: c[80] || '', ftype: c[81] || '', status: c[82] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[83]) tftp.push({ opcode: c[83] || '', source_file: c[84] || '', dest_file: c[85] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[88]) syslog.push({ facility: c[86] || '', severity: c[87] || '', message: c[88] || '', src_ip: sip_addr, timestamp: ts });
-        if (c[89]) bgp.push({ type: c[89] || '', prefix_length: c[90] || '', next_hop: c[91] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[92]) ospf.push({ msg: c[92] || '', src_router: c[93] || '', area_id: c[94] || '', src_ip: sip_addr, timestamp: ts });
-        if (c[95]) gre.push({ proto: c[95] || '', key: c[96] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[97] || c[98]) ipsec.push({ ike_exchtype: c[97] || '', esp_seq: c[98] || '', ike_version: c[99] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[100]) vlan.push({ vlan_id: c[100] || '', priority: c[101] || '', src_ip: sip_addr, timestamp: ts });
-        if (c[102]) modbus.push({ func_code: c[102] || '', ref_num: c[103] || '', word_cnt: c[104] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[105] || c[106]) dnp3.push({ dir: c[105] || '', src: c[106] || '', dst: c[107] || '', src_ip: sip_addr, timestamp: ts });
-        if (c[108]) mqtt.push({ msg_type: c[108] || '', topic: c[109] || '', msg: c[110] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[111] || c[112]) mdns.push({ query_name: c[111] || '', answer_name: c[112] || '', src_ip: sip_addr, timestamp: ts });
-        if (c[113]) wsd.push({ action: c[113] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[114]) rpc.push({ opnum: c[114] || '', call_id: c[115] || '', pkt_type: c[116] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[117]) postgresql.push({ query: c[117] || '', authtype: c[118] || '', statement: c[119] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[120] || c[121]) mysql.push({ query: c[120] || '', command: c[121] || '', affected_rows: c[122] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[123]) redis.push({ command: c[123] || '', response: c[124] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[125]) mongodb.push({ opcode: c[125] || '', query: c[126] || '', documents: c[127] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[128]) netflow.push({ src_addr: c[128] || '', dst_addr: c[129] || '', packets: c[130] || '', src_ip: sip_addr, timestamp: ts });
-        if (c[131]) vxlan.push({ vni: c[131] || '', flags: c[132] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[133]) l2tp.push({ tunnel_id: c[133] || '', session_id: c[134] || '', type: c[135] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[136]) ppp.push({ protocol: c[136] || '', direction: c[137] || '', src_ip: sip_addr, timestamp: ts });
-        if (c[138]) coap.push({ code: c[138] || '', uri_path: c[139] || '', type: c[140] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[141]) bacnet.push({ service: c[141] || '', object_id: c[142] || '', instance: c[143] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
-        if (c[144]) diameter.push({ cmd_code: c[144] || '', app_id: c[145] || '', session_id: c[146] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.protocols`;
+    exec(cmd, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(new Error(`TShark protocol detection failed: ${err.message}`));
+      const protocols = new Set();
+      for (const line of stdout.trim().split('\n')) {
+        for (const proto of line.split(':')) {
+          if (proto.trim()) protocols.add(proto.trim().toLowerCase());
+        }
       }
-
-      resolve({
-        packets, dns, tls, http,
-        ftp, smtp, pop3imap, icmp, arp, dhcp,
-        ssh, smb, rdp, snmp, sip, nbns,
-        quic, ldap, telnet, kerberos, radius, nfs,
-        tftp, syslog, bgp, ospf, gre, ipsec,
-        vlan, modbus, dnp3, mqtt, mdns, wsd,
-        rpc, postgresql, mysql, redis, mongodb,
-        netflow, vxlan, l2tp, ppp, coap, bacnet, diameter
-      });
+      // always keep base fields
+      protocols.add('frame');
+      protocols.add('ip');
+      protocols.add('tcp');
+      protocols.add('udp');
+      console.log(`[TShark] Protocols in pcap: ${[...protocols].join(', ')}`);
+      resolve(protocols);
     });
   });
 }
 
+// Step 2: get all fields tshark supports for those protocols
+function getTSharkFieldsForProtocols(protocols) {
+  return new Promise((resolve, reject) => {
+    exec(`"${TSHARK_BIN}" -G fields`, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(new Error(`TShark -G fields failed: ${err.message}`));
+
+      // always include these regardless of protocol detection
+      const BASE_FIELDS = [
+        'frame.number', 'frame.time_epoch', 'frame.len',
+        'ip.src', 'ip.dst', 'ip.proto',
+        'tcp.srcport', 'tcp.dstport', 'tcp.flags',
+        'udp.srcport', 'udp.dstport',
+        '_ws.col.Protocol', '_ws.col.Info',
+      ];
+
+      const fields = new Set(BASE_FIELDS);
+
+      for (const line of stdout.split('\n')) {
+        const parts = line.split('\t');
+        // tshark -G fields format: F <name> <field> <protocol> <type> ...
+        if (parts[0] !== 'F') continue;
+        const fieldName = parts[2];
+        const protocol = parts[3]?.toLowerCase();
+        if (protocol && protocols.has(protocol) && fieldName) {
+          fields.add(fieldName);
+        }
+      }
+
+      console.log(`[TShark] ${fields.size} fields matched for detected protocols`);
+      resolve([...fields]);
+    });
+  });
+}
+
+// Step 3: run extraction + bucket by protocol prefix dynamically
+function runTShark(pcapPath) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      // 1. detect protocols in pcap
+      const protocols = await getPcapProtocols(pcapPath);
+
+      // 2. get fields for those protocols from tshark itself
+      const fields = await getTSharkFieldsForProtocols(protocols);
+
+      // 3. run extraction
+      const fieldArgs = fields.map(f => `-e ${f}`).join(' ');
+      const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E header=y -E separator=\\t -E quote=n ${fieldArgs}`;
+
+      exec(cmd, { maxBuffer: 200 * 1024 * 1024 }, (err, stdout) => {
+        if (err) return reject(new Error(`TShark failed: ${err.message}`));
+
+        const lines = stdout.trim().split('\n');
+        if (lines.length < 2) return resolve({});
+
+        // 4. build column index from header row tshark gives us
+        const headers = lines[0].split('\t');
+        const col = {};
+        for (let i = 0; i < headers.length; i++) col[headers[i]] = i;
+        const g = (row, field) => row[col[field]] || '';
+
+        // 5. bucket rows dynamically by protocol prefix — no hardcoded ifs
+        const buckets = {};
+        // group fields by their protocol prefix (e.g. 'dns', 'http', 'smb2')
+        const protocolFields = {};
+        for (const field of fields) {
+          const parts = field.split('.');
+          if (parts.length < 2) continue;
+          const proto = parts[0];
+          if (!protocolFields[proto]) protocolFields[proto] = [];
+          protocolFields[proto].push(field);
+        }
+
+        // skip base fields from bucketing
+        const SKIP_PROTOS = new Set(['frame', 'ip', 'tcp', 'udp', '_ws']);
+
+        const packets = [];
+
+        for (let i = 1; i < lines.length; i++) {
+          const line = lines[i];
+          if (!line.trim()) continue;
+          const c = line.split('\t');
+
+          // always build base packet object
+          const pkt = {
+            frame_number: parseInt(g(c, 'frame.number')) || 0,
+            timestamp:    parseFloat(g(c, 'frame.time_epoch')) || 0,
+            length:       parseInt(g(c, 'frame.len')) || 0,
+            src_ip:       g(c, 'ip.src'),
+            dst_ip:       g(c, 'ip.dst'),
+            ip_proto:     g(c, 'ip.proto'),
+            src_port:     parseInt(g(c, 'tcp.srcport')) || parseInt(g(c, 'udp.srcport')) || 0,
+            dst_port:     parseInt(g(c, 'tcp.dstport')) || parseInt(g(c, 'udp.dstport')) || 0,
+            tcp_flags:    g(c, 'tcp.flags'),
+            protocol:     g(c, '_ws.col.Protocol'),
+            info:         g(c, '_ws.col.Info'),
+          };
+          packets.push(pkt);
+
+          // dynamically bucket by protocol — driven by field names, zero hardcoding
+          for (const [proto, protoFields] of Object.entries(protocolFields)) {
+            if (SKIP_PROTOS.has(proto)) continue;
+
+            // check if any field for this protocol has a value in this row
+            const entry = {};
+            let hasData = false;
+            for (const field of protoFields) {
+              const val = g(c, field);
+              if (val) hasData = true;
+              // field.name.subname → name_subname as key
+              const key = field.split('.').slice(1).join('_');
+              entry[key] = val;
+            }
+
+            if (hasData) {
+              if (!buckets[proto]) buckets[proto] = [];
+              buckets[proto].push({
+                ...entry,
+                src_ip: pkt.src_ip,
+                dst_ip: pkt.dst_ip,
+                src_port: pkt.src_port,
+                dst_port: pkt.dst_port,
+                timestamp: pkt.timestamp,
+              });
+            }
+          }
+        }
+
+        console.log(`[TShark] Extracted packets: ${packets.length}, protocol buckets: ${Object.keys(buckets).join(', ')}`);
+        resolve({ packets, ...buckets });
+      });
+
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
 // ═══════════════════════════════════════════════════════════════════
 // MINISEARCH - Port Index Builder
 // Used ONLY for unknown ports (outside the 45 hardcoded protocols)
