@@ -1201,9 +1201,22 @@ function runTShark(pcapPath) {
 
       let stdout = '';
       let stderr = '';
-      const proc = spawn(TSHARK_BIN, args, { timeout: 120000 });
-      proc.stdout.on('data', chunk => stdout += chunk.toString());
-      proc.stderr.on('data', chunk => stderr += chunk.toString());
+      console.log(`[TShark] Spawning with ${args.length} args (${fields.length} fields)...`);
+      const proc = spawn(TSHARK_BIN, args);
+      let procStarted = false;
+      proc.stdout.on('data', chunk => { 
+        if (!procStarted) { procStarted = true; console.log('[TShark] Process started, receiving output...'); }
+        stdout += chunk.toString(); 
+      });
+      proc.stderr.on('data', chunk => { stderr += chunk.toString(); });
+
+      // Manual timeout since spawn doesn't support it reliably
+      const spawnTimeout = setTimeout(() => {
+        console.error(`[TShark] TIMEOUT after 120s — killing process. stderr: ${stderr.slice(0, 500)}`);
+        proc.kill('SIGKILL');
+      }, 120000);
+      proc.on('close', (code) => {
+        clearTimeout(spawnTimeout);
       proc.on('error', err => reject(new Error(`TShark spawn failed: ${err.message}`)));
       proc.on('close', (code) => {
         if (code !== 0) return reject(new Error(`TShark exited ${code}: ${stderr}`));
