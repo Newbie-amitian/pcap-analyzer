@@ -465,45 +465,32 @@ async function resolvePortRisksAndTags(serviceName, portNum) {
  * Batch resolve risks for all ports, known ones skip SearXNG entirely
  */
 async function batchResolvePortRisks(portServiceMap) {
-  const unknownPorts = [];
   const results = new Map();
 
+  const uniquePortServicePairs = new Map();
   for (const [port, serviceName] of portServiceMap) {
-    const knownKey = getKnownProtocolKey(serviceName);
-    if (knownKey) {
-      const riskData = KNOWN_PROTOCOL_RISKS[knownKey];
-      const tags = new Set([knownKey]);
-      serviceName.toLowerCase().split(/[\s\-_\/]+/).filter(w => w.length > 2).forEach(w => tags.add(w));
-      riskData.risks.forEach(r => r.toLowerCase().split(/[\s\-]+/).filter(w => w.length > 3).forEach(w => tags.add(w)));
-      results.set(port, { risks: riskData.risks, alternatives: riskData.alternatives, tags: [...tags], source: 'hardcoded' });
-    } else {
-      unknownPorts.push({ port, serviceName });
+    if (!uniquePortServicePairs.has(serviceName)) {
+      uniquePortServicePairs.set(serviceName, port);
     }
   }
 
-  console.log(`[Hybrid] ${results.size} known protocol ports (hardcoded), ${unknownPorts.length} unknown ports (dynamic)`);
+  console.log(`[Risks] Resolving risks for ${uniquePortServicePairs.size} unique services (hybrid: hardcoded + SearXNG)...`);
 
-  // Only SearXNG-fetch the unknown ones, in parallel
-  if (unknownPorts.length > 0) {
-    const uniqueUnknownServices = [...new Set(unknownPorts.map(p => p.serviceName).filter(s =>
-      s && s !== 'Unknown' && s !== 'Ephemeral' && s !== 'Registered'
-    ))];
+  const resolvedCache = new Map();
+  await Promise.all(
+    [...uniquePortServicePairs.entries()].map(async ([serviceName, port]) => {
+      const resolved = await resolvePortRisksAndTags(serviceName, port);
+      resolvedCache.set(serviceName?.toLowerCase(), resolved);
+    })
+  );
 
-    const dynamicResults = new Map();
-    await Promise.all(uniqueUnknownServices.map(async (svc) => {
-      const data = await fetchServiceRisksFromSearXNG(svc);
-      dynamicResults.set(svc.toLowerCase(), data);
-    }));
-
-    for (const { port, serviceName } of unknownPorts) {
-      const data = dynamicResults.get(serviceName.toLowerCase()) || { risks: [], alternatives: [], tags: [serviceName.toLowerCase()] };
-      results.set(port, { ...data, source: 'dynamic' });
-    }
+  for (const [port, serviceName] of portServiceMap) {
+    const cached = resolvedCache.get(serviceName?.toLowerCase());
+    results.set(port, cached || { risks: [], alternatives: [], tags: [serviceName?.toLowerCase() || ''], source: 'unknown' });
   }
 
   return results;
 }
-
 // ═══════════════════════════════════════════════════════════════════
 // NVD API - CVE Lookups
 // ═══════════════════════════════════════════════════════════════════
