@@ -127,34 +127,59 @@ async function ensureSession(sessionId) {
   if (sessions.has(sessionId)) {
     return true;
   }
-  
+
+  // Check local disk first (fast)
   const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-  
   if (fs.existsSync(pcapPath)) {
-    console.log(`[SessionRecovery] Recreating lost session: ${sessionId}`);
-    
+    console.log(`[SessionRecovery] Recreating from local PCAP: ${sessionId}`);
     sessions.set(sessionId, {
       session_id: sessionId,
       filename: 'restored.pcap',
       created_at: Date.now(),
     });
-    
     return true;
   }
-  
-  return false;
+
+  // Check B2 for analysis summary (Render restart recovery)
+  try {
+    const r = await b2.send(new GetObjectCommand({
+      Bucket: process.env.B2_BUCKET_NAME,
+      Key: `analysis/${sessionId}-summary.json`,
+    }));
+    const text = await r.Body.transformToString();
+    const summaryData = JSON.parse(text);
+    console.log(`[SessionRecovery] Recreating from B2 summary: ${sessionId}`);
+    sessions.set(sessionId, {
+      session_id: sessionId,
+      filename: 'restored.pcap',
+      created_at: Date.now(),
+      total_packets: summaryData.total_packets || 0,
+    });
+    return true;
+  } catch (_) {
+    // Not in B2 either — session truly doesn't exist
+    return false;
+  }
 }
 
-setInterval(() => {
+setInterval(async () => {
   const now = Date.now();
   for (const [id, session] of sessions) {
     if (now - session.created_at > SESSION_TTL_MS) {
+      // Delete local files
       try { const p = path.join(PCAP_DIR, `${id}.pcap`); if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) { }
       try { const p = path.join(EXPORT_DIR, id); if (fs.existsSync(p)) fs.rmSync(p, { recursive: true }); } catch (_) { }
+      
+      // Delete B2 analysis files
+      const analysisTypes = ['summary', 'packets', 'dns', 'tls', 'http', 'ports'];
+      await Promise.all(analysisTypes.map(type =>
+        deleteFromB2(`analysis/${id}-${type}.json`).catch(() => {})
+      ));
+
       sessions.delete(id);
       imageStore.delete(id);
       portIntelCache.delete(id);
-      console.log(`[Session] Expired: ${id}`);
+      console.log(`[Session] Expired + B2 cleaned: ${id}`);
     }
   }
 }, 5 * 60 * 1000);
@@ -1669,11 +1694,90 @@ const server = http.createServer(async (req, res) => {
         }),
       ]);
 
-      sessions.set(session_id, { 
-        session_id, 
-        filename, 
+      // Run ALL tshark extractions in parallel (same as process-b2)
+      const [allPackets, allDns, allTls, allHttpReq, allHttpObj, allPorts] = await Promise.all([
+        runTshark(session_id, '', DEFAULT_FIELDS, 500),
+        getDnsQueries(session_id),
+        getTlsSni(session_id),
+        getHttpRequests(session_id),
+        getHttpObjects(session_id),
+        getAllPorts(session_id),
+      ]);
+
+      // Build summary metadata
+      const uploadIpCounts = {};
+      for (const p of allPackets) {
+        if (p.src_ip) uploadIpCounts[p.src_ip] = (uploadIpCounts[p.src_ip] || 0) + 1;
+        if (p.dst_ip) uploadIpCounts[p.dst_ip] = (uploadIpCounts[p.dst_ip] || 0) + 1;
+      }
+      const uploadDomains = new Set();
+      for (const q of allDns) if (q.domain) uploadDomains.add(q.domain);
+      for (const s of allTls) if (s.server_name) uploadDomains.add(s.server_name);
+      for (const r of allHttpReq) if (r.host) uploadDomains.add(r.host);
+
+      const uploadSummary = {
+        total_packets: quickTotal || 0,
+        protocols: quickProtos.protocols || {},
+        duration_seconds: Math.round(quickDuration) || 0,
+        unique_ports: Object.keys(allPorts).length,
+        unique_ips: Object.keys(uploadIpCounts).length,
+        unique_domains: uploadDomains.size,
+        dns_count: allDns.length,
+        tls_count: allTls.length,
+        http_count: allHttpReq.length,
+        http_objects_count: allHttpObj.length,
+        top_ips: Object.entries(uploadIpCounts).sort((a,b) => b[1]-a[1]).slice(0,10),
+        top_ports: Object.entries(allPorts).sort((a,b) => b[1]-a[1]).slice(0,20),
+      };
+
+      // Upload all analysis files to B2 in parallel
+      console.log(`[B2-Analysis] Uploading analysis files for ${session_id}...`);
+      await Promise.all([
+        b2.send(new PutObjectCommand({
+          Bucket: process.env.B2_BUCKET_NAME,
+          Key: `analysis/${session_id}-summary.json`,
+          Body: JSON.stringify(uploadSummary),
+          ContentType: 'application/json',
+        })),
+        b2.send(new PutObjectCommand({
+          Bucket: process.env.B2_BUCKET_NAME,
+          Key: `analysis/${session_id}-packets.json`,
+          Body: JSON.stringify(allPackets),
+          ContentType: 'application/json',
+        })),
+        b2.send(new PutObjectCommand({
+          Bucket: process.env.B2_BUCKET_NAME,
+          Key: `analysis/${session_id}-dns.json`,
+          Body: JSON.stringify(allDns),
+          ContentType: 'application/json',
+        })),
+        b2.send(new PutObjectCommand({
+          Bucket: process.env.B2_BUCKET_NAME,
+          Key: `analysis/${session_id}-tls.json`,
+          Body: JSON.stringify(allTls),
+          ContentType: 'application/json',
+        })),
+        b2.send(new PutObjectCommand({
+          Bucket: process.env.B2_BUCKET_NAME,
+          Key: `analysis/${session_id}-http.json`,
+          Body: JSON.stringify({ requests: allHttpReq, objects: allHttpObj }),
+          ContentType: 'application/json',
+        })),
+        b2.send(new PutObjectCommand({
+          Bucket: process.env.B2_BUCKET_NAME,
+          Key: `analysis/${session_id}-ports.json`,
+          Body: JSON.stringify(allPorts),
+          ContentType: 'application/json',
+        })),
+      ]);
+      console.log(`[B2-Analysis] ✓ All analysis files uploaded for ${session_id}`);
+
+      // Store ONLY tiny metadata in RAM
+      sessions.set(session_id, {
+        session_id,
+        filename,
         created_at: Date.now(),
-        total_packets: quickTotal || 0
+        total_packets: quickTotal || 0,
       });
 
       if (sessions.size > 10) {
@@ -1696,7 +1800,7 @@ const server = http.createServer(async (req, res) => {
           raw_text: '',
         },
       });
-      
+
       return;
     } catch (e) {
       console.error(`[Upload] Error: ${e.message}`);
@@ -1923,130 +2027,113 @@ if (isSmallTalk) {
   return;
 }
 
-// Get session data
-const sessionData = sessions.get(session_id);
+// ── Fetch summary from B2, route, fetch needed slices ──
+      const sessionData = sessions.get(session_id);
 
-// Get ALL data types for comprehensive context
-// Get ALL data types for comprehensive context
-// ── Per-session data cache ──────────────────────────────────
-const session = sessions.get(session_id);
-if (!session) {
-  res.writeHead(404, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
-  return res.end(JSON.stringify({ error: 'Session not found' }));
-}
-if (!session._cache) session._cache = {};
-const cache = session._cache;
+      async function fetchAnalysis(sid, type) {
+        try {
+          const r = await b2.send(new GetObjectCommand({
+            Bucket: process.env.B2_BUCKET_NAME,
+            Key: `analysis/${sid}-${type}.json`,
+          }));
+          const body = await r.Body.transformToString();
+          return JSON.parse(body);
+        } catch (e) {
+          console.error(`[B2-Fetch] Failed to fetch ${type} for ${sid}: ${e.message}`);
+          return null;
+        }
+      }
 
-if (!cache.packets)      cache.packets      = await runTshark(session_id, '', DEFAULT_FIELDS, 500);
-if (!cache.protocols)    cache.protocols    = await getProtocolCounts(session_id, 0);
-if (!cache.ports)        cache.ports        = await getAllPorts(session_id);
-if (!cache.dnsQueries)   cache.dnsQueries   = await getDnsQueries(session_id);
-if (!cache.tlsSni)       cache.tlsSni       = await getTlsSni(session_id);
-if (!cache.httpObjects)  cache.httpObjects  = await getHttpObjects(session_id);
-if (!cache.httpRequests) cache.httpRequests = await getHttpRequests(session_id);
+      // Step 1: Always fetch summary (tiny ~5KB)
+      const summary = await fetchAnalysis(session_id, 'summary');
+      if (!summary) {
+        res.writeHead(500, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
+        return res.end(JSON.stringify({ error: 'Analysis not found. Please re-upload your PCAP.' }));
+      }
 
-const packets     = cache.packets;
-const protocols   = cache.protocols;
-const ports       = cache.ports;
-const dnsQueries  = cache.dnsQueries;
-const tlsSni      = cache.tlsSni;
-const httpObjects = cache.httpObjects;
-const httpRequests= cache.httpRequests;
+      // Step 2: Router call (~200 tokens)
+      const routerContext = `Total Packets: ${summary.total_packets}
+Protocols: ${Object.entries(summary.protocols || {}).map(([p,c]) => `${p}(${c})`).join(', ')}
+Unique Ports: ${summary.unique_ports}
+DNS Queries: ${summary.dns_count}
+TLS Domains: ${summary.tls_count}
+HTTP Requests: ${summary.http_count}
+HTTP Objects: ${summary.http_objects_count}`;
 
-      // Build comprehensive context
-// Build comprehensive context
-      const contextSummary = `Total Packets: ${sessionData?.total_packets || packets.length}
-Protocols: ${Object.entries(protocols.protocols || {}).map(([p, c]) => `${p}(${c})`).join(', ')}
-Unique Ports: ${Object.keys(ports).length}
-DNS Queries: ${dnsQueries.length}
-TLS Domains: ${tlsSni.length}
-HTTP Objects: ${httpObjects.length}`;
+      const analysis = await analyzePromptForTshark(prompt, routerContext);
+      console.log(`[Agent-Stream] Intent: ${analysis.intent}, Need: ${analysis.data_types?.join(', ')}`);
 
-      // Step 1: Analyze prompt to decide what data is needed
-      // Step 1: Analyze prompt to decide what data is needed
-const analysis = await analyzePromptForTshark(prompt, contextSummary);
-console.log(`[Agent-Stream] Analysis: ${analysis.reasoning}`);
-console.log(`[Agent-Stream] Intent: ${analysis.intent}`);
+      if (analysis.intent === 'greeting') {
+        const corsHeaders = getCorsHeaders(origin);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', ...corsHeaders });
+        res.write(`data: ${JSON.stringify({ token: analysis.greeting_response || "Hey! Ask me anything about your PCAP!" })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
 
-// If greeting/small talk, respond directly without TShark
-if (analysis.intent === 'greeting') {
-  const corsHeaders = getCorsHeaders(origin);
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    ...corsHeaders,
-  });
-  const reply = analysis.greeting_response || "Hey! Ask me anything about your PCAP — protocols, IPs, DNS queries, suspicious traffic, and more.";
-  res.write(`data: ${JSON.stringify({ token: reply })}\n\n`);
-  res.write('data: [DONE]\n\n');
-  res.end();
-  return;
-}
+      // Step 3: Fetch only needed slices from B2 in parallel
+      const needed = analysis.data_types || ['packets', 'protocols'];
+      const fetchMap = {};
+      await Promise.all(needed.map(async (type) => {
+        if (type === 'protocols') { fetchMap.protocols = summary.protocols; return; }
+        if (type === 'dns') { fetchMap.dns = await fetchAnalysis(session_id, 'dns'); return; }
+        if (type === 'tls_sni') { fetchMap.tls = await fetchAnalysis(session_id, 'tls'); return; }
+        if (type === 'http' || type === 'http_objects') { fetchMap.http = await fetchAnalysis(session_id, 'http'); return; }
+        if (type === 'ports') { fetchMap.ports = await fetchAnalysis(session_id, 'ports'); return; }
+        if (type === 'packets') { fetchMap.packets = await fetchAnalysis(session_id, 'packets'); return; }
+      }));
 
-console.log(`[Agent-Stream] Need: ${analysis.data_types?.join(', ')}`);
+      // Step 4: Build focused context
+      const packets     = fetchMap.packets || [];
+      const dnsQueries  = fetchMap.dns || [];
+      const tlsSni      = fetchMap.tls || [];
+      const httpData    = fetchMap.http || { requests: [], objects: [] };
+      const httpRequests = httpData.requests || [];
+      const httpObjects  = httpData.objects || [];
+      const ports        = fetchMap.ports || {};
 
-      // Build context based on analysis - KEEP IT CONCISE
-      // Build compact, structured context — no raw packet rows
-const sortedProtos = Object.entries(protocols.protocols || {}).sort((a, b) => b[1] - a[1]).slice(0, 15);
-const sortedPorts = Object.entries(ports).sort((a, b) => b[1] - a[1]).slice(0, 20);
+      const allDomains = new Set();
+      for (const q of dnsQueries) if (q.domain) allDomains.add(q.domain);
+      for (const s of tlsSni) if (s.server_name) allDomains.add(s.server_name);
+      for (const r of httpRequests) if (r.host) allDomains.add(r.host);
 
-// Compute top IPs from packets
-const ipCounts = {};
-for (const p of packets) {
-  if (p.src_ip) ipCounts[p.src_ip] = (ipCounts[p.src_ip] || 0) + 1;
-  if (p.dst_ip) ipCounts[p.dst_ip] = (ipCounts[p.dst_ip] || 0) + 1;
-}
-const topIps = Object.entries(ipCounts).sort((a, b) => b[1] - a[1]).slice(0, 10);
+      const allUris = httpRequests.map(r =>
+        `#${r.frame_number || '?'} | ${r.method} http://${r.host}${r.uri}${r.post_body ? ` | POST DATA: ${r.post_body}` : ''}`
+      );
 
-// Collect ALL unique domains from DNS + TLS SNI + HTTP hosts (deduplicated)
-const allDomains = new Set();
-for (const q of dnsQueries) if (q.domain) allDomains.add(q.domain);
-for (const s of tlsSni) if (s.server_name) allDomains.add(s.server_name);
-for (const r of httpRequests) if (r.host) allDomains.add(r.host);
+      const packetList = packets.slice(0, 500).map(p =>
+        `#${p.id} | ${p.timestamp?.toFixed(3)}s | ${p.src_ip || '?'} → ${p.dst_ip || '?'} | ${p.protocol} | ${p.info || ''}`
+      ).join('\n');
 
-// All unique HTTP URIs
-// AFTER:
-const allUris = httpRequests.map(r =>
-  `#${r.frame_number || '?'} | ${r.method} http://${r.host}${r.uri}${r.post_body ? ` | POST DATA: ${r.post_body}` : ''}`
-);
+      const sortedProtos = Object.entries(summary.protocols || {}).sort((a,b) => b[1]-a[1]).slice(0,15);
+      const sortedPorts  = Object.entries(ports).sort((a,b) => b[1]-a[1]).slice(0,20);
 
-// Packets with numbers for lookup
-const packetList = packets.slice(0, 500).map(p =>
-  `#${p.id} | ${p.timestamp?.toFixed(3)}s | ${p.src_ip || '?'} → ${p.dst_ip || '?'} | ${p.protocol} | ${p.info || ''}`
-).join('\n');
-
-let fullContext = `
+      const fullContext = `
 === PCAP SUMMARY ===
-Total Packets: ${(sessionData?.total_packets || packets.length).toLocaleString()}
-Duration: ${protocols.maxTime?.toFixed(2) || 0}s
-Unique IPs: ${Object.keys(ipCounts).length}
-Unique Ports: ${Object.keys(ports).length}
-Unique Domains: ${allDomains.size}
+Total Packets: ${summary.total_packets.toLocaleString()}
+Duration: ${summary.duration_seconds || 0}s
+Unique IPs: ${summary.unique_ips || 0}
+Unique Ports: ${summary.unique_ports || 0}
+Unique Domains: ${summary.unique_domains || 0}
 
-=== PROTOCOLS ===
-${sortedProtos.map(([p, c]) => `${p}: ${c} packets`).join('\n')}
+${sortedProtos.length ? `=== PROTOCOLS ===\n${sortedProtos.map(([p,c]) => `${p}: ${c} packets`).join('\n')}` : ''}
 
-=== ALL DOMAINS VISITED (DNS + HTTPS + HTTP) ===
-${[...allDomains].sort().join('\n')}
+${allDomains.size ? `=== ALL DOMAINS VISITED ===\n${[...allDomains].sort().join('\n')}` : ''}
 
-=== HTTP REQUESTS ===
-${allUris.slice(0, 50).join('\n') || 'None'}
+${allUris.length ? `=== HTTP REQUESTS ===\n${allUris.slice(0,50).join('\n')}` : ''}
 
-=== HTTP OBJECTS (files downloaded) ===
-${httpObjects.map(o => `${o.filename} (${o.content_type}, ${o.size} bytes)`).join('\n') || 'None'}
+${httpObjects.length ? `=== HTTP OBJECTS ===\n${httpObjects.map(o => `${o.filename} (${o.content_type}, ${o.size} bytes)`).join('\n')}` : ''}
 
-=== TOP IPs ===
-${topIps.map(([ip, c]) => `${ip}: ${c} packets`).join('\n')}
+${summary.top_ips?.length ? `=== TOP IPs ===\n${summary.top_ips.map(([ip,c]) => `${ip}: ${c} packets`).join('\n')}` : ''}
 
-=== TOP PORTS ===
-${sortedPorts.map(([p, c]) => `port ${p}: ${c} packets`).join('\n')}
+${sortedPorts.length ? `=== TOP PORTS ===\n${sortedPorts.map(([p,c]) => `port ${p}: ${c} packets`).join('\n')}` : ''}
 
-=== PACKET LIST (with packet numbers) ===
-${packetList}
-`.trim();
-      // Step 2: Stream response with full context
-await callLLMStream(prompt, res, origin, fullContext, history);
+${packetList ? `=== PACKET LIST ===\n${packetList}` : ''}
+`.trim().replace(/\n{3,}/g, '\n\n');
+
+      // Step 5: Stream LLM response
+      await callLLMStream(prompt, res, origin, fullContext, history);
       return;
       
     } catch (e) {
@@ -2266,22 +2353,102 @@ Answer the user's question using ONLY the data above. Be specific with actual IP
         exec(cmd, { timeout: 10000 }, (err, stdout) =>
           resolve(parseFloat(stdout?.trim()) || 0));
       });
-      sessions.set(session_id, {
-        session_id,
-        filename: filename || b2_key.split('/').pop(),
-        created_at: Date.now(),
-        total_packets: quickTotal || 0,
-      });
-      return respond({
-        session_id,
-        summary: {
-          total_packets: quickTotal || 0,
-          protocols: quickProtos.protocols || {},
-          duration_seconds: Math.round(quickDuration) || 0,
-          time_range: { start: 0, end: Math.round(quickDuration) || 0 },
-          raw_text: '',
-        },
-      });
+      // Run ALL tshark extractions in parallel
+const [allPackets, allDns, allTls, allHttpReq, allHttpObj, allPorts] = await Promise.all([
+  runTshark(session_id, '', DEFAULT_FIELDS, 500),
+  getDnsQueries(session_id),
+  getTlsSni(session_id),
+  getHttpRequests(session_id),
+  getHttpObjects(session_id),
+  getAllPorts(session_id),
+]);
+
+// Build summary (tiny metadata only)
+const ipCounts = {};
+for (const p of allPackets) {
+  if (p.src_ip) ipCounts[p.src_ip] = (ipCounts[p.src_ip] || 0) + 1;
+  if (p.dst_ip) ipCounts[p.dst_ip] = (ipCounts[p.dst_ip] || 0) + 1;
+}
+const allDomains = new Set();
+for (const q of allDns) if (q.domain) allDomains.add(q.domain);
+for (const s of allTls) if (s.server_name) allDomains.add(s.server_name);
+for (const r of allHttpReq) if (r.host) allDomains.add(r.host);
+
+const summary = {
+  total_packets: quickTotal || 0,
+  protocols: quickProtos.protocols || {},
+  duration_seconds: Math.round(quickDuration) || 0,
+  unique_ports: Object.keys(allPorts).length,
+  unique_ips: Object.keys(ipCounts).length,
+  unique_domains: allDomains.size,
+  dns_count: allDns.length,
+  tls_count: allTls.length,
+  http_count: allHttpReq.length,
+  http_objects_count: allHttpObj.length,
+  top_ips: Object.entries(ipCounts).sort((a,b) => b[1]-a[1]).slice(0,10),
+  top_ports: Object.entries(allPorts).sort((a,b) => b[1]-a[1]).slice(0,20),
+};
+
+// Upload all analysis files to B2 in parallel
+console.log(`[B2-Analysis] Uploading analysis files for ${session_id}...`);
+await Promise.all([
+  b2.send(new PutObjectCommand({
+    Bucket: process.env.B2_BUCKET_NAME,
+    Key: `analysis/${session_id}-summary.json`,
+    Body: JSON.stringify(summary),
+    ContentType: 'application/json',
+  })),
+  b2.send(new PutObjectCommand({
+    Bucket: process.env.B2_BUCKET_NAME,
+    Key: `analysis/${session_id}-packets.json`,
+    Body: JSON.stringify(allPackets),
+    ContentType: 'application/json',
+  })),
+  b2.send(new PutObjectCommand({
+    Bucket: process.env.B2_BUCKET_NAME,
+    Key: `analysis/${session_id}-dns.json`,
+    Body: JSON.stringify(allDns),
+    ContentType: 'application/json',
+  })),
+  b2.send(new PutObjectCommand({
+    Bucket: process.env.B2_BUCKET_NAME,
+    Key: `analysis/${session_id}-tls.json`,
+    Body: JSON.stringify(allTls),
+    ContentType: 'application/json',
+  })),
+  b2.send(new PutObjectCommand({
+    Bucket: process.env.B2_BUCKET_NAME,
+    Key: `analysis/${session_id}-http.json`,
+    Body: JSON.stringify({ requests: allHttpReq, objects: allHttpObj }),
+    ContentType: 'application/json',
+  })),
+  b2.send(new PutObjectCommand({
+    Bucket: process.env.B2_BUCKET_NAME,
+    Key: `analysis/${session_id}-ports.json`,
+    Body: JSON.stringify(allPorts),
+    ContentType: 'application/json',
+  })),
+]);
+console.log(`[B2-Analysis] ✓ All analysis files uploaded for ${session_id}`);
+
+// Store ONLY tiny metadata in RAM
+sessions.set(session_id, {
+  session_id,
+  filename: filename || b2_key.split('/').pop(),
+  created_at: Date.now(),
+  total_packets: quickTotal || 0,
+});
+
+return respond({
+  session_id,
+  summary: {
+    total_packets: quickTotal || 0,
+    protocols: quickProtos.protocols || {},
+    duration_seconds: Math.round(quickDuration) || 0,
+    time_range: { start: 0, end: Math.round(quickDuration) || 0 },
+    raw_text: '',
+  },
+});
     } catch (e) {
       console.error(`[B2-Process] Error: ${e.message}`);
       return respond({ error: e.message }, 500);
