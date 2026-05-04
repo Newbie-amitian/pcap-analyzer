@@ -1157,6 +1157,11 @@ function getTSharkFieldsForProtocols(protocols) {
         }
       }
 
+    // DEBUG: sample what tshark -G fields actually looks like
+      const sampleLines = stdout.split('\n').filter(l => l.startsWith('F')).slice(0, 5);
+      console.log(`[TShark DEBUG] expandedProtocols: ${[...expandedProtocols].join(', ')}`);
+      console.log(`[TShark DEBUG] sample -G fields lines:\n${sampleLines.join('\n')}`);
+
       for (const line of stdout.split('\n')) {
         const parts = line.split('\t');
         if (parts[0] !== 'F') continue;
