@@ -1164,8 +1164,7 @@ function runTShark(pcapPath) {
       'diameter.cmd.code', 'diameter.applicationId', 'diameter.Session-Id',
     ].join(' -e ');
 
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E header=y -E separator=/t -E quote=n -e ${fields} 2>/dev/null`;
-
+const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E header=y -E separator=\\t -E quote=n -e ${fields}`;
     exec(cmd, { maxBuffer: 200 * 1024 * 1024 }, (err, stdout) => {
       if (err) return reject(new Error(`TShark failed: ${err.message}`));
 
