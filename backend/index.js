@@ -1152,10 +1152,19 @@ function runTShark(pcapPath) {
       for (const rawPkt of rawPackets) {
         const layers = rawPkt._source?.layers || {};
 
-        const gv = (field) => {
-          const val = layers[field];
-          if (Array.isArray(val)) return val[0] || '';
-          return val || '';
+const gv = (field) => {
+          // Try flat key first (some tshark versions flatten)
+          if (layers[field] !== undefined) {
+            const val = layers[field];
+            return Array.isArray(val) ? val[0] || '' : (val || '');
+          }
+          // Try nested: field = 'udp.srcport' → layers['udp']['udp.srcport']
+          const proto = field.split('.')[0];
+          if (layers[proto] && typeof layers[proto] === 'object') {
+            const val = layers[proto][field];
+            if (val !== undefined) return Array.isArray(val) ? val[0] || '' : (val || '');
+          }
+          return '';
         };
 
         // DEBUG: log first packet's layer keys to see actual field names
@@ -1195,10 +1204,14 @@ if (packets.length === 0) {
             timestamp: pkt.timestamp,
           };
 
-          for (const [k, v] of Object.entries(layers)) {
-            if (!k.startsWith(proto + '.')) continue;
-            const key = k.slice(proto.length + 1).replace(/\./g, '_');
-            entry[key] = Array.isArray(v) ? v[0] : (v || '');
+// In nested JSON mode, protocol fields are inside layers[proto]
+          const protoLayer = layers[proto];
+          if (protoLayer && typeof protoLayer === 'object' && !Array.isArray(protoLayer)) {
+            for (const [k, v] of Object.entries(protoLayer)) {
+              if (!k.startsWith(proto + '.')) continue;
+              const key = k.slice(proto.length + 1).replace(/\./g, '_');
+              entry[key] = Array.isArray(v) ? v[0] : (typeof v === 'object' ? '' : (v || ''));
+            }
           }
 
           if (!buckets[proto]) buckets[proto] = [];
