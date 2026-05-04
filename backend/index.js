@@ -1518,8 +1518,28 @@ Here's **filename.jpg** pulled from the traffic:
 
     let buffer = '';
 
-    response.body.on('data', (chunk) => {
-      buffer += Buffer.isBuffer(chunk) ? chunk.toString() : chunk;
+// Replace this block:
+response.body.on('data', (chunk) => { ... });
+response.body.on('end', () => { ... });
+response.body.on('error', (e) => { ... });
+
+// With this:
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+let buffer = '';
+
+const pump = async () => {
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+        console.log(`[LLM-Stream] ✓ Complete`);
+        return;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
@@ -1528,6 +1548,7 @@ Here's **filename.jpg** pulled from the traffic:
           const data = line.slice(6).trim();
           if (data === '[DONE]') {
             res.write('data: [DONE]\n\n');
+            res.end();
             return;
           }
           try {
@@ -1537,26 +1558,15 @@ Here's **filename.jpg** pulled from the traffic:
           } catch (_) {}
         }
       }
-    });
-
-    response.body.on('end', () => {
-      console.log(`[LLM-Stream] ✓ Complete`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-    });
-
-    response.body.on('error', (e) => {
-      console.error(`[LLM-Stream] Stream error: ${e.message}`);
-      res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
-      res.end();
-    });
-
+    }
   } catch (e) {
-    console.error(`[LLM-Stream] Groq error: ${e.message}`);
+    console.error(`[LLM-Stream] Stream error: ${e.message}`);
     res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
     res.end();
   }
-}
+};
+
+pump();
 
 async function callLLM(prompt, systemOverride = null) {
   const defaultSystem = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
