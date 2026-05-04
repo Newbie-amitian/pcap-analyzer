@@ -1360,9 +1360,26 @@ for (const [proto, data] of Object.entries(tsharkData)) {
   for (const r of data.slice(0, 2000)) {
     const parts = hints.map(f => r[f] || '').filter(Boolean);
     if (parts.length > 0) {
-      add(proto, parts.join(' '), r.src_ip, r.dst_ip, r.dst_port || r.src_port || 0);
+      add(
+        proto,
+        parts.join(' '),
+        r.src_ip,
+        r.dst_ip,
+        r.dst_port || r.src_port || 0
+      );
     }
   }
+}
+
+if (docs.length > 0) {
+  index.addAll(docs);
+  console.log(
+    `[MiniSearch] Built content index for ${sessionId}: ${docs.length} entries indexed`
+  );
+}
+
+sessionContentIndexes.set(sessionId, index);
+return index;
 }
 // ═══════════════════════════════════════════════════════════════════
 // SMART AGENT KEYWORD ROUTING (Hardcoded for 45 known protocols)
