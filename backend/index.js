@@ -1331,82 +1331,39 @@ function buildContentIndex(sessionId, tsharkData) {
   };
 
   // HTTP - URIs, hosts, user agents
-  for (const r of (tsharkData.http || []).slice(0, 2000)) {
-    if (r.uri) add('http', `${r.method} ${r.uri}`, r.src_ip, r.dst_ip, 80, r.host);
-    if (r.host) add('http', r.host, r.src_ip, r.dst_ip, 80);
-    if (r.user_agent) add('http', r.user_agent, r.src_ip, r.dst_ip, 80);
-  }
+  // Dynamically index content from all buckets
+// Each bucket row has auto-keyed fields (e.g. request_uri, qry_name)
+// plus src_ip, dst_ip, src_port, dst_port, timestamp always present
 
-  // DNS - domains
-  for (const r of (tsharkData.dns || []).slice(0, 2000)) {
-    if (r.domain) add('dns', r.domain, r.src_ip, '', 53);
-    if (r.answer_a) add('dns', r.answer_a, r.src_ip, '', 53, r.domain);
-  }
+const CONTENT_FIELD_HINTS = {
+  http:       ['request_uri', 'host', 'user_agent', 'request_method'],
+  dns:        ['qry_name', 'a', 'aaaa'],
+  ftp:        ['request_arg', 'request_command'],
+  smb:        ['filename', 'path'],   // smb2.filename → filename, smb.path → path
+  smb2:       ['filename'],
+  smtp:       ['req_parameter', 'req_command'],
+  kerberos:   ['CNameString', 'realm'],
+  ldap:       ['baseObject', 'filter_string'],
+  mysql:      ['query'],
+  pgsql:      ['query'],
+  mqtt:       ['topic'],
+  telnet:     ['data'],
+  tls:        ['handshake_extensions_server_name'],
+  sip:        ['from_user', 'to_user', 'Call-ID'],
+};
 
-  // FTP - commands + filenames
-  for (const r of (tsharkData.ftp || []).slice(0, 1000)) {
-    if (r.arg) add('ftp', `${r.command} ${r.arg}`, r.src_ip, r.dst_ip, 21);
-  }
+for (const [proto, data] of Object.entries(tsharkData)) {
+  if (proto === 'packets') continue;
+  const hints = CONTENT_FIELD_HINTS[proto];
+  if (!hints) continue; // skip protocols with nothing useful to index
 
-  // SMB - filenames
-  for (const r of (tsharkData.smb || []).slice(0, 1000)) {
-    if (r.filename_v2) add('smb', r.filename_v2, r.src_ip, r.dst_ip, 445);
-    if (r.path_v1) add('smb', r.path_v1, r.src_ip, r.dst_ip, 445);
+  for (const r of data.slice(0, 2000)) {
+    const parts = hints.map(f => r[f] || '').filter(Boolean);
+    if (parts.length > 0) {
+      add(proto, parts.join(' '), r.src_ip, r.dst_ip, r.dst_port || r.src_port || 0);
+    }
   }
-
-  // SMTP - parameters (email addresses)
-  for (const r of (tsharkData.smtp || []).slice(0, 1000)) {
-    if (r.parameter) add('smtp', `${r.command} ${r.parameter}`, r.src_ip, r.dst_ip, 25);
-  }
-
-  // Kerberos - usernames + realms
-  for (const r of (tsharkData.kerberos || []).slice(0, 1000)) {
-    if (r.cname) add('kerberos', `${r.cname} ${r.realm}`, r.src_ip, r.dst_ip, 88);
-  }
-
-  // LDAP - base objects + filters
-  for (const r of (tsharkData.ldap || []).slice(0, 1000)) {
-    if (r.base_object) add('ldap', r.base_object, r.src_ip, r.dst_ip, 389);
-    if (r.filter) add('ldap', r.filter, r.src_ip, r.dst_ip, 389);
-  }
-
-  // MySQL / PostgreSQL - queries
-  for (const r of (tsharkData.mysql || []).slice(0, 500)) {
-    if (r.query) add('mysql', r.query, r.src_ip, r.dst_ip, 3306);
-  }
-  for (const r of (tsharkData.postgresql || []).slice(0, 500)) {
-    if (r.query) add('postgresql', r.query, r.src_ip, r.dst_ip, 5432);
-  }
-
-  // MQTT - topics
-  for (const r of (tsharkData.mqtt || []).slice(0, 1000)) {
-    if (r.topic) add('mqtt', r.topic, r.src_ip, r.dst_ip, 1883);
-  }
-
-  // Telnet - data
-  for (const r of (tsharkData.telnet || []).slice(0, 500)) {
-    if (r.data) add('telnet', r.data, r.src_ip, r.dst_ip, 23);
-  }
-
-  // TLS - SNI hostnames
-  for (const r of (tsharkData.tls || []).slice(0, 2000)) {
-    if (r.sni) add('tls', r.sni, r.src_ip, r.dst_ip, r.dst_port);
-  }
-
-  // SIP - users + call IDs
-  for (const r of (tsharkData.sip || []).slice(0, 1000)) {
-    if (r.from_user || r.to_user) add('sip', `${r.from_user} ${r.to_user} ${r.call_id}`, r.src_ip, r.dst_ip, 5060);
-  }
-
-  if (docs.length > 0) {
-    index.addAll(docs);
-    console.log(`[MiniSearch] Built content index for ${sessionId}: ${docs.length} content entries`);
-  }
-
-  sessionContentIndexes.set(sessionId, index);
-  return index;
 }
-
 // ═══════════════════════════════════════════════════════════════════
 // SMART AGENT KEYWORD ROUTING (Hardcoded for 45 known protocols)
 // ═══════════════════════════════════════════════════════════════════
@@ -1548,8 +1505,8 @@ async function analyzePCAP(sessionId, pcapPath) {
     // 1. Run TShark (single pass, all protocols)
     console.log('[Analysis] Running TShark (full protocol extraction)...');
     const tsharkData = await runTShark(pcapPath);
-    const { packets, dns, tls, http } = tsharkData;
-    console.log(`[Analysis] Parsed ${packets.length} packets`);
+const { packets } = tsharkData;
+console.log(`[Analysis] Parsed ${packets.length} packets`);
 
     // 2. Aggregate base stats
     const ports = new Set();
@@ -1596,13 +1553,13 @@ async function analyzePCAP(sessionId, pcapPath) {
     // 7. Threat detection
     console.log('[Analysis] Running threat detection...');
     const threats = {
-      port_scans: detectPortScans(packets),
-      brute_force: detectBruteForce(packets),
-      dns_tunneling: detectDNSTunneling(dns),
-      data_exfiltration: detectDataExfiltration(packets, ipReputations),
-      ddos_indicators: detectDDoSPatterns(packets),
-      malicious_ips: detectMaliciousIPs([...srcIPs, ...dstIPs], ipReputations)
-    };
+  port_scans: detectPortScans(packets),
+  brute_force: detectBruteForce(packets),
+  dns_tunneling: detectDNSTunneling(tsharkData.dns || []),
+  data_exfiltration: detectDataExfiltration(packets, ipReputations),
+  ddos_indicators: detectDDoSPatterns(packets),
+  malicious_ips: detectMaliciousIPs([...srcIPs, ...dstIPs], ipReputations)
+};
 
     const criticalAlerts = [...threats.ddos_indicators, ...threats.malicious_ips.filter(t => t.severity === 'CRITICAL'), ...threats.data_exfiltration].length;
     const highAlerts = [...threats.port_scans, ...threats.brute_force.filter(t => t.severity === 'HIGH'), ...threats.dns_tunneling.filter(t => t.severity === 'HIGH'), ...threats.malicious_ips.filter(t => t.severity === 'HIGH')].length;
@@ -1621,32 +1578,11 @@ async function analyzePCAP(sessionId, pcapPath) {
       critical_alerts: criticalAlerts,
       high_alerts: highAlerts,
       analysis_time_ms: Date.now() - startTime,
-      protocols_detected: {
-        dns: dns.length > 0, tls: tls.length > 0, http: http.length > 0,
-        ftp: tsharkData.ftp.length > 0, smtp: tsharkData.smtp.length > 0,
-        pop3imap: tsharkData.pop3imap.length > 0, icmp: tsharkData.icmp.length > 0,
-        arp: tsharkData.arp.length > 0, dhcp: tsharkData.dhcp.length > 0,
-        ssh: tsharkData.ssh.length > 0, smb: tsharkData.smb.length > 0,
-        rdp: tsharkData.rdp.length > 0, snmp: tsharkData.snmp.length > 0,
-        sip: tsharkData.sip.length > 0, nbns: tsharkData.nbns.length > 0,
-        quic: tsharkData.quic.length > 0, ldap: tsharkData.ldap.length > 0,
-        telnet: tsharkData.telnet.length > 0, kerberos: tsharkData.kerberos.length > 0,
-        radius: tsharkData.radius.length > 0, nfs: tsharkData.nfs.length > 0,
-        tftp: tsharkData.tftp.length > 0, syslog: tsharkData.syslog.length > 0,
-        bgp: tsharkData.bgp.length > 0, ospf: tsharkData.ospf.length > 0,
-        gre: tsharkData.gre.length > 0, ipsec: tsharkData.ipsec.length > 0,
-        vlan: tsharkData.vlan.length > 0, modbus: tsharkData.modbus.length > 0,
-        dnp3: tsharkData.dnp3.length > 0, mqtt: tsharkData.mqtt.length > 0,
-        mdns: tsharkData.mdns.length > 0, wsd: tsharkData.wsd.length > 0,
-        rpc: tsharkData.rpc.length > 0, postgresql: tsharkData.postgresql.length > 0,
-        mysql: tsharkData.mysql.length > 0, redis: tsharkData.redis.length > 0,
-        mongodb: tsharkData.mongodb.length > 0, netflow: tsharkData.netflow.length > 0,
-        vxlan: tsharkData.vxlan.length > 0, l2tp: tsharkData.l2tp.length > 0,
-        ppp: tsharkData.ppp.length > 0, coap: tsharkData.coap.length > 0,
-        bacnet: tsharkData.bacnet.length > 0, diameter: tsharkData.diameter.length > 0,
-      }
-    };
-
+      protocols_detected: Object.fromEntries(
+  Object.entries(tsharkData)
+    .filter(([proto]) => proto !== 'packets')
+    .map(([proto, data]) => [proto, Array.isArray(data) && data.length > 0])
+),
     // 9. Build port intelligence (hybrid risks + tags)
     const portIntel = [];
     for (const port of [...ports].sort((a, b) => a - b)) {
@@ -1682,31 +1618,14 @@ async function analyzePCAP(sessionId, pcapPath) {
       [`analysis/${sessionId}-threats.json`]: threats,
     };
 
-    const protocolFiles = {
-      dns: tsharkData.dns, tls: tsharkData.tls, http: tsharkData.http,
-      ftp: tsharkData.ftp, smtp: tsharkData.smtp, pop3imap: tsharkData.pop3imap,
-      icmp: tsharkData.icmp, arp: tsharkData.arp, dhcp: tsharkData.dhcp,
-      ssh: tsharkData.ssh, smb: tsharkData.smb, rdp: tsharkData.rdp,
-      snmp: tsharkData.snmp, sip: tsharkData.sip, nbns: tsharkData.nbns,
-      quic: tsharkData.quic, ldap: tsharkData.ldap, telnet: tsharkData.telnet,
-      kerberos: tsharkData.kerberos, radius: tsharkData.radius, nfs: tsharkData.nfs,
-      tftp: tsharkData.tftp, syslog: tsharkData.syslog, bgp: tsharkData.bgp,
-      ospf: tsharkData.ospf, gre: tsharkData.gre, ipsec: tsharkData.ipsec,
-      vlan: tsharkData.vlan, modbus: tsharkData.modbus, dnp3: tsharkData.dnp3,
-      mqtt: tsharkData.mqtt, mdns: tsharkData.mdns, wsd: tsharkData.wsd,
-      rpc: tsharkData.rpc, postgresql: tsharkData.postgresql, mysql: tsharkData.mysql,
-      redis: tsharkData.redis, mongodb: tsharkData.mongodb, netflow: tsharkData.netflow,
-      vxlan: tsharkData.vxlan, l2tp: tsharkData.l2tp, ppp: tsharkData.ppp,
-      coap: tsharkData.coap, bacnet: tsharkData.bacnet, diameter: tsharkData.diameter,
-    };
-
     let uploadedProtocols = 0;
-    for (const [name, data] of Object.entries(protocolFiles)) {
-      if (data && data.length > 0) {
-        uploadMap[`analysis/${sessionId}-${name}.json`] = data;
-        uploadedProtocols++;
-      }
-    }
+for (const [proto, data] of Object.entries(tsharkData)) {
+  if (proto === 'packets') continue;
+  if (Array.isArray(data) && data.length > 0) {
+    uploadMap[`analysis/${sessionId}-${proto}.json`] = data;
+    uploadedProtocols++;
+  }
+}
     console.log(`[Analysis] ${uploadedProtocols} protocol files have data, uploading to B2...`);
 
     await Promise.all(
