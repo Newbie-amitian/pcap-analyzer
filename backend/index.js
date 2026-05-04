@@ -12,11 +12,9 @@ const zlib = require('zlib');
 // ═══════════════════════════════════════════════════════════════════
 const SEARXNG_URL = process.env.SEARXNG_URL;
 
-// Google Gemini AI
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const GEMINI_MODEL = 'gemini-2.0-flash';
+// Groq AI
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 // ALLOWED_ORIGIN: Your frontend URL (default: localhost for local dev)
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
@@ -24,7 +22,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
 // Validate required env vars on startup
 const missingVars = [];
 if (!SEARXNG_URL) missingVars.push('SEARXNG_URL');
-if (!GEMINI_API_KEY) missingVars.push('GEMINI_API_KEY');
+if (!GROQ_API_KEY) missingVars.push('GROQ_API_KEY');
 
 if (missingVars.length > 0) {
   console.error('═══════════════════════════════════════════════════════════════');
@@ -43,7 +41,7 @@ if (missingVars.length > 0) {
 
 console.log('✅ Environment variables loaded:');
 console.log(`   SEARXNG_URL    = ${SEARXNG_URL}`);
-console.log(`   GEMINI_API_KEY = ${GEMINI_API_KEY ? GEMINI_API_KEY.slice(0, 10) + '...' : 'NOT SET'}`);
+console.log(`   GROQ_API_KEY   = ${GROQ_API_KEY ? GROQ_API_KEY.slice(0, 10) + '...' : 'NOT SET'}`);
 console.log(`   ALLOWED_ORIGIN = ${ALLOWED_ORIGIN}`);
 
 // ── Backblaze B2 Client (S3-compatible) ───────────────────────
@@ -1346,9 +1344,7 @@ async function getEphemeralPortIntelligence(ephemeralPorts) {
 
 // Step 1: Analyze prompt to decide what TShark command to run
 async function analyzePromptForTshark(prompt, contextSummary) {
-  try {
-    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-    const analysisPrompt = `You are a PCAP network analysis assistant. Classify the user's message and decide what to do.
+  const analysisPrompt = `You are a PCAP network analysis assistant. Classify the user's message and decide what to do.
 
 AVAILABLE DATA TYPES:
 - packets: Basic packet list (src_ip, dst_ip, protocol, ports, info)
@@ -1378,19 +1374,34 @@ Respond with ONLY a JSON object (no markdown, no explanation):
   "reasoning": "brief explanation"
 }`;
 
-    const result = await model.generateContent(analysisPrompt);
-    const raw = result.response.text();
-    const clean = (raw || '{}').replace(/```json|```/gi, '').trim();
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [{ role: 'user', content: analysisPrompt }],
+        max_tokens: 200,
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+      }),
+    });
+    const data = await response.json();
+    const raw = data.choices?.[0]?.message?.content || '{}';
+    const clean = raw.replace(/```json|```/gi, '').trim();
     const match = clean.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(match ? match[0] : '{}');
     console.log(`[LLM-Analyze] Intent: ${parsed.intent}, Need: ${parsed.data_types?.join(', ')}`);
     return parsed;
   } catch (e) {
-    console.error(`[LLM-Analyze] Gemini error: ${e.message}`);
+    console.error(`[LLM-Analyze] Groq error: ${e.message}`);
     return { data_types: ['packets', 'protocols'], reasoning: 'Fallback' };
   }
 }
-// Step 2: Generate final response with all context
+
 // Step 2: Generate final response with all context
 async function callLLMStream(prompt, res, origin, fullContext, history = '') {
   const corsHeaders = getCorsHeaders(origin);
@@ -1401,10 +1412,7 @@ async function callLLMStream(prompt, res, origin, fullContext, history = '') {
     ...corsHeaders,
   });
 
-  try {
-    const model = genAI.getGenerativeModel({
-      model: GEMINI_MODEL,
-      systemInstruction: `You are PacketSight's friendly network analyst — sharp, knowledgeable, but casual. Like a security-savvy colleague explaining things over coffee.
+  const systemPrompt = `You are PacketSight's friendly network analyst — sharp, knowledgeable, but casual. Like a security-savvy colleague explaining things over coffee.
 
 RESPONSE STRUCTURE (always follow this):
 1. Start with 1-2 natural, conversational sentences that directly answer what was asked. Use phrases like "Looks like...", "You've got...", "I can see...", "Interestingly..." — never start with a heading, bullet, or robotic opener like "Based on the data provided."
@@ -1449,33 +1457,66 @@ Here's **filename.jpg** pulled from the traffic:
 - Replace filename.jpg with the EXACT filename from HTTP OBJECTS (e.g. aspen.jpg), and size with the actual byte count.
 - The src must be literally IMAGE_URL_PLACEHOLDER:filename.jpg — do not change this format, do not add http://, do not make it a real URL. The frontend will resolve it automatically.
 - Every single time an image preview is requested, output the ![...](...) tag. Never substitute it with text like "(Extracted from HTTP traffic)" or "here's the preview" without the actual image tag.
-- If the user asks again, output the ![...](...) tag again. Never skip it.`,
+- If the user asks again, output the ![...](...) tag again. Never skip it.`;
+
+  const userPrompt = `NETWORK DATA:\n${fullContext}\n\n${history ? `CONVERSATION HISTORY (last few messages for context):\n${history}\n\n` : ''}CURRENT QUESTION: ${prompt}\n\nAnswer based on the data and conversation history above:`;
+
+  try {
+    console.log(`[LLM-Stream] Prompt size: ${userPrompt.length} chars`);
+    console.log(`[LLM-Stream] Starting Groq streaming request...`);
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        max_tokens: 800,
+        temperature: 0.7,
+        stream: true,
+      }),
     });
 
-    const userPrompt = `NETWORK DATA:\n${fullContext}\n\n${history ? `CONVERSATION HISTORY (last few messages for context):\n${history}\n\n` : ''}CURRENT QUESTION: ${prompt}\n\nAnswer based on the data and conversation history above:`;
+    const reader = response.body;
+    let buffer = '';
 
-    console.log(`[LLM-Stream] Prompt size: ${userPrompt.length} chars`);
-    console.log(`[LLM-Stream] Starting Gemini streaming request...`);
+    for await (const chunk of reader) {
+      buffer += Buffer.from(chunk).toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
 
-    const result = await model.generateContentStream(userPrompt);
-
-    for await (const chunk of result.stream) {
-      const token = chunk.text();
-      if (token) {
-        res.write(`data: ${JSON.stringify({ token })}\n\n`);
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') {
+            res.write('data: [DONE]\n\n');
+            res.end();
+            console.log(`[LLM-Stream] ✓ Complete`);
+            return;
+          }
+          try {
+            const json = JSON.parse(data);
+            const token = json.choices?.[0]?.delta?.content;
+            if (token) res.write(`data: ${JSON.stringify({ token })}\n\n`);
+          } catch (_) {}
+        }
       }
     }
 
     res.write('data: [DONE]\n\n');
     res.end();
-    console.log(`[LLM-Stream] ✓ Complete`);
   } catch (e) {
-    console.error(`[LLM-Stream] Gemini error: ${e.message}`);
+    console.error(`[LLM-Stream] Groq error: ${e.message}`);
     res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
     res.end();
   }
-}
-async function callLLM(prompt, systemOverride = null) {
+}async function callLLM(prompt, systemOverride = null) {
   const defaultSystem = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
 
 RULES:
@@ -1484,20 +1525,31 @@ RULES:
 - Be specific with IPs, ports, protocols, and packet counts`;
 
   try {
-    const model = genAI.getGenerativeModel({
-      model: GEMINI_MODEL,
-      systemInstruction: systemOverride || defaultSystem,
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [
+          { role: 'system', content: systemOverride || defaultSystem },
+          { role: 'user', content: prompt },
+        ],
+        max_tokens: 800,
+        temperature: 0.7,
+      }),
     });
-    const result = await model.generateContent(prompt);
-    const text = result.response.text();
-    console.log(`[LLM] ✓ Got response (${text.length} chars)`);
+    const data = await response.json();
+    const text = data.choices?.[0]?.message?.content || null;
+    if (text) console.log(`[LLM] ✓ Got response (${text.length} chars)`);
     return text;
   } catch (e) {
-    console.error(`[LLM] Gemini error: ${e.message}`);
+    console.error(`[LLM] Groq error: ${e.message}`);
     return null;
   }
-}
-// ═══════════════════════════════════════════════════════════════════
+}// ═══════════════════════════════════════════════════════════════════
 // Main Server
 // ═══════════════════════════════════════════════════════════════════
 const server = http.createServer(async (req, res) => {
@@ -2243,6 +2295,6 @@ server.listen(PORT, () => {
   console.log('═══════════════════════════════════════════════════════════════');
   console.log(`🚀 PCAP Analyzer Backend running on port ${PORT}`);
   console.log(`📊 Engine: TShark + SearXNG (NO AI for port intel)`);
-console.log(`🤖 LLM: Google Gemini (${GEMINI_MODEL})`);
+console.log(`🤖 LLM: Groq (${GROQ_MODEL})`);
   console.log('═══════════════════════════════════════════════════════════════');
 });
