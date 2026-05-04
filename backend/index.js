@@ -7,46 +7,37 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 
 // ═══════════════════════════════════════════════════════════════════
-
-// REQUIRED ENVIRONMENT VARIABLES (Set these in Render dashboard!)
+// REQUIRED ENVIRONMENT VARIABLES
 // ═══════════════════════════════════════════════════════════════════
 const SEARXNG_URL = process.env.SEARXNG_URL;
-
-// Groq AI
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
-
-// ALLOWED_ORIGIN: Your frontend URL (default: localhost for local dev)
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const NVD_API_KEY = process.env.NVD_API_KEY || null;
+const ABUSEIPDB_API_KEY = process.env.ABUSEIPDB_API_KEY || null;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
+const SEARXNG_ENGINES = process.env.SEARXNG_ENGINES || 'google,bing,duckduckgo,startpage';
+const SEARXNG_MAX_RESULTS = parseInt(process.env.SEARXNG_MAX_RESULTS || '5');
 
-// Validate required env vars on startup
 const missingVars = [];
 if (!SEARXNG_URL) missingVars.push('SEARXNG_URL');
 if (!GROQ_API_KEY) missingVars.push('GROQ_API_KEY');
 
 if (missingVars.length > 0) {
-  console.error('═══════════════════════════════════════════════════════════════');
   console.error('❌ FATAL: Missing required environment variables!');
-  console.error('═══════════════════════════════════════════════════════════════');
   missingVars.forEach(v => console.error(`   - ${v}`));
-  console.error('');
-  console.error('Set these in your Render dashboard → Environment tab:');
-  console.error('   SEARXNG_URL     = https://searxng-krq1.onrender.com');
-  console.error('   CF_ACCOUNT_ID   = your_cloudflare_account_id');
-  console.error('   CF_API_TOKEN    = your_cloudflare_api_token');
-  console.error('   ALLOWED_ORIGIN  = http://localhost:3000 (or your Vercel URL)');
-  console.error('═══════════════════════════════════════════════════════════════');
   process.exit(1);
 }
 
 console.log('✅ Environment variables loaded:');
-console.log(`   SEARXNG_URL    = ${SEARXNG_URL}`);
-console.log(`   GROQ_API_KEY   = ${GROQ_API_KEY ? GROQ_API_KEY.slice(0, 10) + '...' : 'NOT SET'}`);
-console.log(`   ALLOWED_ORIGIN = ${ALLOWED_ORIGIN}`);
+console.log(`   SEARXNG_URL       = ${SEARXNG_URL}`);
+console.log(`   GROQ_API_KEY      = ${GROQ_API_KEY ? GROQ_API_KEY.slice(0, 10) + '...' : 'NOT SET'}`);
+console.log(`   GROQ_MODEL        = ${GROQ_MODEL}`);
+console.log(`   NVD_API_KEY       = ${NVD_API_KEY ? NVD_API_KEY.slice(0, 10) + '...' : 'NOT SET'}`);
+console.log(`   ABUSEIPDB_API_KEY = ${ABUSEIPDB_API_KEY ? ABUSEIPDB_API_KEY.slice(0, 10) + '...' : 'NOT SET'}`);
+console.log(`   ALLOWED_ORIGIN    = ${ALLOWED_ORIGIN}`);
 
-// ── Backblaze B2 Client (S3-compatible) ───────────────────────
-const { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+// ── Backblaze B2 Client ────────────────────────────────────────────
+const { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 
 const b2 = new S3Client({
   region: process.env.B2_BUCKET_REGION || 'us-west-004',
@@ -86,78 +77,649 @@ async function deleteFromB2(b2Key) {
   }
 }
 
+/**
+ * Check if a key exists in B2 without downloading it
+ */
+async function existsInB2(b2Key) {
+  try {
+    await b2.send(new HeadObjectCommand({
+      Bucket: process.env.B2_BUCKET_NAME,
+      Key: b2Key,
+    }));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Fetch JSON from B2, returns null if not found
+ */
+async function fetchB2JSON(b2Key) {
+  try {
+    const r = await b2.send(new GetObjectCommand({
+      Bucket: process.env.B2_BUCKET_NAME,
+      Key: b2Key,
+    }));
+    const text = await r.Body.transformToString();
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// IANA PORT REGISTRY - Dynamic Fetch from Official IANA CSV
+// ═══════════════════════════════════════════════════════════════════
+const IANA_CSV_URL = 'https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.csv';
+const IANA_CACHE_FILE = './iana_ports_cache.json';
+const IANA_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+let ianaPortRegistry = new Map();
+let ianaLastFetch = 0;
+let ianaFetchPromise = null;
+
+// Secure services (encrypted by default) — still makes sense to keep as a small set
+const SECURE_SERVICES = new Set([
+  'ssh', 'https', 'imaps', 'pop3s', 'ldaps', 'smtps', 'sips', 'ftps', 'dot', 'doq',
+  'tls', 'ssl', 'quic'
+]);
+
+async function fetchIANARegistry() {
+  if (ianaFetchPromise) return ianaFetchPromise;
+  if (ianaPortRegistry.size > 0 && (Date.now() - ianaLastFetch) < IANA_CACHE_TTL) {
+    return ianaPortRegistry;
+  }
+
+  if (fs.existsSync(IANA_CACHE_FILE)) {
+    try {
+      const cacheData = JSON.parse(fs.readFileSync(IANA_CACHE_FILE, 'utf8'));
+      if (cacheData.timestamp && (Date.now() - cacheData.timestamp) < IANA_CACHE_TTL) {
+        console.log('[IANA] ✓ Loaded from local cache');
+        ianaPortRegistry = new Map(Object.entries(cacheData.ports).map(([k, v]) => [parseInt(k), v]));
+        ianaLastFetch = cacheData.timestamp;
+        return ianaPortRegistry;
+      }
+    } catch (e) {
+      console.log('[IANA] Cache file corrupted, will refetch');
+    }
+  }
+
+  ianaFetchPromise = new Promise((resolve) => {
+    console.log('[IANA] Fetching official registry from iana.org...');
+    https.get(IANA_CSV_URL, { timeout: 30000, headers: { 'Accept': 'text/csv' } }, (res) => {
+      if (res.statusCode !== 200) {
+        console.error(`[IANA] HTTP ${res.statusCode}`);
+        ianaFetchPromise = null;
+        return resolve(new Map());
+      }
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = parseIANACSV(data);
+          ianaPortRegistry = parsed;
+          ianaLastFetch = Date.now();
+          const cacheObj = {
+            timestamp: ianaLastFetch,
+            ports: Object.fromEntries([...ianaPortRegistry].map(([k, v]) => [k.toString(), v]))
+          };
+          fs.writeFileSync(IANA_CACHE_FILE, JSON.stringify(cacheObj));
+          console.log(`[IANA] ✓ Loaded ${ianaPortRegistry.size} port entries`);
+          ianaFetchPromise = null;
+          resolve(ianaPortRegistry);
+        } catch (e) {
+          console.error(`[IANA] Parse error: ${e.message}`);
+          ianaFetchPromise = null;
+          resolve(new Map());
+        }
+      });
+    }).on('error', (e) => {
+      console.error(`[IANA] Fetch error: ${e.message}`);
+      ianaFetchPromise = null;
+      resolve(new Map());
+    }).on('timeout', () => {
+      console.error('[IANA] Timeout');
+      ianaFetchPromise = null;
+      resolve(new Map());
+    });
+  });
+
+  return ianaFetchPromise;
+}
+
+function parseIANACSV(csvData) {
+  const lines = csvData.split('\n');
+  const portMap = new Map();
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const parts = parseCSVLine(line);
+    if (parts.length < 4) continue;
+    const serviceName = parts[0]?.trim() || '';
+    const portNumber = parts[1]?.trim() || '';
+    const protocol = parts[2]?.trim() || '';
+    const description = parts[3]?.trim() || '';
+    if (!portNumber || !serviceName) continue;
+    if (portNumber.includes('-')) {
+      const [start, end] = portNumber.split('-').map(p => parseInt(p.trim()));
+      if (!isNaN(start) && !isNaN(end)) {
+        for (let port = start; port <= end; port++) {
+          addPortToRegistry(portMap, port, serviceName, protocol, description);
+        }
+      }
+    } else {
+      const port = parseInt(portNumber);
+      if (!isNaN(port)) addPortToRegistry(portMap, port, serviceName, protocol, description);
+    }
+  }
+  return portMap;
+}
+
+function parseCSVLine(line) {
+  const parts = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') { inQuotes = !inQuotes; }
+    else if (char === ',' && !inQuotes) { parts.push(current); current = ''; }
+    else { current += char; }
+  }
+  parts.push(current);
+  return parts;
+}
+
+function addPortToRegistry(portMap, port, serviceName, protocol, description) {
+  if (portMap.has(port)) return;
+  const serviceLower = serviceName.toLowerCase();
+  const isSecure = SECURE_SERVICES.has(serviceLower);
+  portMap.set(port, {
+    service: serviceName,
+    description: description || `${serviceName} Protocol`,
+    protocol: protocol || 'TCP/UDP',
+    secure: isSecure
+    // NOTE: risks are now fetched dynamically from SearXNG, not hardcoded
+  });
+}
+
+async function getIANAPortInfo(port) {
+  const portNum = parseInt(port);
+  if (isNaN(portNum)) return null;
+  const registry = await fetchIANARegistry();
+  const info = registry.get(portNum);
+  if (info) {
+    return {
+      port: portNum,
+      service_name: info.service,
+      description: info.description,
+      protocol: info.protocol,
+      secure: info.secure || false,
+      source: 'IANA Registry'
+    };
+  }
+  if (portNum >= 49152 && portNum <= 65535) {
+    return { port: portNum, service_name: 'Ephemeral', description: 'Dynamic/private port', protocol: 'TCP/UDP', secure: true, source: 'IANA Registry' };
+  }
+  if (portNum >= 1024 && portNum < 49152) {
+    return { port: portNum, service_name: 'Registered', description: 'Registered port - service depends on application', protocol: 'TCP/UDP', secure: false, source: 'IANA Registry' };
+  }
+  return { port: portNum, service_name: 'Unknown', description: 'Unassigned or unknown service', protocol: 'Unknown', secure: false, source: 'IANA Registry' };
+}
+
+fetchIANARegistry().then(() => console.log('[IANA] Registry initialized')).catch(e => console.error('[IANA] Init error:', e.message));
+
+// ═══════════════════════════════════════════════════════════════════
+// SearXNG - Dynamic Security Risk Lookup (replaces hardcoded map!)
+// ═══════════════════════════════════════════════════════════════════
+const searxngRiskCache = new Map();
+const SEARXNG_RISK_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+async function fetchServiceRisksFromSearXNG(serviceName) {
+  if (!serviceName || serviceName === 'Unknown' || serviceName === 'Ephemeral' || serviceName === 'Registered') {
+    return { risks: [], alternatives: [] };
+  }
+
+  const cacheKey = serviceName.toLowerCase();
+  const cached = searxngRiskCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp) < SEARXNG_RISK_TTL) {
+    return cached.data;
+  }
+
+  try {
+    const query = `${serviceName} protocol security risks vulnerabilities`;
+    const results = await searchSearXNG(query, 8000);
+
+    const risks = [];
+    const alternatives = [];
+
+    if (results.results && results.results.length > 0) {
+      // Extract risk keywords from snippets
+      const riskKeywords = [
+        'unencrypted', 'cleartext', 'clear text', 'plain text', 'no authentication',
+        'brute force', 'default credentials', 'buffer overflow', 'injection',
+        'man-in-the-middle', 'mitm', 'spoofing', 'amplification', 'ddos',
+        'information disclosure', 'data exposure', 'unauthenticated', 'anonymous',
+        'privilege escalation', 'remote code execution', 'rce', 'exploit',
+        'backdoor', 'malware', 'ransomware', 'exfiltration', 'tunneling',
+        'weak encryption', 'deprecated', 'insecure', 'vulnerable', 'attack'
+      ];
+
+      const altKeywords = [
+        'use instead', 'replace with', 'alternative', 'secure version',
+        'recommended', 'upgrade to', 'switch to', 'migrate to', 'prefer'
+      ];
+
+      for (const result of results.results.slice(0, 5)) {
+        const text = (result.title + ' ' + result.snippet).toLowerCase();
+
+        // Extract risks
+        for (const keyword of riskKeywords) {
+          if (text.includes(keyword)) {
+            const risk = capitalizeFirst(keyword.replace(/-/g, ' '));
+            if (!risks.includes(risk)) risks.push(risk);
+          }
+        }
+
+        // Extract alternatives
+        for (const keyword of altKeywords) {
+          const idx = text.indexOf(keyword);
+          if (idx !== -1) {
+            const snippet = text.slice(idx, idx + 60);
+            // Look for protocol names after the keyword
+            const protoMatch = snippet.match(/(?:ssh|sftp|https|ldaps|smtps|tls|ssl|snmpv3|imaps|pop3s|ftps|scp)\b/i);
+            if (protoMatch && !alternatives.includes(protoMatch[0].toUpperCase())) {
+              alternatives.push(protoMatch[0].toUpperCase());
+            }
+          }
+        }
+      }
+    }
+
+    const data = {
+      risks: risks.slice(0, 6),
+      alternatives: alternatives.slice(0, 3)
+    };
+
+    searxngRiskCache.set(cacheKey, { data, timestamp: Date.now() });
+    console.log(`[SearXNG] ✓ Risks for ${serviceName}: ${data.risks.length} found`);
+    return data;
+
+  } catch (e) {
+    console.error(`[SearXNG] Risk fetch error for ${serviceName}: ${e.message}`);
+    return { risks: [], alternatives: [] };
+  }
+}
+
+function capitalizeFirst(str) {
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+/**
+ * Batch fetch risks for multiple unique services in parallel
+ */
+async function batchFetchServiceRisks(serviceNames) {
+  const unique = [...new Set(serviceNames.filter(s =>
+    s && s !== 'Unknown' && s !== 'Ephemeral' && s !== 'Registered'
+  ))];
+
+  console.log(`[SearXNG] Batch fetching risks for ${unique.length} unique services...`);
+
+  const results = new Map();
+  await Promise.all(unique.map(async (name) => {
+    const risk = await fetchServiceRisksFromSearXNG(name);
+    results.set(name.toLowerCase(), risk);
+  }));
+
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NVD API - CVE Lookups
+// ═══════════════════════════════════════════════════════════════════
+const nvdCache = new Map();
+const NVD_CACHE_TTL = 24 * 60 * 60 * 1000;
+let nvdRequestQueue = [];
+let nvdProcessing = false;
+
+async function fetchCVEsFromNVD(serviceName, limit = 5) {
+  if (!serviceName) return [];
+  const cacheKey = serviceName.toLowerCase();
+  const cached = nvdCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp) < NVD_CACHE_TTL) return cached.data;
+
+  return new Promise((resolve) => {
+    nvdRequestQueue.push({ serviceName, limit, resolve });
+    processNVDQueue();
+  });
+}
+
+async function processNVDQueue() {
+  if (nvdProcessing || nvdRequestQueue.length === 0) return;
+  nvdProcessing = true;
+  while (nvdRequestQueue.length > 0) {
+    const request = nvdRequestQueue.shift();
+    const cacheKey = request.serviceName.toLowerCase();
+    const cached = nvdCache.get(cacheKey);
+    if (cached && (Date.now() - cached.timestamp) < NVD_CACHE_TTL) {
+      request.resolve(cached.data);
+      continue;
+    }
+    const result = await fetchNVDDirect(request.serviceName, request.limit);
+    request.resolve(result);
+    await new Promise(r => setTimeout(r, NVD_API_KEY ? 600 : 6000));
+  }
+  nvdProcessing = false;
+}
+
+function fetchNVDDirect(serviceName, limit) {
+  return new Promise((resolve) => {
+    const queryParams = new URLSearchParams({ keywordSearch: serviceName, resultsPerPage: limit.toString() });
+    const headers = {};
+    if (NVD_API_KEY) headers['apiKey'] = NVD_API_KEY;
+    const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?${queryParams.toString()}`;
+    console.log(`[NVD] Fetching CVEs for: ${serviceName}`);
+    const req = https.get(url, { headers, timeout: 15000 }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) return resolve([]);
+          const json = JSON.parse(data);
+          const cves = (json.vulnerabilities || []).slice(0, limit).map(vuln => {
+            const cve = vuln.cve;
+            const metrics = cve.metrics?.cvssMetricV31?.[0] || cve.metrics?.cvssMetricV2?.[0] || {};
+            const cvssData = metrics.cvssData || {};
+            return {
+              cve_id: cve.id,
+              cvss_score: cvssData.baseScore || null,
+              severity: cvssData.baseSeverity || metrics.baseSeverity || 'UNKNOWN',
+              description: cve.descriptions?.[0]?.value || 'No description available',
+              published: cve.published,
+              modified: cve.lastModified
+            };
+          });
+          nvdCache.set(serviceName.toLowerCase(), { data: cves, timestamp: Date.now() });
+          console.log(`[NVD] ✓ Found ${cves.length} CVEs for ${serviceName}`);
+          resolve(cves);
+        } catch (e) {
+          console.error(`[NVD] Parse error: ${e.message}`);
+          resolve([]);
+        }
+      });
+    });
+    req.on('error', () => resolve([]));
+    req.on('timeout', () => { req.destroy(); resolve([]); });
+    req.end();
+  });
+}
+
+async function batchFetchCVEs(portServiceMap) {
+  const uniqueServices = new Set();
+  for (const [, serviceName] of portServiceMap) {
+    if (serviceName && serviceName !== 'Unknown' && serviceName !== 'Ephemeral' && serviceName !== 'Registered') {
+      uniqueServices.add(serviceName.toLowerCase().split(/[\s-]/)[0]);
+    }
+  }
+  console.log(`[NVD] Batch: ${uniqueServices.size} unique services from ${portServiceMap.size} ports`);
+  const results = new Map();
+  await Promise.all([...uniqueServices].map(async service => {
+    results.set(service, await fetchCVEsFromNVD(service, 3));
+  }));
+  const portCVEMap = new Map();
+  for (const [port, serviceName] of portServiceMap) {
+    const normalized = serviceName?.toLowerCase().split(/[\s-]/)[0];
+    if (normalized && results.has(normalized)) portCVEMap.set(port, results.get(normalized));
+  }
+  return portCVEMap;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// AbuseIPDB - IP Reputation
+// ═══════════════════════════════════════════════════════════════════
+const ipReputationCache = new Map();
+const IP_CACHE_TTL = 60 * 60 * 1000;
+const IP_BATCH_SIZE = 10;
+
+function isPrivateIP(ip) {
+  return !ip ||
+    ip.startsWith('192.168.') || ip.startsWith('10.') ||
+    ip.startsWith('172.16.') || ip === '127.0.0.1' ||
+    ip.startsWith('169.254.') || ip.startsWith('::1') ||
+    ip.startsWith('fe80:');
+}
+
+async function checkIPReputation(ip) {
+  if (isPrivateIP(ip)) return { ip, abuse_score: 0, is_malicious: false, source: 'Local IP' };
+  const cached = ipReputationCache.get(ip);
+  if (cached && (Date.now() - cached.timestamp) < IP_CACHE_TTL) return cached.data;
+  if (!ABUSEIPDB_API_KEY) return { ip, abuse_score: 0, is_malicious: false, source: 'No API Key' };
+
+  return new Promise((resolve) => {
+    const queryParams = new URLSearchParams({ ipAddress: ip, maxAgeInDays: '90', verbose: '' });
+    const options = {
+      hostname: 'api.abuseipdb.com',
+      path: `/api/v2/check?${queryParams.toString()}`,
+      method: 'GET',
+      headers: { 'Key': ABUSEIPDB_API_KEY, 'Accept': 'application/json' },
+      timeout: 10000
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) return resolve({ ip, abuse_score: 0, is_malicious: false, source: 'Error' });
+          const json = JSON.parse(data);
+          const result = json.data || {};
+          const abuseScore = result.abuseConfidenceScore || 0;
+          const reputation = {
+            ip, abuse_score: abuseScore,
+            is_malicious: abuseScore >= 50,
+            is_suspicious: abuseScore >= 25,
+            total_reports: result.totalReports || 0,
+            last_reported: result.lastReportedAt || null,
+            usage_type: result.usageType || 'Unknown',
+            source: 'AbuseIPDB'
+          };
+          ipReputationCache.set(ip, { data: reputation, timestamp: Date.now() });
+          console.log(`[AbuseIPDB] ✓ ${ip}: Score ${abuseScore}`);
+          resolve(reputation);
+        } catch (e) {
+          resolve({ ip, abuse_score: 0, is_malicious: false, source: 'Error' });
+        }
+      });
+    });
+    req.on('error', () => resolve({ ip, abuse_score: 0, is_malicious: false, source: 'Error' }));
+    req.on('timeout', () => { req.destroy(); resolve({ ip, abuse_score: 0, is_malicious: false, source: 'Timeout' }); });
+    req.end();
+  });
+}
+
+async function batchCheckIPReputation(ips) {
+  const results = new Map();
+  const publicIPs = [...new Set(ips)].filter(ip => !isPrivateIP(ip));
+  console.log(`[AbuseIPDB] Batch: ${publicIPs.length} unique public IPs`);
+  for (let i = 0; i < publicIPs.length; i += IP_BATCH_SIZE) {
+    const batch = publicIPs.slice(i, i + IP_BATCH_SIZE);
+    const batchResults = await Promise.all(batch.map(ip => checkIPReputation(ip)));
+    batch.forEach((ip, j) => results.set(ip, batchResults[j]));
+    if (i + IP_BATCH_SIZE < publicIPs.length) await new Promise(r => setTimeout(r, 500));
+  }
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// THREAT DETECTION
+// ═══════════════════════════════════════════════════════════════════
+function detectPortScans(packets) {
+  const ipPortTimestamps = new Map();
+  for (const pkt of packets) {
+    if (!pkt.src_ip || !pkt.dst_port) continue;
+    if (!ipPortTimestamps.has(pkt.src_ip)) ipPortTimestamps.set(pkt.src_ip, []);
+    ipPortTimestamps.get(pkt.src_ip).push({ port: pkt.dst_port, timestamp: pkt.timestamp });
+  }
+  const portScans = [];
+  for (const [ip, events] of ipPortTimestamps) {
+    events.sort((a, b) => a.timestamp - b.timestamp);
+    let startIdx = 0;
+    const portSet = new Set();
+    for (let endIdx = 0; endIdx < events.length; endIdx++) {
+      while (startIdx < endIdx && events[endIdx].timestamp - events[startIdx].timestamp > 60) {
+        portSet.delete(events[startIdx].port);
+        startIdx++;
+      }
+      portSet.add(events[endIdx].port);
+      if (portSet.size >= 10) {
+        portScans.push({ type: 'PORT_SCAN', ip, ports_scanned: portSet.size, ports: [...portSet].sort((a, b) => a - b), severity: 'HIGH', timestamp: events[startIdx].timestamp });
+        break;
+      }
+    }
+  }
+  return portScans;
+}
+
+function detectBruteForce(packets) {
+  const authFailures = new Map();
+  const authPatterns = [/login.*fail/i, /authentication.*fail/i, /access.*denied/i, /invalid.*password/i, /invalid.*user/i, /login.*incorrect/i, /401/, /403/, /530/, /550/, /permission denied/i];
+  for (const pkt of packets) {
+    if (!pkt.info) continue;
+    if (authPatterns.some(p => p.test(pkt.info)) && pkt.src_ip && pkt.dst_port) {
+      const key = `${pkt.src_ip}:${pkt.dst_port}`;
+      authFailures.set(key, (authFailures.get(key) || 0) + 1);
+    }
+  }
+  const results = [];
+  for (const [key, count] of authFailures) {
+    if (count >= 5) {
+      const [ip, port] = key.split(':');
+      results.push({ type: 'BRUTE_FORCE', ip, port: parseInt(port), attempts: count, severity: count >= 20 ? 'CRITICAL' : count >= 10 ? 'HIGH' : 'MEDIUM', timestamp: Date.now() });
+    }
+  }
+  return results;
+}
+
+function detectDNSTunneling(dnsQueries) {
+  const suspicious = [];
+  for (const query of dnsQueries) {
+    if (!query.domain) continue;
+    const labels = query.domain.split('.');
+    for (const label of labels.slice(0, -2)) {
+      if (label.length > 50) {
+        suspicious.push({ type: 'DNS_TUNNELING', domain: query.domain, reason: 'Long subdomain detected', subdomain_length: label.length, severity: 'HIGH' });
+        break;
+      }
+      const entropy = calculateEntropy(label);
+      if (entropy > 4.0 && label.length > 20) {
+        suspicious.push({ type: 'DNS_TUNNELING', domain: query.domain, reason: 'High entropy subdomain', entropy: entropy.toFixed(2), severity: 'MEDIUM' });
+        break;
+      }
+    }
+    if (labels.length > 6) {
+      suspicious.push({ type: 'DNS_TUNNELING', domain: query.domain, reason: 'Excessive subdomain depth', depth: labels.length, severity: 'MEDIUM' });
+    }
+  }
+  return suspicious;
+}
+
+function calculateEntropy(str) {
+  const freq = {};
+  for (const char of str) freq[char] = (freq[char] || 0) + 1;
+  let entropy = 0;
+  for (const count of Object.values(freq)) {
+    const p = count / str.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function detectDataExfiltration(packets, ipReputations) {
+  const outboundBytes = new Map();
+  for (const pkt of packets) {
+    if (!pkt.src_ip) continue;
+    const isPrivateDest = pkt.dst_ip && isPrivateIP(pkt.dst_ip);
+    if (!isPrivateDest) outboundBytes.set(pkt.src_ip, (outboundBytes.get(pkt.src_ip) || 0) + (pkt.length || 0));
+  }
+  const exfil = [];
+  for (const [ip, bytes] of outboundBytes) {
+    if (bytes > 10 * 1024 * 1024) {
+      const reputation = ipReputations.get(ip);
+      exfil.push({ type: 'DATA_EXFILTRATION', ip, bytes_transferred: bytes, bytes_mb: (bytes / 1024 / 1024).toFixed(2), severity: 'HIGH', is_known_malicious: reputation?.is_malicious || false });
+    }
+  }
+  return exfil;
+}
+
+function detectDDoSPatterns(packets) {
+  const ipPackets = new Map();
+  for (const pkt of packets) {
+    if (!pkt.src_ip || pkt.timestamp === undefined) continue;
+    if (!ipPackets.has(pkt.src_ip)) ipPackets.set(pkt.src_ip, []);
+    ipPackets.get(pkt.src_ip).push(pkt.timestamp);
+  }
+  const ddosIndicators = [];
+  for (const [ip, timestamps] of ipPackets) {
+    timestamps.sort((a, b) => a - b);
+    for (let i = 0; i < timestamps.length; i++) {
+      let count = 1;
+      for (let j = i + 1; j < timestamps.length; j++) {
+        if (timestamps[j] - timestamps[i] <= 1) count++;
+        else break;
+      }
+      if (count >= 1000) {
+        ddosIndicators.push({ type: 'DDOS_INDICATOR', ip, packets_per_second: count, severity: 'CRITICAL', timestamp: timestamps[i] });
+        break;
+      }
+    }
+  }
+  return ddosIndicators;
+}
+
+function detectMaliciousIPs(uniqueIPs, ipReputations) {
+  const malicious = [];
+  for (const ip of uniqueIPs) {
+    const reputation = ipReputations.get(ip);
+    if (reputation?.is_malicious) {
+      malicious.push({ type: 'MALICIOUS_IP', ip, abuse_score: reputation.abuse_score, total_reports: reputation.total_reports || 0, severity: reputation.abuse_score >= 75 ? 'CRITICAL' : 'HIGH', source: 'AbuseIPDB' });
+    }
+  }
+  return malicious;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════════════════
 const SEARXNG_TIMEOUT_MS = 10000;
-const SEARXNG_MAX_RESULTS = 5;
-const SEARXNG_ENGINES = 'google,bing,duckduckgo,startpage';
-
-// ── TShark binary path ─────────────────────────────────────────
-const TSHARK_BIN = process.env.TSHARK_PATH ||
-  (process.platform === 'win32'
-    ? 'C:\\Program Files\\Wireshark\\tshark.exe'
-    : 'tshark');
-
-console.log(`[Init] TShark path: ${TSHARK_BIN}`);
-
-exec(`"${TSHARK_BIN}" -v 2>/dev/null`, (err, stdout) => {
-  if (err) {
-    console.error(`[FATAL] tshark not found at: ${TSHARK_BIN}`);
-    console.error(`        Set TSHARK_PATH env var to override.`);
-  } else {
-    console.log(`[Init] Found: ${stdout.split('\n')[0]}`);
-  }
-});
-
-// ── Directories ────────────────────────────────────────────────
+const TSHARK_BIN = process.env.TSHARK_PATH || (process.platform === 'win32' ? 'C:\\Program Files\\Wireshark\\tshark.exe' : 'tshark');
 const PCAP_DIR = './tmp_pcaps';
 const EXPORT_DIR = './tmp_exports';
 if (!fs.existsSync(PCAP_DIR)) fs.mkdirSync(PCAP_DIR, { recursive: true });
 if (!fs.existsSync(EXPORT_DIR)) fs.mkdirSync(EXPORT_DIR, { recursive: true });
 
+console.log(`[Init] TShark path: ${TSHARK_BIN}`);
+exec(`"${TSHARK_BIN}" -v 2>/dev/null`, (err, stdout) => {
+  if (err) console.error(`[FATAL] tshark not found at: ${TSHARK_BIN}`);
+  else console.log(`[Init] Found: ${stdout.split('\n')[0]}`);
+});
+
 // ── Session store ──────────────────────────────────────────────
 const sessions = new Map();
-const imageStore = new Map();
-const portIntelCache = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
-// ── Session Recovery ───────────────────────────────────────────
 async function ensureSession(sessionId) {
-  if (sessions.has(sessionId)) {
-    return true;
-  }
-
-  // Check local disk first (fast)
+  if (sessions.has(sessionId)) return true;
   const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
   if (fs.existsSync(pcapPath)) {
-    console.log(`[SessionRecovery] Recreating from local PCAP: ${sessionId}`);
-    sessions.set(sessionId, {
-      session_id: sessionId,
-      filename: 'restored.pcap',
-      created_at: Date.now(),
-    });
+    sessions.set(sessionId, { session_id: sessionId, filename: 'restored.pcap', created_at: Date.now() });
     return true;
   }
-
-  // Check B2 for analysis summary (Render restart recovery)
   try {
-    const r = await b2.send(new GetObjectCommand({
-      Bucket: process.env.B2_BUCKET_NAME,
-      Key: `analysis/${sessionId}-summary.json`,
-    }));
+    const r = await b2.send(new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: `analysis/${sessionId}-summary.json` }));
     const text = await r.Body.transformToString();
     const summaryData = JSON.parse(text);
-    console.log(`[SessionRecovery] Recreating from B2 summary: ${sessionId}`);
-    sessions.set(sessionId, {
-      session_id: sessionId,
-      filename: 'restored.pcap',
-      created_at: Date.now(),
-      total_packets: summaryData.total_packets || 0,
-    });
+    sessions.set(sessionId, { session_id: sessionId, filename: 'restored.pcap', created_at: Date.now(), total_packets: summaryData.total_packets || 0 });
     return true;
   } catch (_) {
-    // Not in B2 either — session truly doesn't exist
     return false;
   }
 }
@@ -166,19 +728,17 @@ setInterval(async () => {
   const now = Date.now();
   for (const [id, session] of sessions) {
     if (now - session.created_at > SESSION_TTL_MS) {
-      // Delete local files
       try { const p = path.join(PCAP_DIR, `${id}.pcap`); if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) { }
       try { const p = path.join(EXPORT_DIR, id); if (fs.existsSync(p)) fs.rmSync(p, { recursive: true }); } catch (_) { }
-      
-      // Delete B2 analysis files
-      const analysisTypes = ['summary', 'packets', 'dns', 'tls', 'http', 'ports'];
-      await Promise.all(analysisTypes.map(type =>
-        deleteFromB2(`analysis/${id}-${type}.json`).catch(() => {})
-      ));
-
+      const analysisTypes = ['summary', 'packets', 'dns', 'tls', 'http', 'ports', 'threats',
+        'ftp', 'smtp', 'pop3imap', 'icmp', 'arp', 'dhcp', 'ssh', 'smb', 'rdp', 'snmp',
+        'sip', 'nbns', 'quic', 'ldap', 'telnet', 'kerberos', 'radius', 'nfs', 'tftp',
+        'syslog', 'bgp', 'ospf', 'gre', 'ipsec', 'vlan', 'modbus', 'dnp3', 'mqtt',
+        'mdns', 'wsd', 'rpc', 'postgresql', 'mysql', 'redis', 'mongodb', 'netflow',
+        'vxlan', 'l2tp', 'ppp', 'coap', 'bacnet', 'diameter'
+      ];
+      await Promise.all(analysisTypes.map(type => deleteFromB2(`analysis/${id}-${type}.json`).catch(() => {})));
       sessions.delete(id);
-      imageStore.delete(id);
-      portIntelCache.delete(id);
       console.log(`[Session] Expired + B2 cleaned: ${id}`);
     }
   }
@@ -206,21 +766,10 @@ setInterval(() => {
 
 // ── CORS ──────────────────────────────────────────────────────
 function getCorsHeaders(origin) {
-const allowedOrigins = (process.env.ALLOWED_ORIGIN || 'http://localhost:3000')
-    .split(',')
-    .map(o => o.trim());
-
+  const allowedOrigins = (process.env.ALLOWED_ORIGIN || 'http://localhost:3000').split(',').map(o => o.trim());
   let allowedOrigin = allowedOrigins[0];
-
-  if (origin && allowedOrigins.includes(origin)) {
-    allowedOrigin = origin;
-  }
-
-  // Always allow localhost in development
-  if (origin && (origin.includes('localhost') || origin.includes('127.0.0.1'))) {
-    allowedOrigin = origin;
-  }
-
+  if (origin && allowedOrigins.includes(origin)) allowedOrigin = origin;
+  if (origin && (origin.includes('localhost') || origin.includes('127.0.0.1'))) allowedOrigin = origin;
   return {
     'Access-Control-Allow-Origin': allowedOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -256,10 +805,7 @@ function parseMultipart(buffer, boundary) {
     const hEnd = buffer.indexOf(CRLF4, lEnd + 2);
     if (hEnd === -1) break;
     const nBound = buffer.indexOf(bBuf, hEnd + 4);
-    parts.push({
-      headers: buffer.slice(lEnd + 2, hEnd).toString(),
-      data: buffer.slice(hEnd + 4, nBound === -1 ? buffer.length : nBound),
-    });
+    parts.push({ headers: buffer.slice(lEnd + 2, hEnd).toString(), data: buffer.slice(hEnd + 4, nBound === -1 ? buffer.length : nBound) });
     if (nBound === -1) break;
     pos = nBound + bBuf.length;
   }
@@ -292,2201 +838,974 @@ function getQuery(url) {
   return q;
 }
 
-const isValidSessionId = (id) =>
-  typeof id === 'string' && /^session-\d{13}-[a-z0-9]{6}$/.test(id);
+const isValidSessionId = (id) => typeof id === 'string' && /^session-\d{13}-[a-z0-9]{6}$/.test(id);
 
 // ═══════════════════════════════════════════════════════════════════
-// TShark core runner
+// SearXNG Search
 // ═══════════════════════════════════════════════════════════════════
-const DEFAULT_FIELDS = [
-  'frame.number',
-  'ip.src', 'ip.dst',
-  'ipv6.src', 'ipv6.dst',
-  'eth.src', 'eth.dst',
-  'frame.len',
-  '_ws.col.Protocol',
-  'tcp.srcport', 'tcp.dstport',
-  'udp.srcport', 'udp.dstport',
-  'frame.time_relative',
-  'frame.time',
-  '_ws.col.Info',
-];
-
-function runTshark(sessionId, filter = '', fields = DEFAULT_FIELDS, limit = 0) {
+async function searchSearXNG(query, timeout = SEARXNG_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) {
-      console.warn(`[TShark] PCAP not found: ${pcapPath}`);
-      return resolve([]);
-    }
-
-    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t`;
-    for (const f of fields) cmd += ` -e ${f}`;
-    if (filter) cmd += ` -Y "${filter.replace(/"/g, '\\"')}"`;
-    if (limit > 0) cmd += ` -c ${limit}`;
-    cmd += ' 2>/dev/null';
-
-    console.log(`[TShark] Running: ${cmd.slice(0, 150)}...`);
-
-    exec(cmd, { timeout: 60000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[TShark] exec error: ${err.message}`);
-        return resolve([]);
-      }
-      const lines = stdout.trim().split('\n').filter(l => l.trim());
-      const packets = lines.map(line => {
-        const c = line.split('\t');
-        const src_ip = c[1] || c[3] || c[5] || null;
-        const dst_ip = c[2] || c[4] || c[6] || null;
-        return {
-          id: parseInt(c[0]) || 0,
-          src_ip,
-          dst_ip,
-          length: parseInt(c[7]) || 0,
-          protocol: c[8] || 'UNKNOWN',
-          src_port: parseInt(c[9]) || parseInt(c[11]) || null,
-          dst_port: parseInt(c[10]) || parseInt(c[12]) || null,
-          timestamp: parseFloat(c[13]) || 0,
-          datetime: c[14] || '',
-          info: c[15] || null,
-        };
-      });
-      console.log(`[TShark] Returned ${packets.length} packets`);
-      resolve(packets);
-    });
-  });
-}
-
-function runTsharkPaged(sessionId, skip, limit) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) return resolve([]);
-
-    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t`;
-    for (const f of DEFAULT_FIELDS) cmd += ` -e ${f}`;
-    cmd += ` -c ${skip + limit}`;
-    cmd += ' 2>/dev/null';
-
-    exec(cmd, { timeout: 60000, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[TSharkPaged] exec error: ${err.message}`);
-        return resolve([]);
-      }
-      const lines = stdout.trim().split('\n').filter(l => l.trim());
-      const pageLines = lines.slice(skip);
-      const packets = pageLines.map(line => {
-        const c = line.split('\t');
-        const src_ip = c[1] || c[3] || c[5] || null;
-        const dst_ip = c[2] || c[4] || c[6] || null;
-        return {
-          id: parseInt(c[0]) || 0,
-          src_ip,
-          dst_ip,
-          length: parseInt(c[7]) || 0,
-          protocol: c[8] || 'UNKNOWN',
-          src_port: parseInt(c[9]) || parseInt(c[11]) || null,
-          dst_port: parseInt(c[10]) || parseInt(c[12]) || null,
-          timestamp: parseFloat(c[13]) || 0,
-          datetime: c[14] || '',
-          info: c[15] || null,
-        };
-      });
-      console.log(`[TSharkPaged] → ${packets.length} packets returned`);
-      resolve(packets);
-    });
-  });
-}
-
-function getTruePacketCount(sessionId) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) return resolve(0);
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.number 2>/dev/null`;
-    exec(cmd, { timeout: 120000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return resolve(0);
-      const count = stdout.trim().split('\n').filter(l => l.trim()).length;
-      console.log(`[TShark] True packet count: ${count}`);
-      resolve(count);
-    });
-  });
-}
-
-function getProtocolCounts(sessionId, limit = 0) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) return resolve({ protocols: {}, maxTime: 0 });
-    
-    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e _ws.col.Protocol -e frame.time_relative`;
-    if (limit > 0) cmd += ` -c ${limit}`;
-    cmd += ' 2>/dev/null';
-    
-    exec(cmd, { timeout: 60000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[TShark-Proto] Error: ${err.message}`);
-        return resolve({ protocols: {}, maxTime: 0 });
-      }
-      
-      const protocols = {};
-      let maxTime = 0;
-      const lines = stdout.trim().split('\n').filter(l => l.trim());
-      
-      for (const line of lines) {
-        const [proto, time] = line.split('\t');
-        if (proto) {
-          const p = proto.toUpperCase();
-          protocols[p] = (protocols[p] || 0) + 1;
-        }
-        if (time) {
-          const t = parseFloat(time);
-          if (t > maxTime) maxTime = t;
-        }
-      }
-      
-      console.log(`[TShark-Proto] Found ${Object.keys(protocols).length} protocols from ${lines.length} packets`);
-      resolve({ protocols, maxTime, sampledCount: lines.length });
-    });
-  });
-}
-
-function getAllPorts(sessionId) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) return resolve({});
-    
-const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e tcp.srcport -e tcp.dstport -e udp.srcport -e udp.dstport 2>/dev/null`;
-    
-    console.log(`[TShark-Ports] Extracting all ports from PCAP...`);
-    
-    exec(cmd, { timeout: 60000, maxBuffer: 100 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[TShark-Ports] Error: ${err.message}`);
-        return resolve({});
-      }
-      
-      const portCounts = {};
-      const lines = stdout.trim().split('\n').filter(l => l.trim());
-      
-      for (const line of lines) {
-  const [tcpSrc, tcpDst, udpSrc, udpDst] = line.split('\t');
-  for (const p of [tcpSrc, tcpDst, udpSrc, udpDst]) {
-    const port = parseInt(p);
-    if (port && port > 0) {
-      portCounts[port] = (portCounts[port] || 0) + 1;
-    }
-  }
-}
-      
-      console.log(`[TShark-Ports] Found ${Object.keys(portCounts).length} unique ports from ${lines.length} packets`);
-      resolve(portCounts);
-    });
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// NEW: Get HTTP Objects, DNS Queries, TLS SNI
-// ═══════════════════════════════════════════════════════════════════
-
-function getHttpObjects(sessionId) {
-  return new Promise((resolve) => {
-    const exportDir = path.join(EXPORT_DIR, sessionId);
-    if (!fs.existsSync(exportDir)) {
-      return resolve([]);
-    }
-
-    // First get packet numbers for HTTP responses from tshark
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "http.response" -T fields -e frame.number -e http.request.uri -e http.content_type 2>/dev/null`;
-
-    exec(cmd, { timeout: 30000 }, (err, stdout) => {
-      // Build a map of uri → packet number
-      const uriToPacket = {};
-      if (!err && stdout) {
-        for (const line of stdout.trim().split('\n').filter(l => l.trim())) {
-          const [frameNum, uri] = line.split('\t');
-          if (uri && frameNum) {
-            // Use just the filename part of the URI as key
-            const key = uri.split('/').pop().split('?')[0].toLowerCase();
-            if (key) uriToPacket[key] = parseInt(frameNum) || null;
-          }
-        }
-      }
-
-      try {
-        const files = fs.readdirSync(exportDir);
-        const objects = files.map(filename => {
-          const fp = path.join(exportDir, filename);
-          const stats = fs.statSync(fp);
-          const ext = path.extname(filename).toLowerCase();
-          const contentTypes = {
-            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
-            '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
-            '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
-            '.json': 'application/json', '.pdf': 'application/pdf',
-            '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2',
-          };
-
-          // Try to match filename to a packet number
-          const baseKey = filename.replace(/\(\d+\)/, '').split('.')[0].toLowerCase();
-          const fullKey = filename.replace(/\(\d+\)/, '').toLowerCase();
-          const packet_number = uriToPacket[fullKey] || uriToPacket[baseKey] || null;
-
-          return {
-            filename,
-            content_type: contentTypes[ext] || 'application/octet-stream',
-            size: stats.size,
-            extension: ext,
-            packet_number,
-          };
-        });
-        console.log(`[HTTP-Objects] Found ${objects.length} objects`);
-        resolve(objects);
-      } catch (e) {
-        console.error(`[HTTP-Objects] Error: ${e.message}`);
-        resolve([]);
-      }
-    });
-  });
-}
-function getDnsQueries(sessionId, limit = 0) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) return resolve([]);
-
-    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "dns.qry.name" -T fields -E separator=/t -e dns.qry.name -e dns.a -e dns.aaaa -e dns.flags.response`;
-    if (limit > 0) cmd += ` -c ${limit}`;
-    cmd += ' 2>/dev/null';
-
-    exec(cmd, { timeout: 30000 }, (err, stdout) => {
-      if (err) {
-        console.error(`[DNS] Error: ${err.message}`);
-        return resolve([]);
-      }
-
-      const queries = [];
-      const seen = new Set();
-      const lines = stdout.trim().split('\n').filter(l => l.trim());
-
-      for (const line of lines) {
-        const [name, a, aaaa, isResponse] = line.split('\t');
-        if (name && !seen.has(name)) {
-          seen.add(name);
-          queries.push({
-            domain: name,
-            type: isResponse === '1' ? 'response' : 'query',
-            answers: [a, aaaa].filter(Boolean).join(', ') || null,
-          });
-        }
-      }
-
-      console.log(`[DNS] Found ${queries.length} unique queries`);
-      resolve(queries);
-    });
-  });
-}
-
-function getTlsSni(sessionId, limit = 100) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) return resolve([]);
-    
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -Y "tls.handshake.extensions_server_name" -T fields -e tls.handshake.extensions_server_name -e ip.dst -c ${limit} 2>/dev/null`;
-    
-    exec(cmd, { timeout: 30000 }, (err, stdout) => {
-      if (err) {
-        console.error(`[TLS-SNI] Error: ${err.message}`);
-        return resolve([]);
-      }
-      
-      const sniList = [];
-      const seen = new Set();
-      const lines = stdout.trim().split('\n').filter(l => l.trim());
-      
-      for (const line of lines) {
-        const [sni, dstIp] = line.split('\t');
-        if (sni && !seen.has(sni)) {
-          seen.add(sni);
-          sniList.push({ server_name: sni, destination_ip: dstIp || null });
-        }
-      }
-      
-      console.log(`[TLS-SNI] Found ${sniList.length} unique SNI domains`);
-      resolve(sniList);
-    });
-  });
-}
-
-function getHttpRequests(sessionId, limit = 0) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) return resolve([]);
-
-    // Use two separate tshark calls — one without -Y filter for host, one for method+uri
-    // This avoids the http.request dissector crash on some pcaps
-let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t -e frame.number -e http.host -e http.request.method -e http.request.uri -e http.file_data -e urlencoded-form.key -e urlencoded-form.value`;
-    if (limit > 0) cmd += ` -c ${limit}`;
-    cmd += ' 2>/dev/null';
-
-    exec(cmd, { timeout: 30000 }, (err, stdout) => {
-      if (err) {
-        console.error(`[HTTP-Req] Error: ${err.message}`);
-        return resolve([]);
-      }
-
-      const requests = [];
-      const lines = stdout.trim().split('\n').filter(l => l.trim());
-
-      for (const line of lines) {
-        const [frameNum, host, method, uri, fileDataHex, formKeys, formValues] = line.split('\t');
-        if (host && method) {
-          let postBody = null;
-
-          // Try urlencoded form fields first (most reliable for login forms)
-          if (formKeys && formValues) {
-            const keys = formKeys.split(',');
-            const vals = formValues.split(',');
-            postBody = keys.map((k, i) => `${k}=${vals[i] || ''}`).join('&');
-          }
-
-          // Fall back to hex-decoded file_data
-          if (!postBody && fileDataHex && fileDataHex.trim()) {
-            try {
-              postBody = Buffer.from(fileDataHex.trim(), 'hex').toString('utf8');
-            } catch (_) {}
-          }
-
-          requests.push({
-            frame_number: parseInt(frameNum) || null,
-            host: host.trim(),
-            method: method.trim() || 'GET',
-            uri: uri ? uri.trim() : '/',
-            post_body: postBody,
-            user_agent: null,
-          });
-        }
-      }
-      console.log(`[HTTP-Req] Found ${requests.length} HTTP requests`);
-      resolve(requests);
-    });
-  });
-}
-
-function runTsharkStat(sessionId, statCommand) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) return resolve('PCAP not found');
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -q -z ${statCommand} 2>/dev/null`;
-    console.log(`[TShark-Stat] Running: ${cmd}`);
-    exec(cmd, { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[TShark-Stat] Error: ${err.message}`);
-        return resolve('Stat failed');
-      }
-      resolve(stdout || '');
-    });
-  });
-}
-
-// ── Detailed packet dissection ──────────────────────────────────
-const DETAIL_FIELDS = [
-  'frame.number', 'frame.time', 'frame.time_relative', 'frame.len',
-  'eth.src', 'eth.dst', 'eth.type',
-  'ip.src', 'ip.dst', 'ip.ttl', 'ip.id', 'ip.proto',
-  'ip.flags.df', 'ip.flags.mf',
-  'ipv6.src', 'ipv6.dst',
-  'tcp.srcport', 'tcp.dstport', 'tcp.seq', 'tcp.ack',
-  'tcp.flags.syn', 'tcp.flags.ack', 'tcp.flags.fin', 'tcp.flags.reset',
-  'tcp.window_size',
-  'udp.srcport', 'udp.dstport', 'udp.length',
-  'icmp.type', 'icmp.code',
-  'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.hw_mac', 'arp.dst.proto_ipv4',
-  'dns.qry.name', 'dns.a', 'dns.aaaa', 'dns.flags.response',
-  'http.request.method', 'http.request.uri', 'http.host',
-  'http.response.code', 'http.response.phrase',
-  'tls.handshake.type', 'tls.handshake.extensions_server_name',
-  '_ws.col.Info', '_ws.col.Protocol',
-];
-
-function getPacketDetails(sessionId, packetNumber) {
-  return new Promise((resolve) => {
-    const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
-    if (!fs.existsSync(pcapPath)) {
-      return resolve({ error: 'PCAP not found' });
-    }
-
-    let cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E separator=/t`;
-    for (const f of DETAIL_FIELDS) cmd += ` -e ${f}`;
-    cmd += ` -c ${packetNumber}`;
-    cmd += ' 2>/dev/null';
-
-    exec(cmd, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[TShark-Detail] Error: ${err.message}`);
-        return resolve({ error: 'Failed to parse packet - ' + err.message.slice(0, 100) });
-      }
-
-      const lines = stdout.trim().split('\n').filter(l => l.trim());
-      const targetLine = lines[packetNumber - 1];
-      if (!targetLine) {
-        return resolve({ error: `Packet ${packetNumber} not found. File has ${lines.length} packets.` });
-      }
-
-      const values = targetLine.split('\t');
-      const fields = {};
-      DETAIL_FIELDS.forEach((field, i) => {
-        fields[field] = values[i] || null;
-      });
-
-      const tree = buildPacketTree(fields);
-      console.log(`[TShark-Detail] ✓ Packet ${packetNumber} parsed, ${tree.layers.length} layers`);
-      resolve(tree);
-    });
-  });
-}
-
-function buildPacketTree(f) {
-  const tree = {
-    frame: {
-      number: f['frame.number'],
-      time: f['frame.time'],
-      time_relative: f['frame.time_relative'],
-      length: f['frame.len'],
-    },
-    layers: []
-  };
-
-  if (f['eth.src'] || f['eth.dst']) {
-    tree.layers.push({
-      name: 'Ethernet II',
-      protocol: 'eth',
-      fields: [
-        { key: 'Source MAC', value: f['eth.src'] },
-        { key: 'Destination MAC', value: f['eth.dst'] },
-        { key: 'Type', value: f['eth.type'] },
-      ].filter(v => v.value)
-    });
-  }
-
-  if (f['ip.src'] || f['ip.dst']) {
-    const ipFlags = [];
-    if (f['ip.flags.df'] === '1') ipFlags.push('DF (Don\'t Fragment)');
-    if (f['ip.flags.mf'] === '1') ipFlags.push('MF (More Fragments)');
-    
-    tree.layers.push({
-      name: 'Internet Protocol Version 4',
-      protocol: 'ipv4',
-      fields: [
-        { key: 'Source IP', value: f['ip.src'] },
-        { key: 'Destination IP', value: f['ip.dst'] },
-        { key: 'TTL', value: f['ip.ttl'] },
-        { key: 'Protocol', value: getProtocolName(f['ip.proto']) },
-        { key: 'ID', value: f['ip.id'] ? `0x${parseInt(f['ip.id']).toString(16).padStart(4, '0')}` : null },
-        { key: 'Flags', value: ipFlags.length > 0 ? ipFlags.join(', ') : null },
-      ].filter(v => v.value)
-    });
-  } else if (f['ipv6.src'] || f['ipv6.dst']) {
-    tree.layers.push({
-      name: 'Internet Protocol Version 6',
-      protocol: 'ipv6',
-      fields: [
-        { key: 'Source IP', value: f['ipv6.src'] },
-        { key: 'Destination IP', value: f['ipv6.dst'] },
-      ].filter(v => v.value)
-    });
-  }
-
-  if (f['tcp.srcport'] || f['tcp.dstport']) {
-    const tcpFlags = [];
-    if (f['tcp.flags.syn'] === '1') tcpFlags.push('SYN');
-    if (f['tcp.flags.ack'] === '1') tcpFlags.push('ACK');
-    if (f['tcp.flags.fin'] === '1') tcpFlags.push('FIN');
-    if (f['tcp.flags.reset'] === '1') tcpFlags.push('RST');
-    
-    tree.layers.push({
-      name: 'Transmission Control Protocol',
-      protocol: 'tcp',
-      fields: [
-        { key: 'Source Port', value: f['tcp.srcport'] },
-        { key: 'Destination Port', value: f['tcp.dstport'] },
-        { key: 'Sequence Number', value: f['tcp.seq'] },
-        { key: 'Acknowledgment Number', value: f['tcp.ack'] },
-        { key: 'Flags', value: tcpFlags.length > 0 ? `[${tcpFlags.join(', ')}]` : null },
-        { key: 'Window Size', value: f['tcp.window_size'] },
-      ].filter(v => v.value)
-    });
-  }
-
-  if (f['udp.srcport'] || f['udp.dstport']) {
-    tree.layers.push({
-      name: 'User Datagram Protocol',
-      protocol: 'udp',
-      fields: [
-        { key: 'Source Port', value: f['udp.srcport'] },
-        { key: 'Destination Port', value: f['udp.dstport'] },
-        { key: 'Length', value: f['udp.length'] },
-      ].filter(v => v.value)
-    });
-  }
-
-  if (f['icmp.type']) {
-    tree.layers.push({
-      name: 'Internet Control Message Protocol',
-      protocol: 'icmp',
-      fields: [
-        { key: 'Type', value: getIcmpType(f['icmp.type']) },
-        { key: 'Code', value: f['icmp.code'] },
-      ].filter(v => v.value)
-    });
-  }
-
-  if (f['arp.opcode']) {
-    tree.layers.push({
-      name: 'Address Resolution Protocol',
-      protocol: 'arp',
-      fields: [
-        { key: 'Operation', value: f['arp.opcode'] === '1' ? 'Request' : 'Reply' },
-        { key: 'Sender MAC', value: f['arp.src.hw_mac'] },
-        { key: 'Sender IP', value: f['arp.src.proto_ipv4'] },
-        { key: 'Target MAC', value: f['arp.dst.hw_mac'] },
-        { key: 'Target IP', value: f['arp.dst.proto_ipv4'] },
-      ].filter(v => v.value)
-    });
-  }
-
-  if (f['dns.qry.name']) {
-    tree.layers.push({
-      name: 'Domain Name System',
-      protocol: 'dns',
-      fields: [
-        { key: 'Type', value: f['dns.flags.response'] === '1' ? 'Response' : 'Query' },
-        { key: 'Query Name', value: f['dns.qry.name'] },
-        { key: 'Answer (A)', value: f['dns.a'] },
-        { key: 'Answer (AAAA)', value: f['dns.aaaa'] },
-      ].filter(v => v.value)
-    });
-  }
-
-  if (f['http.request.method'] || f['http.response.code']) {
-    const httpFields = [
-      { key: 'Method', value: f['http.request.method'] },
-      { key: 'URI', value: f['http.request.uri'] },
-      { key: 'Host', value: f['http.host'] },
-      { key: 'Status Code', value: f['http.response.code'] },
-      { key: 'Status Phrase', value: f['http.response.phrase'] },
-    ].filter(v => v.value);
-    
-    if (httpFields.length > 0) {
-      tree.layers.push({
-        name: 'Hypertext Transfer Protocol',
-        protocol: 'http',
-        fields: httpFields
-      });
-    }
-  }
-
-  if (f['tls.handshake.type'] || f['tls.handshake.extensions_server_name']) {
-    tree.layers.push({
-      name: 'Transport Layer Security',
-      protocol: 'tls',
-      fields: [
-        { key: 'Handshake Type', value: getTlsHandshakeType(f['tls.handshake.type']) },
-        { key: 'SNI (Server Name)', value: f['tls.handshake.extensions_server_name'] },
-      ].filter(v => v.value)
-    });
-  }
-
-  if (tree.layers.length === 0 && f['_ws.col.Protocol']) {
-    tree.layers.push({
-      name: f['_ws.col.Protocol'],
-      protocol: f['_ws.col.Protocol'].toLowerCase(),
-      fields: [
-        { key: 'Protocol', value: f['_ws.col.Protocol'] },
-        { key: 'Info', value: f['_ws.col.Info'] || 'No detailed dissection available' },
-      ].filter(v => v.value)
-    });
-  }
-
-  tree.info = f['_ws.col.Info'];
-  tree.protocol = f['_ws.col.Protocol'];
-
-  return tree;
-}
-
-function getProtocolName(proto) {
-  const protocols = {
-    '1': 'ICMP', '2': 'IGMP', '6': 'TCP', '17': 'UDP',
-    '41': 'IPv6', '47': 'GRE', '50': 'ESP', '51': 'AH',
-    '58': 'ICMPv6', '89': 'OSPF', '132': 'SCTP'
-  };
-  return protocols[proto] || `Protocol ${proto}`;
-}
-
-function getIcmpType(type) {
-  const types = {
-    '0': 'Echo Reply', '3': 'Destination Unreachable', '4': 'Source Quench',
-    '5': 'Redirect', '8': 'Echo Request', '11': 'Time Exceeded',
-    '12': 'Parameter Problem', '13': 'Timestamp', '14': 'Timestamp Reply'
-  };
-  return types[type] || `Type ${type}`;
-}
-
-function getTlsHandshakeType(type) {
-  const types = {
-    '1': 'Client Hello', '2': 'Server Hello', '11': 'Certificate',
-    '12': 'Server Key Exchange', '14': 'Server Hello Done',
-    '16': 'Client Key Exchange', '20': 'Finished'
-  };
-  return types[type] || `Type ${type}`;
-}
-
-// ── Parse TShark PDML Output ───────────────────────────────────
-function parsePdmlOutput(pdmlXml, targetPacket) {
-  const packets = [];
-  const packetMatches = pdmlXml.match(/<packet[^>]*>[\s\S]*?<\/packet>/g) || [];
-  
-  for (const packetXml of packetMatches) {
-    const packet = {
-      frame: {},
-      layers: [],
-      info: ''
-    };
-    
-    const protoMatches = packetXml.match(/<proto[^>]*>[\s\S]*?<\/proto>/g) || [];
-    
-    for (const protoXml of protoMatches) {
-      const nameMatch = protoXml.match(/name="([^"]+)"/);
-      const protoName = nameMatch ? nameMatch[1] : 'unknown';
-      const shownameMatch = protoXml.match(/showname="([^"]+)"/);
-      const protoShowName = shownameMatch ? shownameMatch[1] : protoName;
-      
-      if (protoName === 'geninfo') continue;
-      
-      const fields = extractFieldsHierarchical(protoXml, 0);
-      
-      if (protoName === 'frame') {
-        extractFrameData(fields, packet);
-        packet.layers.push({
-          name: 'Frame',
-          protocol: 'frame',
-          fields: fields
-        });
-        continue;
-      }
-      
-      const knownProtocols = ['eth', 'ip', 'ipv6', 'tcp', 'udp', 'dns', 'http', 'tls', 'dhcp', 
-        'dhcpv6', 'mdns', 'ssdp', 'icmp', 'icmpv6', 'arp', 'snmp', 'smb', 'ftp', 'ssh', 'smtp', 
-        'ntp', 'igmp', 'stp', 'lldp', 'cdp', 'quic', 'sctp', 'gre', 'vlan', 'ppp', 'wlan'];
-      
-      if (fields.length > 0 || knownProtocols.includes(protoName)) {
-        packet.layers.push({
-          name: protoShowName || protoName.toUpperCase(),
-          protocol: protoName.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10),
-          fields: fields.length > 0 ? fields : [{ key: 'Protocol', value: protoShowName || protoName, children: [] }]
-        });
-      }
-    }
-    
-    let infoMatch = packetXml.match(/<field[^>]*name="_ws\.col\.Info"[^>]*show="([^"]+)"/);
-    if (!infoMatch) {
-      infoMatch = packetXml.match(/showname="Info[^"]*"[^>]*show="([^"]+)"/);
-    }
-    if (infoMatch) {
-      packet.info = infoMatch[1];
-    }
-    
-    packets.push(packet);
-  }
-  
-  const target = packets[targetPacket - 1];
-  if (!target && packets.length > 0) {
-    return packets[packets.length - 1];
-  }
-  
-  return target || { frame: {}, layers: [], info: '' };
-}
-
-function extractFrameData(fields, packet) {
-  for (const field of fields) {
-    if (field.key === 'Frame Number') packet.frame.number = field.value;
-    if (field.key === 'Arrival Time') packet.frame.time = field.value;
-    if (field.key === 'Time Since Reference' || field.key === 'Time since reference') packet.frame.time_relative = field.value;
-    if (field.key === 'Frame Length') packet.frame.length = field.value;
-    if (field.children && field.children.length > 0) {
-      extractFrameData(field.children, packet);
-    }
-  }
-}
-
-function extractFieldsHierarchical(xmlBlock, depth) {
-  const fields = [];
-  const seen = new Set();
-  
-  const fieldPattern = /<field\s+([^>]*)(?:\/>|>([\s\S]*?)<\/field>)/g;
-  
-  let match;
-  while ((match = fieldPattern.exec(xmlBlock)) !== null) {
-    const attrs = match[1];
-    const content = match[2] || '';
-    
-    const shownameMatch = attrs.match(/showname="([^"]+)"/);
-    const showMatch = attrs.match(/show="([^"]+)"/);
-    const nameMatch = attrs.match(/name="([^"]+)"/);
-    
-    const fieldName = nameMatch ? nameMatch[1] : '';
-    if (fieldName.startsWith('_ws.') && !fieldName.includes('Info')) {
-      continue;
-    }
-    
-    let key = '';
-    let value = '';
-    let isExpandable = false;
-    
-    if (shownameMatch) {
-      const showname = shownameMatch[1];
-      const colonIdx = showname.indexOf(': ');
-      if (colonIdx > 0) {
-        key = showname.substring(0, colonIdx).trim();
-        value = showMatch ? showMatch[1] : showname.substring(colonIdx + 2).trim();
-      } else {
-        key = showname.trim();
-        value = showMatch ? showMatch[1] : '';
-      }
-    } else if (nameMatch && showMatch) {
-      key = fieldName.split('.').pop().replace(/_/g, ' ');
-      value = showMatch[1];
-    }
-    
-    if (key && key.length > 0) {
-      key = key.charAt(0).toUpperCase() + key.slice(1);
-    }
-    
-    let children = [];
-    if (content && content.includes('<field')) {
-      children = extractFieldsHierarchical(content, depth + 1);
-      isExpandable = children.length > 0;
-    }
-    
-    const isOnlyHex = value && /^[0-9a-fA-F:\s]+$/.test(value) && value.length > 50;
-    
-    if (key && value && value.length < 500 && !isOnlyHex) {
-      const fieldKey = key + ':' + value.substring(0, 50);
-      if (!seen.has(fieldKey)) {
-        seen.add(fieldKey);
-        fields.push({ key, value, children, isExpandable, depth });
-      }
-    } else if (key && isExpandable && children.length > 0) {
-      const fieldKey = key + ':expandable';
-      if (!seen.has(fieldKey)) {
-        seen.add(fieldKey);
-        fields.push({ key, value: value || '', children, isExpandable: true, depth });
-      }
-    }
-  }
-  
-  return fields;
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// SearXNG Search for Port Intelligence - NO HARDCODING
-// ═══════════════════════════════════════════════════════════════════
-async function searchPortWithSearXNG(port, searchType = 'general') {
-  return new Promise((resolve, reject) => {
-    // More specific queries for better results
-    const queries = {
-      general: `IANA registered port ${port} TCP UDP service name`,
-      risks: `port ${port} TCP UDP security vulnerability CVE NVD`,
-      uses: `port ${port} protocol application usage purpose`
-    };
-
-    const searchUrl = `${SEARXNG_URL}/search?q=${encodeURIComponent(queries[searchType] || queries.general)}&format=json&engines=${SEARXNG_ENGINES}`;
-
-    console.log(`[SearXNG] Searching ${searchType} for port ${port}...`);
-
-    const urlObj = new URL(searchUrl);
-    const options = {
-      hostname: urlObj.hostname,
-      port: urlObj.port || 443,
-      path: urlObj.pathname + urlObj.search,
-      method: 'GET',
-      timeout: SEARXNG_TIMEOUT_MS,
-    };
-
-    const protocol = urlObj.protocol === 'https:' ? https : http;
-
-    const req = protocol.request(options, (res) => {
+    const url = `${SEARXNG_URL}/search?q=${encodeURIComponent(query)}&format=json&engines=${SEARXNG_ENGINES}&max_results=${SEARXNG_MAX_RESULTS}`;
+    const req = https.get(url, { timeout, headers: { 'Accept': 'application/json' } }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
-          if (res.statusCode !== 200) {
-            console.error(`[SearXNG] Error ${res.statusCode} for port ${port}`);
-            return resolve(null);
-          }
-
+          if (res.statusCode !== 200) return resolve({ error: `HTTP ${res.statusCode}`, results: [] });
           const json = JSON.parse(data);
-          const results = json.results || [];
-
-          if (results.length === 0) {
-            return resolve(null);
-          }
-
-          // Check for well-known ports first (more reliable)
-          const wellKnownServices = {
-            20: 'FTP Data', 21: 'FTP', 22: 'SSH', 23: 'Telnet',
-            25: 'SMTP', 53: 'DNS', 67: 'DHCP Server', 68: 'DHCP Client',
-            69: 'TFTP', 80: 'HTTP', 110: 'POP3', 119: 'NNTP',
-            123: 'NTP', 135: 'RPC', 137: 'NetBIOS Name', 138: 'NetBIOS Datagram',
-            139: 'NetBIOS Session', 143: 'IMAP', 161: 'SNMP', 162: 'SNMP Trap',
-            389: 'LDAP', 443: 'HTTPS', 445: 'SMB', 465: 'SMTPS',
-            514: 'Syslog', 515: 'LPR', 587: 'SMTP TLS', 636: 'LDAPS',
-            993: 'IMAPS', 995: 'POP3S', 1080: 'SOCKS', 1433: 'MSSQL',
-            1434: 'MSSQL Monitor', 1521: 'Oracle', 3306: 'MySQL',
-            3389: 'RDP', 5432: 'PostgreSQL', 5900: 'VNC', 5901: 'VNC',
-            6379: 'Redis', 8080: 'HTTP Proxy', 8443: 'HTTPS Alt',
-            27017: 'MongoDB', 5353: 'mDNS', 5355: 'LLMNR',
-            1900: 'SSDP', 547: 'DHCPv6', 631: 'IPP', 
-          };
-
-          // Check if port is well-known
-          if (wellKnownServices[port]) {
-            const serviceName = wellKnownServices[port];
-            console.log(`[SearXNG] ✓ Port ${port}: ${serviceName} (well-known)`);
-            return resolve({
-              service_name: serviceName,
-              description: `Port ${port} is used for ${serviceName}`,
-              common_uses: getServiceCommonUses(serviceName),
-              risks: [],
-              source: 'IANA Well-Known Ports'
-            });
-          }
-
-          let serviceName = 'Unknown';
-          let description = '';
-          let commonUses = [];
-          let risks = [];
-
-          for (const result of results.slice(0, 5)) {
-            const content = (result.content || '').toLowerCase();
-            const title = (result.title || '').toLowerCase();
-
-            if (!description && result.content) {
-              description = result.content.slice(0, 300);
-            }
-
-            // More specific service detection
-            const serviceScores = {};
-const scoreService = (name, uses, points) => {
-  if (!serviceScores[name]) serviceScores[name] = { score: 0, uses };
-  serviceScores[name].score += points;
-};
-
-if (content.includes('domain name') || content.includes('dns server') || title.includes('dns')) scoreService('DNS', ['DNS queries', 'Name resolution'], 3);
-if (content.includes('dhcp') && !content.includes('dns')) scoreService(port === 67 ? 'DHCP Server' : port === 68 ? 'DHCP Client' : 'DHCP', ['IP address assignment', 'Network configuration'], 3);
-if (content.includes('hypertext transfer') || content.includes('web server') || title.includes('http')) scoreService('HTTP', ['Web traffic', 'HTTP requests'], 2);
-if (content.includes('https') || content.includes('ssl/tls') || content.includes('secure web')) scoreService('HTTPS', ['Secure web traffic', 'Encrypted HTTP'], 3);
-if (content.includes('ssh') || content.includes('secure shell')) scoreService('SSH', ['Secure remote access', 'Terminal access'], 3);
-if (content.includes('file transfer') && content.includes('ftp')) scoreService('FTP', ['File transfer'], 2);
-if (content.includes('netbios')) scoreService('NetBIOS', ['Windows networking', 'Name resolution'], 2);
-if (content.includes('mdns') || content.includes('multicast dns')) scoreService('mDNS', ['Local service discovery', 'Bonjour'], 3);
-if (content.includes('llmnr')) scoreService('LLMNR', ['Local name resolution'], 2);
-if (content.includes('ssdp') || content.includes('upnp')) scoreService('SSDP', ['UPnP discovery', 'Device discovery'], 2);
-
-const topService = Object.entries(serviceScores).sort((a, b) => b[1].score - a[1].score)[0];
-if (topService) {
-  serviceName = topService[0];
-  commonUses = topService[1].uses;
-}
-            // Security risks
-            if (content.includes('vulnerability') || content.includes('vulnerable')) {
-              if (!risks.includes('Known vulnerabilities')) risks.push('Known vulnerabilities exist');
-            }
-            if (content.includes('exploit') || content.includes('exploited')) {
-              if (!risks.includes('Active exploits')) risks.push('Active exploits reported');
-            }
-            if (content.includes('cve-')) {
-              const cveMatch = content.match(/cve-\d{4}-\d+/gi);
-              if (cveMatch && !risks.some(r => r.includes('CVE'))) {
-                risks.push(`Related CVEs: ${cveMatch.slice(0, 3).join(', ').toUpperCase()}`);
-              }
-            }
-          }
-
-          if (commonUses.length === 0) {
-            commonUses = ['Network service', 'Application communication'];
-          }
-
-          console.log(`[SearXNG] ✓ Found ${searchType} info for port ${port}: ${serviceName}`);
-          resolve({
-            service_name: serviceName,
-            description: description || `Port ${port} - network service`,
-            common_uses: commonUses,
-            risks: risks,
-            source: 'SearXNG Web Search'
-          });
+          resolve({ results: (json.results || []).map(r => ({ title: r.title || '', url: r.url || '', snippet: r.content || '', engine: r.engine || 'unknown' })) });
         } catch (e) {
-          console.error(`[SearXNG] Parse error for port ${port}: ${e.message}`);
-          resolve(null);
+          resolve({ error: e.message, results: [] });
         }
       });
     });
-
-    req.on('error', (e) => {
-      console.error(`[SearXNG] Request error for port ${port}: ${e.message}`);
-      // Retry once after 1 second on socket hang up
-      if (e.message.includes('socket hang up') || e.message.includes('ECONNRESET')) {
-        setTimeout(() => {
-          console.log(`[SearXNG] Retrying port ${port}...`);
-          searchPortWithSearXNG(port, searchType).then(resolve).catch(() => resolve(null));
-        }, 1000);
-      } else {
-        resolve(null);
-      }
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      console.error(`[SearXNG] Timeout for port ${port}`);
-      resolve(null);
-    });
-
+    req.on('error', e => resolve({ error: e.message, results: [] }));
+    req.on('timeout', () => { req.destroy(); resolve({ error: 'Timeout', results: [] }); });
     req.end();
   });
 }
 
-// Helper to get common uses for well-known services
-function getServiceCommonUses(serviceName) {
-  const uses = {
-    'DNS': ['DNS queries', 'Name resolution', 'Domain lookups'],
-    'DHCP Server': ['IP address assignment', 'Network configuration'],
-    'DHCP Client': ['Obtain IP address', 'Network configuration'],
-    'HTTP': ['Web traffic', 'HTTP requests', 'Unencrypted web'],
-    'HTTPS': ['Secure web traffic', 'Encrypted HTTP', 'E-commerce'],
-    'SSH': ['Secure remote access', 'Terminal access', 'File transfer'],
-    'FTP': ['File transfer', 'Data exchange'],
-    'NetBIOS': ['Windows networking', 'Name resolution', 'File sharing'],
-    'mDNS': ['Local service discovery', 'Bonjour', 'Zeroconf'],
-    'LLMNR': ['Local name resolution', 'Windows networking'],
-    'SSDP': ['UPnP discovery', 'Device discovery'],
-    'SMTP': ['Email sending', 'Mail relay'],
-    'RDP': ['Remote desktop', 'Windows remote access'],
-  };
-  return uses[serviceName] || ['Network service', 'Application communication'];
-}
-
-// ── Port Intelligence - Group ephemeral ports, SearXNG for service ports ──────────────────────────────────────────
-async function getPortIntelligence(port) {
-  console.log(`[PortIntel] Port ${port} - searching SearXNG...`);
-
-  const [generalResult, risksResult] = await Promise.all([
-    searchPortWithSearXNG(port, 'general'),
-    searchPortWithSearXNG(port, 'risks')
-  ]);
-
-  const serviceName = generalResult?.service_name || 'Unknown';
-  const description = generalResult?.description || `Port ${port} - network service`;
-  const commonUses = generalResult?.common_uses || ['Network service', 'Application communication'];
-  const risks = risksResult?.risks || [];
-
-  // Determine risk level
-  let riskLevel = 'LOW';
-  if (risks.length > 0) {
-    if (risks.some(r => r.toLowerCase().includes('critical') || r.toLowerCase().includes('rce'))) {
-      riskLevel = 'CRITICAL';
-    } else if (risks.some(r => r.toLowerCase().includes('exploit') || r.toLowerCase().includes('vulnerability') || r.toLowerCase().includes('cve'))) {
-      riskLevel = 'HIGH';
-    } else if (risks.length > 0) {
-      riskLevel = 'MEDIUM';
-    }
-  }
-
-  if (risks.length === 0) {
-    risks.push('Standard network service - review traffic patterns');
-  }
-
-  console.log(`[PortIntel] ✓ Port ${port}: ${serviceName}, ${risks.length} risks, ${commonUses.length} uses`);
-
-  return {
-    port: port,
-    service_name: serviceName,
-    description: description,
-    secure_alternative: 'Review firewall rules and traffic patterns',
-    common_uses: commonUses,
-    risks: risks,
-    risk: riskLevel,
-    reason: risks[0] || description,
-    cve_id: null,
-    cvss_score: null,
-    cve_count: 0,
-    all_cves: [],
-    source: 'SearXNG Web Search',
-  };
-}
-
-// Get intelligence for ephemeral ports as a GROUP (not individual)
-async function getEphemeralPortIntelligence(ephemeralPorts) {
-  console.log(`[PortIntel] Grouping ${ephemeralPorts.length} ephemeral ports for single search...`);
-  
-  // Make ONE search for ephemeral ports in general
-  const result = await searchPortWithSearXNG('ephemeral port dynamic client', 'general');
-  const risksResult = await searchPortWithSearXNG('ephemeral port security', 'risks');
-  
-  const serviceName = 'Ephemeral';
-  const description = result?.description || `Ephemeral ports are dynamic client-side ports used for outbound connections (IANA range 49152-65535)`;
-  const commonUses = ['Client connections', 'Temporary connections', 'Outbound traffic', 'Dynamic port allocation'];
-  const risks = risksResult?.risks?.length > 0 ? risksResult.risks : [
-    'Port scanning',
-    'Service fingerprinting', 
-    'Application identification',
-    'Ephemeral port exhaustion'
-  ];
-
-  const totalPackets = ephemeralPorts.reduce((sum, p) => sum + p.count, 0);
-  const portList = ephemeralPorts.map(p => p.port).sort((a, b) => a - b);
-  const portDetails = ephemeralPorts.map(p => ({ port: p.port, count: p.count })).sort((a, b) => a.port - b.port);
-
-  console.log(`[PortIntel] ✓ Ephemeral group: ${ephemeralPorts.length} ports, ${totalPackets} packets`);
-
-  return {
-    port: 'ephemeral',
-    port_range: { min: portList[0], max: portList[portList.length - 1] },
-    port_count: ephemeralPorts.length,
-    count: totalPackets,
-    risk: 'LOW',
-    reason: 'Ephemeral ports (49152-65535) are used for outbound client connections',
-    service_name: serviceName,
-    description: `${ephemeralPorts.length} ephemeral ports used for outbound connections`,
-    secure_alternative: 'Client-side ports, typically low risk',
-    common_uses: commonUses,
-    risks: risks,
-    source: 'SearXNG Web Search',
-    all_ports: portDetails,
-    sample_ports: portList.slice(0, 10),
-  };
-}
-
 // ═══════════════════════════════════════════════════════════════════
-// LLM Functions - 2-STEP DYNAMIC PROCESS
+// Groq LLM
 // ═══════════════════════════════════════════════════════════════════
-
-// Step 1: Analyze prompt to decide what TShark command to run
-async function analyzePromptForTshark(prompt, contextSummary) {
-  const analysisPrompt = `You are a PCAP network analysis assistant. Classify the user's message and decide what to do.
-
-AVAILABLE DATA TYPES:
-- packets: Basic packet list (src_ip, dst_ip, protocol, ports, info)
-- protocols: Protocol distribution (counts per protocol)
-- dns: DNS queries and responses
-- http: HTTP requests (hosts, URIs, methods)
-- tls_sni: TLS Server Name Indication (domains accessed via HTTPS)
-- http_objects: Extracted HTTP files (images, HTML, JS, etc)
-- ports: Unique destination ports with counts
-- conversations: IP conversation statistics
-- endpoints: Top talkers (IPs with most traffic)
-
-PCAP SUMMARY:
-${contextSummary}
-
-USER MESSAGE: "${prompt}"
-
-Classify the intent:
-- "greeting" → small talk, greetings, thanks, unrelated chat (hi, hello, thanks, cool, etc.)
-- "pcap_query" → any question about network traffic, packets, IPs, protocols, ports, security, etc.
-
-Respond with ONLY a JSON object (no markdown, no explanation):
-{
-  "intent": "greeting" or "pcap_query",
-  "data_types": ["list", "of", "needed", "data", "types"],
-  "greeting_response": "friendly reply if intent is greeting, else null",
-  "reasoning": "brief explanation"
-}`;
-
-  try {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+async function callGroqLLM(messages, maxTokens = 1500) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify({ model: GROQ_MODEL, messages, max_tokens: maxTokens, temperature: 0.7 });
+    const options = {
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${GROQ_API_KEY}`,
         'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
       },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages: [{ role: 'user', content: analysisPrompt }],
-        max_tokens: 200,
-        temperature: 0.1,
-        response_format: { type: 'json_object' },
-      }),
+      timeout: 30000,
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) return reject(new Error(`Groq API ${res.statusCode}: ${data}`));
+          const json = JSON.parse(data);
+          resolve(json.choices?.[0]?.message?.content || '');
+        } catch (e) { reject(e); }
+      });
     });
-    const data = await response.json();
-    const raw = data.choices?.[0]?.message?.content || '{}';
-    const clean = raw.replace(/```json|```/gi, '').trim();
-    const match = clean.match(/\{[\s\S]*\}/);
-    const parsed = JSON.parse(match ? match[0] : '{}');
-    console.log(`[LLM-Analyze] Intent: ${parsed.intent}, Need: ${parsed.data_types?.join(', ')}`);
-    return parsed;
-  } catch (e) {
-    console.error(`[LLM-Analyze] Groq error: ${e.message}`);
-    return { data_types: ['packets', 'protocols'], reasoning: 'Fallback' };
-  }
-}
-
-// Step 2: Generate final response with all context
-async function callLLMStream(prompt, res, origin, fullContext, history = '') {
-  const corsHeaders = getCorsHeaders(origin);
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    ...corsHeaders,
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Groq timeout')); });
+    req.write(payload);
+    req.end();
   });
+}
 
-  const systemPrompt = `You are PacketSight's friendly network analyst — sharp, knowledgeable, but casual. Like a security-savvy colleague explaining things over coffee.
+// ═══════════════════════════════════════════════════════════════════
+// TSHARK - FULL PROTOCOL EXTRACTION (Single Pass, All Protocols)
+// ═══════════════════════════════════════════════════════════════════
+function runTShark(pcapPath) {
+  return new Promise((resolve, reject) => {
 
-RESPONSE STRUCTURE (always follow this):
-1. Start with 1-2 natural, conversational sentences that directly answer what was asked. Use phrases like "Looks like...", "You've got...", "I can see...", "Interestingly..." — never start with a heading, bullet, or robotic opener like "Based on the data provided."
-2. Present the data (categories, tables, lists — whatever fits).
-3. End with a brief human closing thought — a quick observation, something worth noting, or a casual follow-up suggestion like "Want me to dig into any of these?" Keep it 1-2 sentences.
+    // ── ALL FIELDS IN ONE SINGLE TSHARK COMMAND ────────────────
+    const fields = [
+      // Base packet fields
+      'frame.number', 'frame.time_epoch', 'frame.len',
+      'ip.src', 'ip.dst', 'ip.proto',
+      'tcp.srcport', 'tcp.dstport', 'tcp.flags',
+      'udp.srcport', 'udp.dstport',
+      '_ws.col.Protocol', '_ws.col.Info',
 
-TONE RULES:
-- Never say "Based on the data provided", "According to the network capture", or "The PCAP shows" — just say what you found naturally.
-- Keep it friendly and direct. You're a colleague, not a report generator.
+      // DNS (col 12-16)
+      'dns.qry.name', 'dns.a', 'dns.aaaa', 'dns.flags.response', 'dns.qry.type',
 
-IMPORTANT CONTENT RULES:
-- When asked about a SPECIFIC site or domain (e.g. "which packet has touropia"), answer ONLY about that site. Do NOT list all other domains unless explicitly asked.
-- When asked generally about "websites visited" or "domains", then list ALL entries from the "ALL DOMAINS VISITED" section.
-- When asked about downloaded files — list from the HTTP OBJECTS section.
-- Never limit your answer to just one data source when multiple are available.
-- When asked about protocols — ALWAYS include the packet count for each protocol from the PROTOCOLS section.
-- When asked about unencrypted or plain HTTP traffic — check the HTTP REQUESTS section. If there are any entries starting with "GET http://" or "POST http://" (not https), that IS unencrypted HTTP traffic. List those requests explicitly. Never say there is no HTTP traffic if the HTTP REQUESTS section has data.
+      // TLS (col 17-18)
+      'tls.handshake.type', 'tls.handshake.extensions_server_name',
 
-FORMATTING RULES:
-- NEVER use markdown tables. They do not render properly. Use plain text formatting only.
-- For files/objects, list them like this:
-  📄 **filename.jpg** — image/jpeg — 168480 bytes
-- For IP addresses, list them like this:
-  🖥 **192.168.1.1** — 240 packets — Client
-- For domains/websites, use ### for each category heading, then a plain comma-separated list on the next line. Copy domain names EXACTLY as they appear in the data — no modifications, no http://, no brackets, no markdown links, just the raw domain string:
-  ### Microsoft Services
-  www.msftconnecttest.com, edge.microsoft.com, config.edge.skype.com
-  ### Google Services
-  www.google.com, fonts.gstatic.com
-  Dynamically decide category names based on actual domains present. Put EVERY domain in exactly one category. Never use bullet points, tables, or markdown links for domains. Always add a brief summary sentence after the last category.
-- Use **bold** for important findings or anything worth flagging.
+      // HTTP (col 19-24)
+      'http.request.method', 'http.request.uri', 'http.host',
+      'http.response.code', 'http.user_agent', 'http.content_type',
 
-IMAGE PREVIEW RULES:
-- When the user asks to "see", "show", "preview", or "display" any image or file from the HTTP OBJECTS section, you MUST output this exact markdown syntax — no exceptions, no prose substitutes:
+      // FTP (col 25-27)
+      'ftp.request.command', 'ftp.request.arg', 'ftp.response.code',
 
-Here's **filename.jpg** pulled from the traffic:
+      // SMTP (col 28-30)
+      'smtp.req.command', 'smtp.req.parameter', 'smtp.response.code',
 
-![filename.jpg](IMAGE_URL_PLACEHOLDER:filename.jpg)
+      // POP3 / IMAP (col 31-33)
+      'pop.request.command', 'imap.request', 'imap.response',
 
-*size bytes — image/jpeg*
+      // ICMP (col 34-36)
+      'icmp.type', 'icmp.code', 'icmp.checksum',
 
-- Replace filename.jpg with the EXACT filename from HTTP OBJECTS (e.g. aspen.jpg), and size with the actual byte count.
-- The src must be literally IMAGE_URL_PLACEHOLDER:filename.jpg — do not change this format, do not add http://, do not make it a real URL. The frontend will resolve it automatically.
-- Every single time an image preview is requested, output the ![...](...) tag. Never substitute it with text like "(Extracted from HTTP traffic)" or "here's the preview" without the actual image tag.
-- If the user asks again, output the ![...](...) tag again. Never skip it.`;
+      // ARP (col 37-40)
+      'arp.opcode', 'arp.src.hw_mac', 'arp.src.proto_ipv4', 'arp.dst.proto_ipv4',
 
-  const userPrompt = `NETWORK DATA:\n${fullContext}\n\n${history ? `CONVERSATION HISTORY (last few messages for context):\n${history}\n\n` : ''}CURRENT QUESTION: ${prompt}\n\nAnswer based on the data and conversation history above:`;
+      // DHCP (col 41-44)
+      'dhcp.option.hostname', 'dhcp.option.requested_ip_address',
+      'dhcp.option.dhcp', 'dhcp.hw.mac_addr',
+
+      // SSH (col 45-47)
+      'ssh.protocol', 'ssh.kex.algorithms', 'ssh.message_code',
+
+      // SMB (col 48-51)
+      'smb.cmd', 'smb.path', 'smb2.cmd', 'smb2.filename',
+
+      // RDP (col 52-53)
+      'rdp.negReq.requestedProtocols', 'rdp.domain',
+
+      // SNMP (col 54-56)
+      'snmp.community', 'snmp.var_bind_str', 'snmp.version',
+
+      // SIP / RTP (col 57-61)
+      'sip.Method', 'sip.from.user', 'sip.to.user',
+      'sip.Call-ID', 'rtp.ssrc',
+
+      // NetBIOS / NBNS (col 62-64)
+      'nbns.name', 'nbss.type', 'netbios.name',
+
+      // QUIC (col 65-67)
+      'quic.version', 'quic.connection_id', 'quic.packet_type',
+
+      // LDAP (col 68-70)
+      'ldap.baseObject', 'ldap.filter_string', 'ldap.resultCode',
+
+      // Telnet (col 71-72)
+      'telnet.data', 'telnet.cmd',
+
+      // Kerberos (col 73-75)
+      'kerberos.realm', 'kerberos.CNameString', 'kerberos.msg_type',
+
+      // RADIUS (col 76-78)
+      'radius.User_Name', 'radius.code', 'radius.NAS_IP_Address',
+
+      // NFS (col 79-81)
+      'nfs.path', 'nfs.ftype', 'nfs.status',
+
+      // TFTP (col 82-84)
+      'tftp.opcode', 'tftp.source_file', 'tftp.destination_file',
+
+      // Syslog (col 85-87)
+      'syslog.facility', 'syslog.severity', 'syslog.msg',
+
+      // BGP (col 88-90)
+      'bgp.type', 'bgp.prefix_length', 'bgp.next_hop',
+
+      // OSPF (col 91-93)
+      'ospf.msg', 'ospf.srcrouter', 'ospf.area_id',
+
+      // GRE (col 94-95)
+      'gre.proto', 'gre.key',
+
+      // IPSec / IKE (col 96-98)
+      'isakmp.exchtype', 'esp.sequence', 'isakmp.version',
+
+      // VLAN (col 99-100)
+      'vlan.id', 'vlan.priority',
+
+      // Modbus (col 101-103)
+      'mbtcp.func_code', 'mbtcp.reference_num', 'mbtcp.word_cnt',
+
+      // DNP3 (col 104-106)
+      'dnp3.ctl.dir', 'dnp3.src', 'dnp3.dst',
+
+      // MQTT (col 107-109)
+      'mqtt.msgtype', 'mqtt.topic', 'mqtt.msg',
+
+      // mDNS (col 110-111)
+      'mdns.qry.name', 'mdns.ans.name',
+
+      // WSD (col 112)
+      'wsd.action',
+
+      // RPC / MSRPC (col 113-115)
+      'dcerpc.opnum', 'dcerpc.cn_call_id', 'dcerpc.pkt_type',
+
+      // PostgreSQL (col 116-118)
+      'pgsql.query', 'pgsql.authtype', 'pgsql.statement',
+
+      // MySQL (col 119-121)
+      'mysql.query', 'mysql.command', 'mysql.affected_rows',
+
+      // Redis (col 122-123)
+      'redis.command', 'redis.bulk_string',
+
+      // MongoDB (col 124-126)
+      'mongo.opcode', 'mongo.query', 'mongo.documents',
+
+      // NetFlow / IPFIX (col 127-129)
+      'cflow.srcaddr', 'cflow.dstaddr', 'cflow.packets',
+
+      // VXLAN (col 130-131)
+      'vxlan.vni', 'vxlan.flags',
+
+      // L2TP (col 132-134)
+      'l2tp.tunnel_id', 'l2tp.session_id', 'l2tp.type',
+
+      // PPP (col 135-136)
+      'ppp.protocol', 'ppp.direction',
+
+      // CoAP (col 137-139)
+      'coap.code', 'coap.opt.uri_path_recon', 'coap.type',
+
+      // BACnet (col 140-142)
+      'bacapp.service', 'bacapp.objectidentifier', 'bacapp.instance_number',
+
+      // DIAMETER (col 143-145)
+      'diameter.cmd.code', 'diameter.applicationId', 'diameter.Session-Id',
+    ].join(' -e ');
+
+    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -E header=y -E separator=/t -E quote=n -e ${fields} 2>/dev/null`;
+
+    exec(cmd, { maxBuffer: 200 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(new Error(`TShark failed: ${err.message}`));
+
+      const lines = stdout.trim().split('\n');
+
+      // Protocol data arrays
+      const packets = [], dns = [], tls = [], http = [];
+      const ftp = [], smtp = [], pop3imap = [], icmp = [], arp = [], dhcp = [];
+      const ssh = [], smb = [], rdp = [], snmp = [], sip = [], nbns = [];
+      const quic = [], ldap = [], telnet = [], kerberos = [], radius = [], nfs = [];
+      const tftp = [], syslog = [], bgp = [], ospf = [], gre = [], ipsec = [];
+      const vlan = [], modbus = [], dnp3 = [], mqtt = [], mdns = [], wsd = [];
+      const rpc = [], postgresql = [], mysql = [], redis = [], mongodb = [];
+      const netflow = [], vxlan = [], l2tp = [], ppp = [], coap = [], bacnet = [];
+      const diameter = [];
+
+      // Skip header line (i=0)
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        const c = line.split('\t');
+
+        // Base packet
+        const pkt = {
+          frame_number: parseInt(c[0]) || 0,
+          timestamp: parseFloat(c[1]) || 0,
+          length: parseInt(c[2]) || 0,
+          src_ip: c[3] || '',
+          dst_ip: c[4] || '',
+          ip_proto: c[5] || '',
+          src_port: parseInt(c[6]) || parseInt(c[9]) || 0,
+          dst_port: parseInt(c[7]) || parseInt(c[10]) || 0,
+          tcp_flags: c[8] || '',
+          protocol: c[11] || '',
+          info: c[12] || ''
+        };
+        packets.push(pkt);
+
+        const ts = pkt.timestamp;
+        const sip_addr = pkt.src_ip;
+        const dip_addr = pkt.dst_ip;
+
+        // DNS (cols 13-17)
+        if (c[13]) dns.push({ domain: c[13], answer_a: c[14] || '', answer_aaaa: c[15] || '', is_response: c[16] === '1', qry_type: c[17] || '', src_ip: sip_addr, timestamp: ts });
+
+        // TLS (cols 18-19)
+        if (c[18] || c[19]) tls.push({ handshake_type: c[18] || '', sni: c[19] || '', src_ip: sip_addr, dst_ip: dip_addr, dst_port: pkt.dst_port, timestamp: ts });
+
+        // HTTP (cols 20-25)
+        if (c[20] || c[21]) http.push({ method: c[20] || '', uri: c[21] || '', host: c[22] || '', status_code: c[23] || '', user_agent: c[24] || '', content_type: c[25] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // FTP (cols 26-28)
+        if (c[26] || c[28]) ftp.push({ command: c[26] || '', arg: c[27] || '', response_code: c[28] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // SMTP (cols 29-31)
+        if (c[29] || c[31]) smtp.push({ command: c[29] || '', parameter: c[30] || '', response_code: c[31] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // POP3 / IMAP (cols 32-34)
+        if (c[32] || c[33]) pop3imap.push({ pop3_command: c[32] || '', imap_request: c[33] || '', imap_response: c[34] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // ICMP (cols 35-37)
+        if (c[35]) icmp.push({ type: c[35] || '', code: c[36] || '', checksum: c[37] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // ARP (cols 38-41)
+        if (c[38]) arp.push({ opcode: c[38] || '', src_mac: c[39] || '', src_ip: c[40] || '', dst_ip: c[41] || '', timestamp: ts });
+
+        // DHCP (cols 42-45)
+        if (c[42] || c[45]) dhcp.push({ hostname: c[42] || '', requested_ip: c[43] || '', dhcp_type: c[44] || '', mac: c[45] || '', src_ip: sip_addr, timestamp: ts });
+
+        // SSH (cols 46-48)
+        if (c[46]) ssh.push({ protocol: c[46] || '', kex_algorithms: c[47] || '', message_code: c[48] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // SMB (cols 49-52)
+        if (c[49] || c[51]) smb.push({ cmd_v1: c[49] || '', path_v1: c[50] || '', cmd_v2: c[51] || '', filename_v2: c[52] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // RDP (cols 53-54)
+        if (c[53] || c[54]) rdp.push({ protocols: c[53] || '', domain: c[54] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // SNMP (cols 55-57)
+        if (c[55] || c[56]) snmp.push({ community: c[55] || '', var_bind: c[56] || '', version: c[57] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // SIP / RTP (cols 58-62)
+        if (c[58] || c[62]) sip.push({ method: c[58] || '', from_user: c[59] || '', to_user: c[60] || '', call_id: c[61] || '', rtp_ssrc: c[62] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // NBNS (cols 63-65)
+        if (c[63] || c[65]) nbns.push({ name: c[63] || '', nbss_type: c[64] || '', netbios_name: c[65] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // QUIC (cols 66-68)
+        if (c[66]) quic.push({ version: c[66] || '', connection_id: c[67] || '', packet_type: c[68] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // LDAP (cols 69-71)
+        if (c[69] || c[71]) ldap.push({ base_object: c[69] || '', filter: c[70] || '', result_code: c[71] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // Telnet (cols 72-73)
+        if (c[72]) telnet.push({ data: c[72] || '', cmd: c[73] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // Kerberos (cols 74-76)
+        if (c[74] || c[75]) kerberos.push({ realm: c[74] || '', cname: c[75] || '', msg_type: c[76] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // RADIUS (cols 77-79)
+        if (c[77] || c[78]) radius.push({ username: c[77] || '', code: c[78] || '', nas_ip: c[79] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // NFS (cols 80-82)
+        if (c[80]) nfs.push({ path: c[80] || '', ftype: c[81] || '', status: c[82] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // TFTP (cols 83-85)
+        if (c[83]) tftp.push({ opcode: c[83] || '', source_file: c[84] || '', dest_file: c[85] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // Syslog (cols 86-88)
+        if (c[88]) syslog.push({ facility: c[86] || '', severity: c[87] || '', message: c[88] || '', src_ip: sip_addr, timestamp: ts });
+
+        // BGP (cols 89-91)
+        if (c[89]) bgp.push({ type: c[89] || '', prefix_length: c[90] || '', next_hop: c[91] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // OSPF (cols 92-94)
+        if (c[92]) ospf.push({ msg: c[92] || '', src_router: c[93] || '', area_id: c[94] || '', src_ip: sip_addr, timestamp: ts });
+
+        // GRE (cols 95-96)
+        if (c[95]) gre.push({ proto: c[95] || '', key: c[96] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // IPSec / IKE (cols 97-99)
+        if (c[97] || c[98]) ipsec.push({ ike_exchtype: c[97] || '', esp_seq: c[98] || '', ike_version: c[99] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // VLAN (cols 100-101)
+        if (c[100]) vlan.push({ vlan_id: c[100] || '', priority: c[101] || '', src_ip: sip_addr, timestamp: ts });
+
+        // Modbus (cols 102-104)
+        if (c[102]) modbus.push({ func_code: c[102] || '', ref_num: c[103] || '', word_cnt: c[104] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // DNP3 (cols 105-107)
+        if (c[105] || c[106]) dnp3.push({ dir: c[105] || '', src: c[106] || '', dst: c[107] || '', src_ip: sip_addr, timestamp: ts });
+
+        // MQTT (cols 108-110)
+        if (c[108]) mqtt.push({ msg_type: c[108] || '', topic: c[109] || '', msg: c[110] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // mDNS (cols 111-112)
+        if (c[111] || c[112]) mdns.push({ query_name: c[111] || '', answer_name: c[112] || '', src_ip: sip_addr, timestamp: ts });
+
+        // WSD (col 113)
+        if (c[113]) wsd.push({ action: c[113] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // RPC / MSRPC (cols 114-116)
+        if (c[114]) rpc.push({ opnum: c[114] || '', call_id: c[115] || '', pkt_type: c[116] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // PostgreSQL (cols 117-119)
+        if (c[117]) postgresql.push({ query: c[117] || '', authtype: c[118] || '', statement: c[119] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // MySQL (cols 120-122)
+        if (c[120] || c[121]) mysql.push({ query: c[120] || '', command: c[121] || '', affected_rows: c[122] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // Redis (cols 123-124)
+        if (c[123]) redis.push({ command: c[123] || '', response: c[124] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // MongoDB (cols 125-127)
+        if (c[125]) mongodb.push({ opcode: c[125] || '', query: c[126] || '', documents: c[127] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // NetFlow (cols 128-130)
+        if (c[128]) netflow.push({ src_addr: c[128] || '', dst_addr: c[129] || '', packets: c[130] || '', src_ip: sip_addr, timestamp: ts });
+
+        // VXLAN (cols 131-132)
+        if (c[131]) vxlan.push({ vni: c[131] || '', flags: c[132] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // L2TP (cols 133-135)
+        if (c[133]) l2tp.push({ tunnel_id: c[133] || '', session_id: c[134] || '', type: c[135] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // PPP (cols 136-137)
+        if (c[136]) ppp.push({ protocol: c[136] || '', direction: c[137] || '', src_ip: sip_addr, timestamp: ts });
+
+        // CoAP (cols 138-140)
+        if (c[138]) coap.push({ code: c[138] || '', uri_path: c[139] || '', type: c[140] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // BACnet (cols 141-143)
+        if (c[141]) bacnet.push({ service: c[141] || '', object_id: c[142] || '', instance: c[143] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+
+        // DIAMETER (cols 144-146)
+        if (c[144]) diameter.push({ cmd_code: c[144] || '', app_id: c[145] || '', session_id: c[146] || '', src_ip: sip_addr, dst_ip: dip_addr, timestamp: ts });
+      }
+
+      resolve({
+        packets, dns, tls, http,
+        ftp, smtp, pop3imap, icmp, arp, dhcp,
+        ssh, smb, rdp, snmp, sip, nbns,
+        quic, ldap, telnet, kerberos, radius, nfs,
+        tftp, syslog, bgp, ospf, gre, ipsec,
+        vlan, modbus, dnp3, mqtt, mdns, wsd,
+        rpc, postgresql, mysql, redis, mongodb,
+        netflow, vxlan, l2tp, ppp, coap, bacnet, diameter
+      });
+    });
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MAIN ANALYSIS HANDLER
+// ═══════════════════════════════════════════════════════════════════
+async function analyzePCAP(sessionId, pcapPath) {
+  console.log(`[Analysis] Starting for session: ${sessionId}`);
+  const startTime = Date.now();
 
   try {
-    console.log(`[LLM-Stream] Prompt size: ${userPrompt.length} chars`);
-    console.log(`[LLM-Stream] Starting Groq streaming request...`);
+    // 1. Run TShark (single pass, all protocols)
+    console.log('[Analysis] Running TShark (full protocol extraction)...');
+    const tsharkData = await runTShark(pcapPath);
+    const { packets, dns, tls, http } = tsharkData;
+    console.log(`[Analysis] Parsed ${packets.length} packets`);
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        max_tokens: 800,
-        temperature: 0.7,
-        stream: true,
-      }),
-    });
+    // 2. Aggregate base stats
+    const ports = new Set();
+    const srcIPs = new Set();
+    const dstIPs = new Set();
+    const protocols = new Map();
+    let totalBytes = 0, firstTimestamp = Infinity, lastTimestamp = 0;
 
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error(`[LLM-Stream] Groq HTTP error ${response.status}: ${errText}`);
-      res.write(`data: ${JSON.stringify({ error: `Groq error: ${response.status}` })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      return res.end();
+    for (const pkt of packets) {
+      if (pkt.dst_port) ports.add(pkt.dst_port);
+      if (pkt.src_port && pkt.src_port < 49152) ports.add(pkt.src_port);
+      if (pkt.src_ip) srcIPs.add(pkt.src_ip);
+      if (pkt.dst_ip) dstIPs.add(pkt.dst_ip);
+      if (pkt.protocol) protocols.set(pkt.protocol, (protocols.get(pkt.protocol) || 0) + 1);
+      totalBytes += pkt.length || 0;
+      if (pkt.timestamp) {
+        if (pkt.timestamp < firstTimestamp) firstTimestamp = pkt.timestamp;
+        if (pkt.timestamp > lastTimestamp) lastTimestamp = pkt.timestamp;
+      }
     }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    // 3. IANA port info
+    console.log(`[Analysis] Getting IANA info for ${ports.size} ports...`);
+    const portInfoMap = new Map();
+    const portServiceMap = new Map();
+    for (const port of ports) {
+      const info = await getIANAPortInfo(port);
+      portInfoMap.set(port, info);
+      portServiceMap.set(port, info?.service_name || 'Unknown');
+    }
 
-    const pump = async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            res.write('data: [DONE]\n\n');
-            res.end();
-            console.log(`[LLM-Stream] ✓ Complete`);
-            return;
-          }
+    // 4. Batch fetch CVEs + SearXNG risks IN PARALLEL
+    console.log('[Analysis] Fetching CVEs + security risks in parallel...');
+    const serviceNames = [...new Set([...portServiceMap.values()])];
+    const [portCVEMap, serviceRisksMap] = await Promise.all([
+      batchFetchCVEs(portServiceMap),
+      batchFetchServiceRisks(serviceNames)
+    ]);
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
+    // 5. IP reputation check
+    console.log('[Analysis] Checking IP reputations...');
+    const ipReputations = await batchCheckIPReputation([...srcIPs, ...dstIPs]);
 
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6).trim();
-              if (data === '[DONE]') {
-                res.write('data: [DONE]\n\n');
-                res.end();
-                return;
-              }
-              try {
-                const json = JSON.parse(data);
-                const token = json.choices?.[0]?.delta?.content;
-                if (token) res.write(`data: ${JSON.stringify({ token })}\n\n`);
-              } catch (_) {}
-            }
-          }
-        }
-      } catch (e) {
-        console.error(`[LLM-Stream] Stream error: ${e.message}`);
-        res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
-        res.end();
+    // 6. Threat detection
+    console.log('[Analysis] Running threat detection...');
+    const threats = {
+      port_scans: detectPortScans(packets),
+      brute_force: detectBruteForce(packets),
+      dns_tunneling: detectDNSTunneling(dns),
+      data_exfiltration: detectDataExfiltration(packets, ipReputations),
+      ddos_indicators: detectDDoSPatterns(packets),
+      malicious_ips: detectMaliciousIPs([...srcIPs, ...dstIPs], ipReputations)
+    };
+
+    const criticalAlerts = [...threats.ddos_indicators, ...threats.malicious_ips.filter(t => t.severity === 'CRITICAL'), ...threats.data_exfiltration].length;
+    const highAlerts = [...threats.port_scans, ...threats.brute_force.filter(t => t.severity === 'HIGH'), ...threats.dns_tunneling.filter(t => t.severity === 'HIGH'), ...threats.malicious_ips.filter(t => t.severity === 'HIGH')].length;
+
+    // 7. Build summary
+    const duration = lastTimestamp > firstTimestamp ? lastTimestamp - firstTimestamp : 0;
+    const summary = {
+      session_id: sessionId,
+      total_packets: packets.length,
+      total_bytes: totalBytes,
+      duration_seconds: duration,
+      unique_src_ips: srcIPs.size,
+      unique_dst_ips: dstIPs.size,
+      unique_ports: ports.size,
+      protocols: Object.fromEntries(protocols),
+      critical_alerts: criticalAlerts,
+      high_alerts: highAlerts,
+      analysis_time_ms: Date.now() - startTime,
+      // Protocol presence map (for agent routing)
+      protocols_detected: {
+        dns: dns.length > 0,
+        tls: tls.length > 0,
+        http: http.length > 0,
+        ftp: tsharkData.ftp.length > 0,
+        smtp: tsharkData.smtp.length > 0,
+        pop3imap: tsharkData.pop3imap.length > 0,
+        icmp: tsharkData.icmp.length > 0,
+        arp: tsharkData.arp.length > 0,
+        dhcp: tsharkData.dhcp.length > 0,
+        ssh: tsharkData.ssh.length > 0,
+        smb: tsharkData.smb.length > 0,
+        rdp: tsharkData.rdp.length > 0,
+        snmp: tsharkData.snmp.length > 0,
+        sip: tsharkData.sip.length > 0,
+        nbns: tsharkData.nbns.length > 0,
+        quic: tsharkData.quic.length > 0,
+        ldap: tsharkData.ldap.length > 0,
+        telnet: tsharkData.telnet.length > 0,
+        kerberos: tsharkData.kerberos.length > 0,
+        radius: tsharkData.radius.length > 0,
+        nfs: tsharkData.nfs.length > 0,
+        tftp: tsharkData.tftp.length > 0,
+        syslog: tsharkData.syslog.length > 0,
+        bgp: tsharkData.bgp.length > 0,
+        ospf: tsharkData.ospf.length > 0,
+        gre: tsharkData.gre.length > 0,
+        ipsec: tsharkData.ipsec.length > 0,
+        vlan: tsharkData.vlan.length > 0,
+        modbus: tsharkData.modbus.length > 0,
+        dnp3: tsharkData.dnp3.length > 0,
+        mqtt: tsharkData.mqtt.length > 0,
+        mdns: tsharkData.mdns.length > 0,
+        wsd: tsharkData.wsd.length > 0,
+        rpc: tsharkData.rpc.length > 0,
+        postgresql: tsharkData.postgresql.length > 0,
+        mysql: tsharkData.mysql.length > 0,
+        redis: tsharkData.redis.length > 0,
+        mongodb: tsharkData.mongodb.length > 0,
+        netflow: tsharkData.netflow.length > 0,
+        vxlan: tsharkData.vxlan.length > 0,
+        l2tp: tsharkData.l2tp.length > 0,
+        ppp: tsharkData.ppp.length > 0,
+        coap: tsharkData.coap.length > 0,
+        bacnet: tsharkData.bacnet.length > 0,
+        diameter: tsharkData.diameter.length > 0,
       }
     };
 
-    pump();
+    // 8. Build port intelligence (with dynamic SearXNG risks!)
+    const portIntel = [];
+    for (const port of [...ports].sort((a, b) => a - b)) {
+      const info = portInfoMap.get(port);
+      const cves = portCVEMap.get(port) || [];
+      const serviceLower = (info?.service_name || '').toLowerCase();
+      const riskData = serviceRisksMap.get(serviceLower) || { risks: [], alternatives: [] };
 
-  } catch (e) {
-    console.error(`[LLM-Stream] Groq error: ${e.message}`);
-    res.write(`data: ${JSON.stringify({ error: e.message })}\n\n`);
-    res.end();
+      portIntel.push({
+        port,
+        service_name: info?.service_name || 'Unknown',
+        description: info?.description || '',
+        protocol: info?.protocol || 'Unknown',
+        risks: riskData.risks,           // ← Dynamic from SearXNG!
+        alternatives: riskData.alternatives, // ← New: secure alternatives
+        secure: info?.secure || false,
+        cves,
+        packet_count: packets.filter(p => p.dst_port === port || p.src_port === port).length
+      });
+    }
+
+    // 9. Build upload map — ONLY non-empty protocol arrays go to B2
+    const uploadMap = {
+      [`analysis/${sessionId}-summary.json`]: summary,
+      [`analysis/${sessionId}-packets.json`]: packets.slice(0, 10000),
+      [`analysis/${sessionId}-ports.json`]: portIntel,
+      [`analysis/${sessionId}-threats.json`]: threats,
+    };
+
+    // Conditionally add protocol files only if they have data
+    const protocolFiles = {
+      dns: tsharkData.dns,
+      tls: tsharkData.tls,
+      http: tsharkData.http,
+      ftp: tsharkData.ftp,
+      smtp: tsharkData.smtp,
+      pop3imap: tsharkData.pop3imap,
+      icmp: tsharkData.icmp,
+      arp: tsharkData.arp,
+      dhcp: tsharkData.dhcp,
+      ssh: tsharkData.ssh,
+      smb: tsharkData.smb,
+      rdp: tsharkData.rdp,
+      snmp: tsharkData.snmp,
+      sip: tsharkData.sip,
+      nbns: tsharkData.nbns,
+      quic: tsharkData.quic,
+      ldap: tsharkData.ldap,
+      telnet: tsharkData.telnet,
+      kerberos: tsharkData.kerberos,
+      radius: tsharkData.radius,
+      nfs: tsharkData.nfs,
+      tftp: tsharkData.tftp,
+      syslog: tsharkData.syslog,
+      bgp: tsharkData.bgp,
+      ospf: tsharkData.ospf,
+      gre: tsharkData.gre,
+      ipsec: tsharkData.ipsec,
+      vlan: tsharkData.vlan,
+      modbus: tsharkData.modbus,
+      dnp3: tsharkData.dnp3,
+      mqtt: tsharkData.mqtt,
+      mdns: tsharkData.mdns,
+      wsd: tsharkData.wsd,
+      rpc: tsharkData.rpc,
+      postgresql: tsharkData.postgresql,
+      mysql: tsharkData.mysql,
+      redis: tsharkData.redis,
+      mongodb: tsharkData.mongodb,
+      netflow: tsharkData.netflow,
+      vxlan: tsharkData.vxlan,
+      l2tp: tsharkData.l2tp,
+      ppp: tsharkData.ppp,
+      coap: tsharkData.coap,
+      bacnet: tsharkData.bacnet,
+      diameter: tsharkData.diameter,
+    };
+
+    let uploadedProtocols = 0;
+    for (const [name, data] of Object.entries(protocolFiles)) {
+      if (data && data.length > 0) {
+        uploadMap[`analysis/${sessionId}-${name}.json`] = data;
+        uploadedProtocols++;
+      }
+    }
+    console.log(`[Analysis] ${uploadedProtocols} protocol files have data, uploading to B2...`);
+
+    // 10. Upload all at once
+    await Promise.all(
+      Object.entries(uploadMap).map(([key, data]) =>
+        b2.send(new PutObjectCommand({
+          Bucket: process.env.B2_BUCKET_NAME,
+          Key: key,
+          Body: JSON.stringify(data),
+          ContentType: 'application/json'
+        }))
+      )
+    );
+
+    console.log(`[Analysis] ✓ Complete in ${Date.now() - startTime}ms`);
+    return { success: true, summary, port_intelligence: portIntel, threats };
+
+  } catch (error) {
+    console.error(`[Analysis] Error: ${error.message}`);
+    return { success: false, error: error.message };
   }
 }
-async function callLLM(prompt, systemOverride = null) {
-  const defaultSystem = `You are an expert PCAP Security Agent. You analyze network traffic professionally.
 
-RULES:
-- Give DETAILED, INTELLIGENT responses
-- Use **bold** for emphasis
-- Be specific with IPs, ports, protocols, and packet counts`;
+// ═══════════════════════════════════════════════════════════════════
+// SMART AGENT KEYWORD ROUTING
+// Maps user message keywords → B2 file keys to fetch
+// ═══════════════════════════════════════════════════════════════════
 
-  try {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages: [
-          { role: 'system', content: systemOverride || defaultSystem },
-          { role: 'user', content: prompt },
-        ],
-        max_tokens: 800,
-        temperature: 0.7,
-      }),
-    });
-    const data = await response.json();
-    const text = data.choices?.[0]?.message?.content || null;
-    if (text) console.log(`[LLM] ✓ Got response (${text.length} chars)`);
-    return text;
-  } catch (e) {
-    console.error(`[LLM] Groq error: ${e.message}`);
-    return null;
+// Full keyword → protocol file map
+const KEYWORD_PROTOCOL_MAP = [
+  // DNS
+  { keywords: ['dns', 'domain', 'resolve', 'hostname', 'nslookup', 'lookup', 'subdomain', 'zone'], file: 'dns' },
+  // TLS / SSL / Certificates
+  { keywords: ['tls', 'ssl', 'certificate', 'https', 'handshake', 'cipher', 'sni', 'x509', 'encrypt'], file: 'tls' },
+  // HTTP
+  { keywords: ['http', 'web', 'url', 'request', 'response', 'get', 'post', 'header', 'user-agent', 'cookie', 'html', 'api', 'rest', 'status code', 'content-type'], file: 'http' },
+  // FTP
+  { keywords: ['ftp', 'file transfer', 'filezilla', 'vsftpd', 'passive', 'active mode'], file: 'ftp' },
+  // SMTP / Email sending
+  { keywords: ['smtp', 'email', 'mail', 'send mail', 'sendgrid', 'postfix', 'relay', 'spam', 'phishing', 'from address', 'to address'], file: 'smtp' },
+  // POP3 / IMAP
+  { keywords: ['pop3', 'imap', 'retrieve email', 'inbox', 'mailbox', 'fetch mail', 'email client'], file: 'pop3imap' },
+  // ICMP
+  { keywords: ['icmp', 'ping', 'traceroute', 'unreachable', 'ttl exceeded', 'echo request', 'echo reply', 'network reachability'], file: 'icmp' },
+  // ARP
+  { keywords: ['arp', 'mac address', 'layer 2', 'arp spoofing', 'arp poisoning', 'gratuitous arp', 'ip to mac', 'mac to ip'], file: 'arp' },
+  // DHCP
+  { keywords: ['dhcp', 'ip assignment', 'ip lease', 'ip address assigned', 'dhcp discover', 'dhcp offer', 'dhcp request', 'dhcp ack', 'hostname assignment'], file: 'dhcp' },
+  // SSH
+  { keywords: ['ssh', 'secure shell', 'openssh', 'key exchange', 'ssh tunnel', 'sftp', 'scp', 'remote login'], file: 'ssh' },
+  // SMB
+  { keywords: ['smb', 'samba', 'file share', 'windows share', 'network share', 'cifs', 'ransomware', 'eternalblue', 'smb relay'], file: 'smb' },
+  // RDP
+  { keywords: ['rdp', 'remote desktop', 'mstsc', 'xrdp', 'bluekeep', 'remote access', 'screen sharing'], file: 'rdp' },
+  // SNMP
+  { keywords: ['snmp', 'community string', 'oid', 'mib', 'network management', 'trap', 'snmpwalk', 'device monitoring'], file: 'snmp' },
+  // SIP / RTP / VoIP
+  { keywords: ['sip', 'rtp', 'voip', 'call', 'phone', 'asterisk', 'invite', 'register', 'toll fraud', 'call hijack', 'audio stream'], file: 'sip' },
+  // NBNS / NetBIOS
+  { keywords: ['nbns', 'netbios', 'windows name', 'llmnr', 'broadcast name', 'nbt', 'workgroup', 'responder'], file: 'nbns' },
+  // QUIC / HTTP3
+  { keywords: ['quic', 'http/3', 'http3', 'udp web', 'google quic', 'chromium transport'], file: 'quic' },
+  // LDAP
+  { keywords: ['ldap', 'directory', 'active directory', 'ad', 'ldap bind', 'ldap search', 'openldap', 'credential stuffing ldap'], file: 'ldap' },
+  // Telnet
+  { keywords: ['telnet', 'clear text login', 'unencrypted shell', 'telnet session', 'terminal'], file: 'telnet' },
+  // Kerberos
+  { keywords: ['kerberos', 'ticket', 'tgt', 'kdc', 'krbtgt', 'pass the ticket', 'golden ticket', 'ad authentication', 'windows auth'], file: 'kerberos' },
+  // RADIUS
+  { keywords: ['radius', 'aaa', 'authentication server', 'access control', 'nas', 'wifi auth', '802.1x'], file: 'radius' },
+  // NFS
+  { keywords: ['nfs', 'network file system', 'mount', 'nfs share', 'rpc nfs', 'file system access'], file: 'nfs' },
+  // TFTP
+  { keywords: ['tftp', 'trivial ftp', 'tftp server', 'firmware update', 'cisco tftp', 'no auth transfer'], file: 'tftp' },
+  // Syslog
+  { keywords: ['syslog', 'log', 'logging', 'event log', 'log server', 'rsyslog', 'log message', 'facility', 'severity'], file: 'syslog' },
+  // BGP
+  { keywords: ['bgp', 'border gateway', 'routing', 'autonomous system', 'as path', 'route hijack', 'bgp hijack', 'internet routing'], file: 'bgp' },
+  // OSPF
+  { keywords: ['ospf', 'link state', 'internal routing', 'area', 'lsa', 'routing protocol internal'], file: 'ospf' },
+  // GRE
+  { keywords: ['gre', 'tunnel', 'encapsulation', 'gre tunnel', 'ip over ip', 'vpn tunnel protocol'], file: 'gre' },
+  // IPSec / IKE / VPN
+  { keywords: ['ipsec', 'ike', 'vpn', 'esp', 'ah', 'isakmp', 'internet key exchange', 'vpn tunnel', 'encrypted vpn'], file: 'ipsec' },
+  // VLAN
+  { keywords: ['vlan', '802.1q', 'vlan tag', 'trunk port', 'vlan hopping', 'network segmentation'], file: 'vlan' },
+  // Modbus / SCADA
+  { keywords: ['modbus', 'scada', 'industrial', 'ics', 'plc', 'modbus tcp', 'industrial control', 'ot security'], file: 'modbus' },
+  // DNP3
+  { keywords: ['dnp3', 'dnp', 'utility', 'substation', 'critical infrastructure', 'power grid'], file: 'dnp3' },
+  // MQTT / IoT
+  { keywords: ['mqtt', 'iot', 'publish', 'subscribe', 'broker', 'mosquitto', 'sensor', 'embedded device'], file: 'mqtt' },
+  // mDNS / Bonjour
+  { keywords: ['mdns', 'bonjour', 'avahi', 'local discovery', 'zero conf', 'zeroconf', 'local service'], file: 'mdns' },
+  // WSD
+  { keywords: ['wsd', 'web services discovery', 'ws-discovery', 'device discovery', 'windows wsd'], file: 'wsd' },
+  // RPC / MSRPC
+  { keywords: ['rpc', 'msrpc', 'dcom', 'dcerpc', 'microsoft rpc', 'remote procedure', 'com+'], file: 'rpc' },
+  // PostgreSQL
+  { keywords: ['postgresql', 'postgres', 'psql', 'pg', 'sql query postgres', 'database postgres'], file: 'postgresql' },
+  // MySQL
+  { keywords: ['mysql', 'mariadb', 'mysqld', 'sql query', 'database query', 'sql injection mysql'], file: 'mysql' },
+  // Redis
+  { keywords: ['redis', 'cache', 'in-memory', 'redis command', 'redis server', 'keyspace'], file: 'redis' },
+  // MongoDB
+  { keywords: ['mongodb', 'mongo', 'nosql', 'bson', 'mongo query', 'mongodb exploit'], file: 'mongodb' },
+  // NetFlow / IPFIX
+  { keywords: ['netflow', 'ipfix', 'flow data', 'traffic flow', 'flow export', 'flow collector'], file: 'netflow' },
+  // VXLAN
+  { keywords: ['vxlan', 'overlay network', 'vxlan vni', 'virtual extensible lan'], file: 'vxlan' },
+  // L2TP
+  { keywords: ['l2tp', 'layer 2 tunnel', 'l2tp vpn', 'pptp', 'l2f'], file: 'l2tp' },
+  // PPP
+  { keywords: ['ppp', 'point to point', 'pppoe', 'ppp auth', 'wan protocol'], file: 'ppp' },
+  // CoAP
+  { keywords: ['coap', 'constrained', 'iot coap', 'coap request', 'coap response'], file: 'coap' },
+  // BACnet
+  { keywords: ['bacnet', 'building automation', 'hvac', 'building control', 'smart building'], file: 'bacnet' },
+  // DIAMETER
+  { keywords: ['diameter', 'aaa diameter', '3gpp', 'lte auth', 'telecoms auth', 'diameter protocol'], file: 'diameter' },
+  // General / always included
+  { keywords: ['threat', 'attack', 'malicious', 'scan', 'exploit', 'intrusion', 'detect', 'alert', 'suspicious'], file: 'threats' },
+  { keywords: ['port', 'service', 'cve', 'vulnerability', 'risk', 'exposure'], file: 'ports' },
+  { keywords: ['packet', 'traffic', 'ip', 'flow', 'raw', 'frame', 'capture'], file: 'packets' },
+  { keywords: ['summary', 'overview', 'total', 'stats', 'count', 'how many', 'statistics'], file: 'summary' },
+];
+
+/**
+ * Smart keyword routing: figure out which B2 files to fetch for a given user message.
+ * Returns array of file type names (e.g. ['dns', 'threats', 'summary'])
+ */
+function resolveFilesForMessage(message) {
+  const lower = message.toLowerCase();
+  const files = new Set();
+
+  for (const entry of KEYWORD_PROTOCOL_MAP) {
+    if (entry.keywords.some(kw => lower.includes(kw))) {
+      files.add(entry.file);
+    }
   }
-}// ═══════════════════════════════════════════════════════════════════
-// Main Server
+
+  // Always include summary for context
+  files.add('summary');
+
+  // Fallback: vague/generic questions → default set
+  if (files.size <= 1) {
+    files.add('threats');
+    files.add('ports');
+  }
+
+  return [...files];
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// HTTP Server
 // ═══════════════════════════════════════════════════════════════════
 const server = http.createServer(async (req, res) => {
-  const url = req.url || '/';
-  const method = req.method || 'GET';
-  const origin = req.headers['origin'] || '';
-  const enc = req.headers['accept-encoding'] || '';
-  const clientIp = req.headers['x-forwarded-for']?.split(',')[0].trim()
-    || req.socket.remoteAddress || 'unknown';
+  const origin = req.headers.origin || '';
+  const acceptEncoding = req.headers['accept-encoding'] || '';
 
-  console.log(`[Request] ${method} ${url} Origin: ${origin || 'none'}`);
-
-  const respond = (data, status = 200) => json(res, data, status, origin, enc);
-
-  // Handle CORS preflight FIRST
-  if (method === 'OPTIONS') {
-    const corsHeaders = getCorsHeaders(origin);
-    res.writeHead(204, corsHeaders);
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, getCorsHeaders(origin));
     return res.end();
   }
 
-  if (url === '/ping' || url === '/pcap/ping') {
-    res.writeHead(200, { 'Content-Type': 'text/plain', ...getCorsHeaders(origin) });
-    return res.end('pong');
-  }
+  const url = req.url || '/';
+  const clientIP = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown';
 
-  if (url === '/pcap/health') {
-    return respond({ status: 'ok', engine: 'TShark + SearXNG', sessions: sessions.size });
-  }
+  try {
 
-  // ── Upload ─────────────────────────────────────────────────
-  if (url === '/pcap/upload' && method === 'POST') {
-    if (!checkRateLimit(clientIp, RATE_UPLOAD))
-      return respond({ error: 'Too many uploads. Limit: 10/min.' }, 429);
-
-    try {
-      const ct = req.headers['content-type'] || '';
-      const bm = ct.match(/boundary=(?:"([^"]+)"|([^;,\s]+))/);
-      const boundary = bm?.[1] ?? bm?.[2];
-      if (!boundary) return respond({ error: 'Missing multipart boundary' }, 400);
-
-      const body = await parseBody(req);
-
-      const MAX_BYTES = 200 * 1024 * 1024;
-      if (body.length > MAX_BYTES)
-        return respond({ error: `File too large (${(body.length / 1024 / 1024).toFixed(0)} MB). Max 200 MB.` }, 413);
-
-      const parts = parseMultipart(body, boundary);
-      let fileData = null, filename = 'upload.pcap';
-      for (const p of parts) {
-        const m = p.headers.match(/filename\*?=(?:UTF-8''|")?([^";\r\n]+)/i);
-        if (m) { filename = decodeURIComponent(m[1].replace(/"/g, '').trim()); fileData = p.data; }
+    // ── Upload PCAP ─────────────────────────────────────────────
+    if (req.method === 'POST' && url.startsWith('/upload')) {
+      if (!checkRateLimit(clientIP, RATE_UPLOAD)) {
+        return json(res, { error: 'Rate limit exceeded' }, 429, origin, acceptEncoding);
       }
-      if (!fileData) return respond({ error: 'No file found in upload' }, 400);
-
-      const session_id = `session-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-      const pcapPath = path.join(PCAP_DIR, `${session_id}.pcap`);
-      const exportDir = path.join(EXPORT_DIR, session_id);
-
-      fs.writeFileSync(pcapPath, fileData);
-      console.log(`[Upload] ${filename} → ${pcapPath} (${(fileData.length / 1024 / 1024).toFixed(1)} MB)`);
-
-      // Extract HTTP objects in background
-      fs.mkdirSync(exportDir, { recursive: true });
-      // AFTER:
-      exec(`"${TSHARK_BIN}" -r "${pcapPath}" --export-objects http,"${exportDir}" 2>/dev/null`, { timeout: 120000, maxBuffer: 200 * 1024 * 1024 }, (err, _out, stderr) => {
-        if (err) { console.error(`[Export] Failed: ${err.message}`); return; }
-        try {
-          const EXT_CT = {
-            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
-            '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
-            '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
-            '.json': 'application/json', '.pdf': 'application/pdf',
-          };
-          const artifacts = new Map();
-          for (const file of fs.readdirSync(exportDir)) {
-            const fp = path.join(exportDir, file);
-            const ext = path.extname(file).toLowerCase();
-            artifacts.set(encodeURIComponent(file), {
-              buffer: fs.readFileSync(fp),
-              contentType: EXT_CT[ext] || 'application/octet-stream',
-              filename: file,
-              packet_num: null, // will be filled below
-            });
-          }
-          imageStore.set(session_id, artifacts);
-          console.log(`[Export] ${artifacts.size} HTTP objects extracted`);
-        } catch (e) { console.error(`[Export] Read error: ${e.message}`); }
-      });
-
-      // Get quick stats for immediate response
-      const [quickTotal, quickProtos, quickDuration] = await Promise.all([
-        getTruePacketCount(session_id),
-        getProtocolCounts(session_id, 0), // Get ALL protocols
-        new Promise((resolve) => {
-          const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.time_relative 2>/dev/null | tail -1`;
-          exec(cmd, { timeout: 10000 }, (err, stdout) => {
-            resolve(parseFloat(stdout.trim()) || 0);
-          });
-        }),
-      ]);
-
-      // Run ALL tshark extractions in parallel (same as process-b2)
-      const [allPackets, allDns, allTls, allHttpReq, allHttpObj, allPorts] = await Promise.all([
-        runTshark(session_id, '', DEFAULT_FIELDS, 500),
-        getDnsQueries(session_id),
-        getTlsSni(session_id),
-        getHttpRequests(session_id),
-        getHttpObjects(session_id),
-        getAllPorts(session_id),
-      ]);
-
-      // Build summary metadata
-      const uploadIpCounts = {};
-      for (const p of allPackets) {
-        if (p.src_ip) uploadIpCounts[p.src_ip] = (uploadIpCounts[p.src_ip] || 0) + 1;
-        if (p.dst_ip) uploadIpCounts[p.dst_ip] = (uploadIpCounts[p.dst_ip] || 0) + 1;
+      const contentType = req.headers['content-type'] || '';
+      if (!contentType.includes('multipart/form-data')) {
+        return json(res, { error: 'Expected multipart/form-data' }, 400, origin, acceptEncoding);
       }
-      const uploadDomains = new Set();
-      for (const q of allDns) if (q.domain) uploadDomains.add(q.domain);
-      for (const s of allTls) if (s.server_name) uploadDomains.add(s.server_name);
-      for (const r of allHttpReq) if (r.host) uploadDomains.add(r.host);
+      const boundary = contentType.split('boundary=')[1];
+      if (!boundary) return json(res, { error: 'No boundary in content-type' }, 400, origin, acceptEncoding);
 
-      const uploadSummary = {
-        total_packets: quickTotal || 0,
-        protocols: quickProtos.protocols || {},
-        duration_seconds: Math.round(quickDuration) || 0,
-        unique_ports: Object.keys(allPorts).length,
-        unique_ips: Object.keys(uploadIpCounts).length,
-        unique_domains: uploadDomains.size,
-        dns_count: allDns.length,
-        tls_count: allTls.length,
-        http_count: allHttpReq.length,
-        http_objects_count: allHttpObj.length,
-        top_ips: Object.entries(uploadIpCounts).sort((a,b) => b[1]-a[1]).slice(0,10),
-        top_ports: Object.entries(allPorts).sort((a,b) => b[1]-a[1]).slice(0,20),
-      };
+      const buffer = await parseBody(req);
+      const parts = parseMultipart(buffer, boundary);
+      const pcapPart = parts.find(p => p.headers.includes('name="pcap"') || p.headers.includes('name="file"') || p.headers.includes('.pcap') || p.headers.includes('.pcapng'));
+      if (!pcapPart) return json(res, { error: 'No PCAP file found in upload' }, 400, origin, acceptEncoding);
 
-      // Upload all analysis files to B2 in parallel
-      console.log(`[B2-Analysis] Uploading analysis files for ${session_id}...`);
-      await Promise.all([
-        b2.send(new PutObjectCommand({
-          Bucket: process.env.B2_BUCKET_NAME,
-          Key: `analysis/${session_id}-summary.json`,
-          Body: JSON.stringify(uploadSummary),
-          ContentType: 'application/json',
-        })),
-        b2.send(new PutObjectCommand({
-          Bucket: process.env.B2_BUCKET_NAME,
-          Key: `analysis/${session_id}-packets.json`,
-          Body: JSON.stringify(allPackets),
-          ContentType: 'application/json',
-        })),
-        b2.send(new PutObjectCommand({
-          Bucket: process.env.B2_BUCKET_NAME,
-          Key: `analysis/${session_id}-dns.json`,
-          Body: JSON.stringify(allDns),
-          ContentType: 'application/json',
-        })),
-        b2.send(new PutObjectCommand({
-          Bucket: process.env.B2_BUCKET_NAME,
-          Key: `analysis/${session_id}-tls.json`,
-          Body: JSON.stringify(allTls),
-          ContentType: 'application/json',
-        })),
-        b2.send(new PutObjectCommand({
-          Bucket: process.env.B2_BUCKET_NAME,
-          Key: `analysis/${session_id}-http.json`,
-          Body: JSON.stringify({ requests: allHttpReq, objects: allHttpObj }),
-          ContentType: 'application/json',
-        })),
-        b2.send(new PutObjectCommand({
-          Bucket: process.env.B2_BUCKET_NAME,
-          Key: `analysis/${session_id}-ports.json`,
-          Body: JSON.stringify(allPorts),
-          ContentType: 'application/json',
-        })),
-      ]);
-      console.log(`[B2-Analysis] ✓ All analysis files uploaded for ${session_id}`);
+      const filenameMatch = pcapPart.headers.match(/filename="([^"]+)"/);
+      const filename = filenameMatch ? filenameMatch[1] : 'upload.pcap';
+      const sessionId = `session-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const pcapPath = path.join(PCAP_DIR, `${sessionId}.pcap`);
 
-      // Store ONLY tiny metadata in RAM
-      sessions.set(session_id, {
-        session_id,
-        filename,
-        created_at: Date.now(),
-        total_packets: quickTotal || 0,
-      });
+      fs.writeFileSync(pcapPath, pcapPart.data);
+      console.log(`[Upload] Saved: ${filename} (${pcapPart.data.length} bytes) → ${sessionId}`);
 
-      if (sessions.size > 10) {
-        let evictKey = null, oldestAge = -1;
-        for (const [k, s] of sessions) {
-          if (k === session_id) continue;
-          const age = Date.now() - s.created_at;
-          if (age > oldestAge) { oldestAge = age; evictKey = k; }
-        }
-        if (evictKey) sessions.delete(evictKey);
-      }
+      sessions.set(sessionId, { session_id: sessionId, filename, created_at: Date.now(), size: pcapPart.data.length });
 
-      respond({
-        session_id,
-        summary: {
-          total_packets: quickTotal || 0,
-          protocols: quickProtos.protocols || {},
-          duration_seconds: Math.round(quickDuration) || 0,
-          time_range: { start: 0, end: Math.round(quickDuration) || 0 },
-          raw_text: '',
-        },
-      });
-
-      return;
-    } catch (e) {
-      console.error(`[Upload] Error: ${e.message}`);
-      return respond({ error: e.message }, 500);
-    }
-  }
-
-  // ── Packets ────────────────────────────────────────────────
-  if (url.startsWith('/pcap/packets') && method === 'GET') {
-    try {
-      const q = getQuery(url);
-      if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
-
-      const sessionExists = await ensureSession(q.session_id);
-      if (!sessionExists) {
-        return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
-      }
-
-      const page = Math.max(1, parseInt(q.page || '1'));
-      const per_page = Math.min(100, parseInt(q.per_page || '50'));
-      const skip = (page - 1) * per_page;
-
-      const packets = await runTsharkPaged(q.session_id, skip, per_page);
-      const sessionData = sessions.get(q.session_id);
-      const realTotal = sessionData?.total_packets ?? packets.length;
-
-      return respond({ packets, total: realTotal, page, per_page });
-    } catch (err) {
-      console.error(`[Packets] Error: ${err.message}`);
-      return respond({ packets: [], total: 0, page: 1, per_page: 50, error: 'Still processing. Refresh in a few seconds.' });
-    }
-  }
-
-  // ── Packet Detail ───────────────────────────────────────────
-  if (url.startsWith('/pcap/packet-detail') && method === 'GET') {
-    const q = getQuery(url);
-    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
-    
-    const packetNum = parseInt(q.packet_number);
-    if (!packetNum || packetNum < 1) return respond({ error: 'Invalid packet_number' }, 400);
-    
-    if (!fs.existsSync(path.join(PCAP_DIR, `${q.session_id}.pcap`)))
-      return respond({ error: 'Session expired or not found' }, 404);
-
-    const details = await getPacketDetails(q.session_id, packetNum);
-    return respond(details);
-  }
-
-  // ── Packet Dissection (PDML) ────────────────────────────────
-  if (url.startsWith('/pcap/packet-dissection') && method === 'GET') {
-    const q = getQuery(url);
-    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
-    
-    const packetNum = parseInt(q.packet_number);
-    if (!packetNum || packetNum < 1) return respond({ error: 'Invalid packet_number' }, 400);
-    
-    const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
-    if (!fs.existsSync(pcapPath)) return respond({ error: 'Session expired or not found' }, 404);
-
-    const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T pdml -c ${packetNum} 2>/dev/null`;
-    console.log(`[TShark-Dissect] Getting PDML dissection for packet ${packetNum}`);
-    
-    exec(cmd, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[TShark-Dissect] Error: ${err.message}`);
-        return respond({ error: 'Failed to dissect packet' }, 500);
-      }
-      
-      const dissection = parsePdmlOutput(stdout, packetNum);
-      console.log(`[TShark-Dissect] ✓ Parsed ${dissection.layers?.length || 0} layers`);
-      return respond(dissection);
-    });
-    return;
-  }
-
-  // ── Vulnerabilities / Port Intel ────────────────────────────
-  if (url.startsWith('/pcap/vulnerabilities') && method === 'GET') {
-    const q = getQuery(url);
-    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
-    
-    const sessionExists = await ensureSession(q.session_id);
-    if (!sessionExists) {
-      return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
-    }
-
-    // Check cache first
-    const cached = portIntelCache.get(q.session_id);
-    if (cached) {
-      console.log(`[PortIntel] Returning cached results for ${q.session_id}`);
-      return respond(cached);
-    }
-
-    // Get ports directly
-    const portCounts = await getAllPorts(q.session_id);
-    const portEntries = Object.entries(portCounts);
-    console.log(`[PortIntel] Analyzing ${portEntries.length} unique ports via SearXNG...`);
-    
-    // Separate ephemeral ports (49152-65535) from service ports
-    const ephemeralPorts = [];
-    const servicePorts = [];
-    
-    for (const [port, count] of portEntries) {
-      const portNum = parseInt(port);
-      if (portNum >= 49152 && portNum <= 65535) {
-        ephemeralPorts.push({ port: portNum, count });
-      } else {
-        servicePorts.push({ port: portNum, count });
-      }
-    }
-    
-    console.log(`[PortIntel] ${servicePorts.length} service ports, ${ephemeralPorts.length} ephemeral ports`);
-    
-    // Get intelligence for SERVICE ports via SearXNG (with concurrency limit)
-    const MAX_CONCURRENT = 5; // Limit concurrent SearXNG requests
-    const alerts = [];
-    
-    // Process service ports in batches
-    for (let i = 0; i < servicePorts.length; i += MAX_CONCURRENT) {
-  if (i > 0) await new Promise(r => setTimeout(r, 1000));
-  const batch = servicePorts.slice(i, i + MAX_CONCURRENT);
-  const batchResults = await Promise.all(
-    batch.map(async ({ port, count }) => {
-          const intel = await getPortIntelligence(port);
-          return {
-            port,
-            count,
-            risk: intel.risk,
-            reason: intel.reason,
-            cve_id: intel.cve_id,
-            cvss_score: intel.cvss_score,
-            source: intel.source,
-            cve_count: intel.cve_count,
-            all_cves: intel.all_cves,
-            service_name: intel.service_name,
-            description: intel.description,
-            secure_alternative: intel.secure_alternative,
-            common_uses: intel.common_uses,
-            risks: intel.risks,
-          };
-        })
-      );
-      alerts.push(...batchResults);
-      console.log(`[PortIntel] Processed ${Math.min(i + MAX_CONCURRENT, servicePorts.length)}/${servicePorts.length} service ports`);
-    }
-    
-    // Get intelligence for ALL ephemeral ports as ONE group (2 requests instead of 200+)
-    if (ephemeralPorts.length > 0) {
-      const ephemeralIntel = await getEphemeralPortIntelligence(ephemeralPorts);
-      alerts.push(ephemeralIntel);
-    }
-    
-    const summary = { critical: 0, high: 0, medium: 0, low: 0 };
-for (const a of alerts) {
-  const r = (a.risk || 'low').toString().trim().toLowerCase();
-  if (r in summary) summary[r]++;
-}
-    
-    const result = { 
-      alerts, 
-      summary,
-      total_ports: portEntries.length,
-      service_ports: servicePorts.length,
-      ephemeral_ports: ephemeralPorts.length,
-      timestamp: new Date().toISOString(),
-      cached: false,
-      data_sources: {
-        port_info: 'SearXNG Web Search',
-        vulnerabilities: 'SearXNG Web Search'
-      }
-    };
-    
-    // Cache the results
-    portIntelCache.set(q.session_id, { ...result, cached: true });
-    console.log(`[PortIntel] Cached results for ${q.session_id}`);
-    
-    return respond(result);
-  }
-
-  // ── Agent STREAMING endpoint - DYNAMIC TSHARK ────────────────────────────────
-  if (url === '/pcap/agent/stream' && method === 'POST') {
-    if (!checkRateLimit(clientIp, RATE_AGENT)) {
-      res.writeHead(429, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
-      return res.end(JSON.stringify({ error: 'Too many queries. Limit: 30/min.' }));
-    }
-
-    try {
-      const body = await parseBody(req);
-      const parsed = JSON.parse(body.toString());
-const { prompt, session_id, history = '' } = parsed || {};
-      
-      if (!isValidSessionId(session_id)) {
-        res.writeHead(400, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
-        return res.end(JSON.stringify({ error: 'Invalid session_id' }));
-      }
-      
-      const sessionExists = await ensureSession(session_id);
-      if (!sessionExists) {
-        res.writeHead(404, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
-        return res.end(JSON.stringify({ error: 'Session expired or not found. Please re-upload your PCAP file.' }));
-      }
-
-      if (!prompt || typeof prompt !== 'string') {
-        res.writeHead(400, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
-        return res.end(JSON.stringify({ error: 'Missing prompt' }));
-      }
-
-      console.log(`[Agent-Stream] Query received for session: ${session_id}`);
-
-// Handle small talk before running any TShark commands
-const nonPcapPhrases = ['hi', 'hello', 'hey', 'thanks', 'thank you', 'ok', 'okay', 'bye', 'lol', 'cool', 'nice', 'sup', 'yo'];
-const isSmallTalk = nonPcapPhrases.includes(prompt.trim().toLowerCase());
-
-if (isSmallTalk) {
-  const corsHeaders = getCorsHeaders(origin);
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    ...corsHeaders,
-  });
-  res.write(`data: ${JSON.stringify({ token: "Hey! Ask me anything about your PCAP — like what protocols are present, which IPs are most active, any suspicious traffic, DNS queries, or HTTPS domains visited." })}\n\n`);
-  res.write('data: [DONE]\n\n');
-  res.end();
-  return;
-}
-
-// ── Fetch summary from B2, route, fetch needed slices ──
-      const sessionData = sessions.get(session_id);
-
-      async function fetchAnalysis(sid, type) {
-        try {
-          const r = await b2.send(new GetObjectCommand({
-            Bucket: process.env.B2_BUCKET_NAME,
-            Key: `analysis/${sid}-${type}.json`,
-          }));
-          const body = await r.Body.transformToString();
-          return JSON.parse(body);
-        } catch (e) {
-          console.error(`[B2-Fetch] Failed to fetch ${type} for ${sid}: ${e.message}`);
-          return null;
-        }
-      }
-
-      // Step 1: Always fetch summary (tiny ~5KB)
-      const summary = await fetchAnalysis(session_id, 'summary');
-      if (!summary) {
-        res.writeHead(500, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
-        return res.end(JSON.stringify({ error: 'Analysis not found. Please re-upload your PCAP.' }));
-      }
-
-      // Step 2: Router call (~200 tokens)
-      const routerContext = `Total Packets: ${summary.total_packets}
-Protocols: ${Object.entries(summary.protocols || {}).map(([p,c]) => `${p}(${c})`).join(', ')}
-Unique Ports: ${summary.unique_ports}
-DNS Queries: ${summary.dns_count}
-TLS Domains: ${summary.tls_count}
-HTTP Requests: ${summary.http_count}
-HTTP Objects: ${summary.http_objects_count}`;
-
-      const analysis = await analyzePromptForTshark(prompt, routerContext);
-      console.log(`[Agent-Stream] Intent: ${analysis.intent}, Need: ${analysis.data_types?.join(', ')}`);
-
-      if (analysis.intent === 'greeting') {
-        const corsHeaders = getCorsHeaders(origin);
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', ...corsHeaders });
-        res.write(`data: ${JSON.stringify({ token: analysis.greeting_response || "Hey! Ask me anything about your PCAP!" })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-        return;
-      }
-
-      // Step 3: Fetch only needed slices from B2 in parallel
-      const needed = analysis.data_types || ['packets', 'protocols'];
-      const fetchMap = {};
-      await Promise.all(needed.map(async (type) => {
-        if (type === 'protocols') { fetchMap.protocols = summary.protocols; return; }
-        if (type === 'dns') { fetchMap.dns = await fetchAnalysis(session_id, 'dns'); return; }
-        if (type === 'tls_sni') { fetchMap.tls = await fetchAnalysis(session_id, 'tls'); return; }
-        if (type === 'http' || type === 'http_objects') { fetchMap.http = await fetchAnalysis(session_id, 'http'); return; }
-        if (type === 'ports') { fetchMap.ports = await fetchAnalysis(session_id, 'ports'); return; }
-        if (type === 'packets') { fetchMap.packets = await fetchAnalysis(session_id, 'packets'); return; }
+      await b2.send(new PutObjectCommand({
+        Bucket: process.env.B2_BUCKET_NAME,
+        Key: `pcaps/${sessionId}.pcap`,
+        Body: pcapPart.data,
+        ContentType: 'application/vnd.tcpdump.pcap'
       }));
 
-      // Step 4: Build focused context
-      const packets     = fetchMap.packets || [];
-      const dnsQueries  = fetchMap.dns || [];
-      const tlsSni      = fetchMap.tls || [];
-      const httpData    = fetchMap.http || { requests: [], objects: [] };
-      const httpRequests = httpData.requests || [];
-      const httpObjects  = httpData.objects || [];
-      const ports        = fetchMap.ports || {};
+      analyzePCAP(sessionId, pcapPath).catch(err => console.error(`[Analysis] Background error: ${err.message}`));
 
-      const allDomains = new Set();
-      for (const q of dnsQueries) if (q.domain) allDomains.add(q.domain);
-      for (const s of tlsSni) if (s.server_name) allDomains.add(s.server_name);
-      for (const r of httpRequests) if (r.host) allDomains.add(r.host);
-
-      const allUris = httpRequests.map(r =>
-        `#${r.frame_number || '?'} | ${r.method} http://${r.host}${r.uri}${r.post_body ? ` | POST DATA: ${r.post_body}` : ''}`
-      );
-
-      const packetList = packets.slice(0, 500).map(p =>
-        `#${p.id} | ${p.timestamp?.toFixed(3)}s | ${p.src_ip || '?'} → ${p.dst_ip || '?'} | ${p.protocol} | ${p.info || ''}`
-      ).join('\n');
-
-      const sortedProtos = Object.entries(summary.protocols || {}).sort((a,b) => b[1]-a[1]).slice(0,15);
-      const sortedPorts  = Object.entries(ports).sort((a,b) => b[1]-a[1]).slice(0,20);
-
-      const fullContext = `
-=== PCAP SUMMARY ===
-Total Packets: ${summary.total_packets.toLocaleString()}
-Duration: ${summary.duration_seconds || 0}s
-Unique IPs: ${summary.unique_ips || 0}
-Unique Ports: ${summary.unique_ports || 0}
-Unique Domains: ${summary.unique_domains || 0}
-
-${sortedProtos.length ? `=== PROTOCOLS ===\n${sortedProtos.map(([p,c]) => `${p}: ${c} packets`).join('\n')}` : ''}
-
-${allDomains.size ? `=== ALL DOMAINS VISITED ===\n${[...allDomains].sort().join('\n')}` : ''}
-
-${allUris.length ? `=== HTTP REQUESTS ===\n${allUris.slice(0,50).join('\n')}` : ''}
-
-${httpObjects.length ? `=== HTTP OBJECTS ===\n${httpObjects.map(o => `${o.filename} (${o.content_type}, ${o.size} bytes)`).join('\n')}` : ''}
-
-${summary.top_ips?.length ? `=== TOP IPs ===\n${summary.top_ips.map(([ip,c]) => `${ip}: ${c} packets`).join('\n')}` : ''}
-
-${sortedPorts.length ? `=== TOP PORTS ===\n${sortedPorts.map(([p,c]) => `port ${p}: ${c} packets`).join('\n')}` : ''}
-
-${packetList ? `=== PACKET LIST ===\n${packetList}` : ''}
-`.trim().replace(/\n{3,}/g, '\n\n');
-
-      // Step 5: Stream LLM response
-      await callLLMStream(prompt, res, origin, fullContext, history);
-      return;
-      
-    } catch (e) {
-      console.error(`[Agent-Stream] Error: ${e.message}`);
-      res.writeHead(500, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
-      return res.end(JSON.stringify({ error: e.message }));
+      return json(res, { success: true, session_id: sessionId, filename, size: pcapPart.data.length, message: 'Upload successful, analysis started' }, 200, origin, acceptEncoding);
     }
-  }
 
-  // ── Agent Query (non-streaming) ─────────────────────────────
-  if (url === '/pcap/agent/query' && method === 'POST') {
-    if (!checkRateLimit(clientIp, RATE_AGENT))
-      return respond({ error: 'Too many queries. Limit: 30/min.' }, 429);
+    // ── Get Summary ──────────────────────────────────────────────
+    if (req.method === 'GET' && url.startsWith('/api/summary/')) {
+      const sessionId = url.split('/api/summary/')[1]?.split('?')[0];
+      if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
+      if (!await ensureSession(sessionId)) return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
+      const data = await fetchB2JSON(`analysis/${sessionId}-summary.json`);
+      if (!data) return json(res, { error: 'Analysis not ready yet, please wait...' }, 202, origin, acceptEncoding);
+      return json(res, data, 200, origin, acceptEncoding);
+    }
 
-    try {
-      const body = await parseBody(req);
-      const parsed = JSON.parse(body.toString());
-      const { prompt, session_id } = parsed || {};
+    // ── Get Port Intelligence ────────────────────────────────────
+    if (req.method === 'GET' && url.startsWith('/api/ports/')) {
+      const sessionId = url.split('/api/ports/')[1]?.split('?')[0];
+      if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
+      if (!await ensureSession(sessionId)) return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
+      const data = await fetchB2JSON(`analysis/${sessionId}-ports.json`);
+      if (!data) return json(res, { error: 'Port analysis not ready yet' }, 202, origin, acceptEncoding);
+      return json(res, data, 200, origin, acceptEncoding);
+    }
 
-      if (!isValidSessionId(session_id)) return respond({ error: 'Invalid session_id' }, 400);
-      
-      const sessionExists = await ensureSession(session_id);
-      if (!sessionExists) {
-        return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
+    // ── Get Threats ───────────────────────────────────────────────
+    if (req.method === 'GET' && url.startsWith('/api/threats/')) {
+      const sessionId = url.split('/api/threats/')[1]?.split('?')[0];
+      if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
+      if (!await ensureSession(sessionId)) return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
+      const data = await fetchB2JSON(`analysis/${sessionId}-threats.json`);
+      if (!data) return json(res, { error: 'Threat analysis not ready yet' }, 202, origin, acceptEncoding);
+      return json(res, data, 200, origin, acceptEncoding);
+    }
+
+    // ── Smart Agent Chat ─────────────────────────────────────────
+    if (req.method === 'POST' && url.startsWith('/api/agent')) {
+      if (!checkRateLimit(clientIP, RATE_AGENT)) {
+        return json(res, { error: 'Rate limit exceeded' }, 429, origin, acceptEncoding);
       }
-      
-      if (!prompt || typeof prompt !== 'string')
-        return respond({ error: 'Missing prompt' }, 400);
 
-      const sessionData = sessions.get(session_id);
-      
-      // Get data for context
-      const [packets, ports, protocols] = await Promise.all([
-        runTshark(session_id, '', DEFAULT_FIELDS, 100),
-        getAllPorts(session_id),
-        getProtocolCounts(session_id, 0),
-      ]);
-      
-      const llmPrompt = `You are analyzing a PCAP network capture. Here is the data:
+      const body = await parseBody(req);
+      const { session_id, message, conversation_history } = JSON.parse(body.toString());
+      if (!session_id || !message) return json(res, { error: 'Missing session_id or message' }, 400, origin, acceptEncoding);
+      if (!await ensureSession(session_id)) return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
 
-**Basic Stats:**
-• Total Packets: ${sessionData?.total_packets || packets.length}
-• Protocols: ${Object.entries(protocols.protocols || {}).map(([p, c]) => `${p}: ${c}`).join(', ')}
+      // 1. Keyword routing → decide which files to fetch
+      const filesToFetch = resolveFilesForMessage(message);
+      console.log(`[Agent] Keyword routing for "${message.slice(0, 60)}..." → files: [${filesToFetch.join(', ')}]`);
 
-**Sample Packets (first 20):**
-${packets.slice(0, 20).map(p => `• #${p.id}: ${p.src_ip || 'N/A'} → ${p.dst_ip || 'N/A'} [${p.protocol}] ${p.info || ''}`).join('\n')}
-
-**Unique Ports:** ${Object.keys(ports).slice(0, 20).join(', ')}
-
-**User Question:** "${prompt}"
-
-Answer the user's question using ONLY the data above. Be specific with actual IPs, ports, and packet counts.`;
-
-      const llmResponse = await callLLM(llmPrompt);
-      
-      return respond({
-        tool_called: 'llm',
-        parameters: {},
-        result: null,
-        response: llmResponse || 'Unable to analyze. Please try again.',
-      });
-    } catch (e) {
-      console.error(`[Agent] Error: ${e.message}`);
-      return respond({ error: e.message }, 500);
-    }
-  }
-
-  // ── HTTP Objects list ──────────────────────────────────────
-  // AFTER (correct):
-  if (url.startsWith('/pcap/images') && method === 'GET') {
-    const q = getQuery(url);
-    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
-
-    const sessionExists = await ensureSession(q.session_id);
-    if (!sessionExists) {
-      return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
-    }
-
-    const artifacts = imageStore.get(q.session_id);
-    if (!artifacts || artifacts.size === 0)
-      return respond({
-        images: [], total: 0,
-        message: 'No HTTP objects found yet. Extraction runs in the background after upload — wait a few seconds then retry.',
-      });
-
-    // Get packet numbers by matching URIs to frame numbers
-    const pcapPath = path.join(PCAP_DIR, `${q.session_id}.pcap`);
-    let uriToPacket = {};
-    if (fs.existsSync(pcapPath)) {
-      try {
-        const out = require('child_process').execSync(
-          `"${TSHARK_BIN}" -r "${pcapPath}" -Y "http.response" -T fields -e frame.number -e http.request.uri 2>/dev/null`,
-          { timeout: 15000, maxBuffer: 5 * 1024 * 1024 }
-        ).toString();
-        for (const line of out.trim().split('\n').filter(l => l.trim())) {
-          const [frameNum, uri] = line.split('\t');
-          if (uri && frameNum) {
-            const key = uri.split('/').pop().split('?')[0].toLowerCase();
-            if (key) uriToPacket[key] = parseInt(frameNum) || null;
-          }
+      // 2. Fetch only files that exist in B2
+      let analysisContext = '';
+      const fetchPromises = filesToFetch.map(async (fileType) => {
+        const key = `analysis/${session_id}-${fileType}.json`;
+        const data = await fetchB2JSON(key);
+        if (data) {
+          // Limit size for large arrays to avoid LLM token overflow
+          const limited = Array.isArray(data) ? data.slice(0, 50) : data;
+          return `\n## ${fileType.toUpperCase()} Data\n${JSON.stringify(limited, null, 2)}`;
         }
-      } catch (_) {}
-    }
-
-    return respond({
-      images: Array.from(artifacts.entries()).map(([k, v]) => {
-        const baseKey = v.filename.replace(/\(\d+\)/, '').toLowerCase();
-        const nameOnly = baseKey.split('.')[0];
-        const packet_num = uriToPacket[baseKey] || uriToPacket[nameOnly] || null;
-        return {
-          filename: v.filename,
-          content_type: v.contentType,
-          artifact_key: k,
-          size: v.buffer.length,
-          is_image: v.contentType.startsWith('image/'),
-          packet_num,
-        };
-      }),
-      total: artifacts.size,
-    });
-  }
-  // ── HTTP Object data ───────────────────────────────────────
-  if (url.startsWith('/pcap/image-data') && method === 'GET') {
-    const q = getQuery(url);
-    if (!isValidSessionId(q.session_id)) return respond({ error: 'Invalid session_id' }, 400);
-    
-    const sessionExists = await ensureSession(q.session_id);
-    if (!sessionExists) {
-      return respond({ error: 'Session expired or not found. Please re-upload your PCAP file.' }, 404);
-    }
-
-    const artifactKey = q.artifact_key;
-    if (!artifactKey) return respond({ error: 'Missing artifact_key' }, 400);
-
-    const artifacts = imageStore.get(q.session_id);
-    if (!artifacts) return respond({ error: 'No objects found for this session' }, 404);
-
-    const artifact = artifacts.get(artifactKey);
-    if (!artifact) return respond({ error: 'Object not found' }, 404);
-
-    res.writeHead(200, {
-      'Content-Type': artifact.contentType,
-      'Content-Length': artifact.buffer.length,
-      'Cache-Control': 'public, max-age=3600',
-      ...getCorsHeaders(origin),
-    });
-    return res.end(artifact.buffer);
-  }
-
-  // ── Generate presigned PUT URL for direct frontend→B2 upload ──
-  if (url === '/pcap/b2-upload-url' && method === 'POST') {
-    if (!checkRateLimit(clientIp, RATE_UPLOAD))
-      return respond({ error: 'Too many uploads. Limit: 10/min.' }, 429);
-    try {
-      const body = await parseBody(req);
-      const { filename, filesize } = JSON.parse(body.toString());
-      if (!filename) return respond({ error: 'Missing filename' }, 400);
-      const MAX_BYTES = 200 * 1024 * 1024;
-      if (filesize && filesize > MAX_BYTES)
-        return respond({ error: 'File too large. Max 200MB.' }, 413);
-      const b2Key = `pcaps/${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${filename}`;
-      const presignedUrl = await getSignedUrl(b2, new PutObjectCommand({
-        Bucket: process.env.B2_BUCKET_NAME,
-        Key: b2Key,
-        ContentType: 'application/octet-stream',
-      }), { expiresIn: 600, unhoistableHeaders: new Set(['x-amz-checksum-crc32', 'x-amz-sdk-checksum-algorithm']) });
-      console.log(`[B2] Generated presigned URL for: ${b2Key}`);
-      return respond({ presigned_url: presignedUrl, b2_key: b2Key });
-    } catch (e) {
-      console.error(`[B2-URL] Error: ${e.message}`);
-      return respond({ error: e.message }, 500);
-    }
-  }
-
-  // ── Process PCAP downloaded from B2 ───────────────────────────
-  if (url === '/pcap/process-b2' && method === 'POST') {
-    if (!checkRateLimit(clientIp, RATE_UPLOAD))
-      return respond({ error: 'Too many uploads. Limit: 10/min.' }, 429);
-    try {
-      const body = await parseBody(req);
-      const { b2_key, filename } = JSON.parse(body.toString());
-      if (!b2_key) return respond({ error: 'Missing b2_key' }, 400);
-      const session_id = `session-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-      const pcapPath = path.join(PCAP_DIR, `${session_id}.pcap`);
-      const exportDir = path.join(EXPORT_DIR, session_id);
-      await downloadFromB2(b2_key, pcapPath);
-      deleteFromB2(b2_key).catch(() => {});
-      fs.mkdirSync(exportDir, { recursive: true });
-      exec(`"${TSHARK_BIN}" -r "${pcapPath}" --export-objects http,"${exportDir}" 2>/dev/null`,
-        { timeout: 120000, maxBuffer: 200 * 1024 * 1024 }, (err) => {
-        if (err) { console.error(`[Export] Failed: ${err.message}`); return; }
-        try {
-          const EXT_CT = {
-            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
-            '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
-            '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
-            '.json': 'application/json', '.pdf': 'application/pdf',
-          };
-          const artifacts = new Map();
-          for (const file of fs.readdirSync(exportDir)) {
-            const fp = path.join(exportDir, file);
-            const ext = path.extname(file).toLowerCase();
-            artifacts.set(encodeURIComponent(file), {
-              buffer: fs.readFileSync(fp),
-              contentType: EXT_CT[ext] || 'application/octet-stream',
-              filename: file,
-            });
-          }
-          imageStore.set(session_id, artifacts);
-          console.log(`[Export] ${artifacts.size} HTTP objects extracted`);
-        } catch (e) { console.error(`[Export] Read error: ${e.message}`); }
+        return null; // File doesn't exist, skip silently
       });
-      const quickTotal = await getTruePacketCount(session_id);
-      const quickProtos = await getProtocolCounts(session_id, 0);
-      const quickDuration = await new Promise((resolve) => {
-        const cmd = `"${TSHARK_BIN}" -r "${pcapPath}" -T fields -e frame.time_relative 2>/dev/null | tail -1`;
-        exec(cmd, { timeout: 10000 }, (err, stdout) =>
-          resolve(parseFloat(stdout?.trim()) || 0));
-      });
-      // Run ALL tshark extractions in parallel
-const [allPackets, allDns, allTls, allHttpReq, allHttpObj, allPorts] = await Promise.all([
-  runTshark(session_id, '', DEFAULT_FIELDS, 500),
-  getDnsQueries(session_id),
-  getTlsSni(session_id),
-  getHttpRequests(session_id),
-  getHttpObjects(session_id),
-  getAllPorts(session_id),
-]);
 
-// Build summary (tiny metadata only)
-const ipCounts = {};
-for (const p of allPackets) {
-  if (p.src_ip) ipCounts[p.src_ip] = (ipCounts[p.src_ip] || 0) + 1;
-  if (p.dst_ip) ipCounts[p.dst_ip] = (ipCounts[p.dst_ip] || 0) + 1;
-}
-const allDomains = new Set();
-for (const q of allDns) if (q.domain) allDomains.add(q.domain);
-for (const s of allTls) if (s.server_name) allDomains.add(s.server_name);
-for (const r of allHttpReq) if (r.host) allDomains.add(r.host);
+      const contextParts = await Promise.all(fetchPromises);
+      analysisContext = contextParts.filter(Boolean).join('\n');
 
-const summary = {
-  total_packets: quickTotal || 0,
-  protocols: quickProtos.protocols || {},
-  duration_seconds: Math.round(quickDuration) || 0,
-  unique_ports: Object.keys(allPorts).length,
-  unique_ips: Object.keys(ipCounts).length,
-  unique_domains: allDomains.size,
-  dns_count: allDns.length,
-  tls_count: allTls.length,
-  http_count: allHttpReq.length,
-  http_objects_count: allHttpObj.length,
-  top_ips: Object.entries(ipCounts).sort((a,b) => b[1]-a[1]).slice(0,10),
-  top_ports: Object.entries(allPorts).sort((a,b) => b[1]-a[1]).slice(0,20),
-};
+      if (!analysisContext) {
+        analysisContext = '\n## Note\nNo specific protocol data found for this query. Answer based on general network security knowledge.';
+      }
 
-// Upload all analysis files to B2 in parallel
-console.log(`[B2-Analysis] Uploading analysis files for ${session_id}...`);
-await Promise.all([
-  b2.send(new PutObjectCommand({
-    Bucket: process.env.B2_BUCKET_NAME,
-    Key: `analysis/${session_id}-summary.json`,
-    Body: JSON.stringify(summary),
-    ContentType: 'application/json',
-  })),
-  b2.send(new PutObjectCommand({
-    Bucket: process.env.B2_BUCKET_NAME,
-    Key: `analysis/${session_id}-packets.json`,
-    Body: JSON.stringify(allPackets),
-    ContentType: 'application/json',
-  })),
-  b2.send(new PutObjectCommand({
-    Bucket: process.env.B2_BUCKET_NAME,
-    Key: `analysis/${session_id}-dns.json`,
-    Body: JSON.stringify(allDns),
-    ContentType: 'application/json',
-  })),
-  b2.send(new PutObjectCommand({
-    Bucket: process.env.B2_BUCKET_NAME,
-    Key: `analysis/${session_id}-tls.json`,
-    Body: JSON.stringify(allTls),
-    ContentType: 'application/json',
-  })),
-  b2.send(new PutObjectCommand({
-    Bucket: process.env.B2_BUCKET_NAME,
-    Key: `analysis/${session_id}-http.json`,
-    Body: JSON.stringify({ requests: allHttpReq, objects: allHttpObj }),
-    ContentType: 'application/json',
-  })),
-  b2.send(new PutObjectCommand({
-    Bucket: process.env.B2_BUCKET_NAME,
-    Key: `analysis/${session_id}-ports.json`,
-    Body: JSON.stringify(allPorts),
-    ContentType: 'application/json',
-  })),
-]);
-console.log(`[B2-Analysis] ✓ All analysis files uploaded for ${session_id}`);
+      // 3. Build LLM messages
+      const messages = [
+        {
+          role: 'system',
+          content: `You are a network security analyst AI with access to PCAP analysis data. Help the user understand network traffic, identify security issues, and provide actionable recommendations.
 
-// Store ONLY tiny metadata in RAM
-sessions.set(session_id, {
-  session_id,
-  filename: filename || b2_key.split('/').pop(),
-  created_at: Date.now(),
-  total_packets: quickTotal || 0,
-});
+Only the following data was fetched based on the user's question (other protocol data was skipped to save tokens):
+${analysisContext}
 
-return respond({
-  session_id,
-  summary: {
-    total_packets: quickTotal || 0,
-    protocols: quickProtos.protocols || {},
-    duration_seconds: Math.round(quickDuration) || 0,
-    time_range: { start: 0, end: Math.round(quickDuration) || 0 },
-    raw_text: '',
-  },
-});
-    } catch (e) {
-      console.error(`[B2-Process] Error: ${e.message}`);
-      return respond({ error: e.message }, 500);
+Respond in a helpful, concise manner using markdown formatting. If data for a specific protocol isn't shown, mention that no traffic was detected for it in this capture.`
+        },
+        ...(conversation_history || []),
+        { role: 'user', content: message }
+      ];
+
+      try {
+        const response = await callGroqLLM(messages);
+        return json(res, { response, files_used: filesToFetch }, 200, origin, acceptEncoding);
+      } catch (e) {
+        return json(res, { error: `LLM error: ${e.message}` }, 500, origin, acceptEncoding);
+      }
     }
-  }
 
-  // ── 404 ─────────────────────────────────────────────────────
-  res.writeHead(404, { 'Content-Type': 'application/json', ...getCorsHeaders(origin) });
-  return res.end(JSON.stringify({ error: 'Not found' }));
+    // ── Health Check ──────────────────────────────────────────────
+    if (req.method === 'GET' && url === '/health') {
+      return json(res, {
+        status: 'ok',
+        uptime: process.uptime(),
+        sessions: sessions.size,
+        iana_registry_loaded: ianaPortRegistry.size,
+        nvd_cache_size: nvdCache.size,
+        ip_reputation_cache_size: ipReputationCache.size,
+        searxng_risk_cache_size: searxngRiskCache.size,
+      }, 200, origin, acceptEncoding);
+    }
+
+    return json(res, { error: 'Not found' }, 404, origin, acceptEncoding);
+
+  } catch (error) {
+    console.error(`[Server] Error: ${error.message}`);
+    return json(res, { error: error.message }, 500, origin, acceptEncoding);
+  }
 });
 
-// ── Keep-alive (prevents Render free tier from sleeping) ──────
-const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
-if (RENDER_URL) {
-  setInterval(() => {
-    https.get(`${RENDER_URL}/ping`, (res) => {
-      console.log(`[KeepAlive] Ping → ${res.statusCode}`);
-    }).on('error', (e) => {
-      console.error(`[KeepAlive] Failed: ${e.message}`);
-    });
-  }, 10 * 60 * 1000); // every 10 minutes
-}
-// ═══════════════════════════════════════════════════════════════════
-// Start Server
-// ═══════════════════════════════════════════════════════════════════
-const PORT = process.env.PORT || 10000;
+// ── Start Server ───────────────────────────────────────────────────
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log('═══════════════════════════════════════════════════════════════');
-  console.log(`🚀 PCAP Analyzer Backend running on port ${PORT}`);
-  console.log(`📊 Engine: TShark + SearXNG (NO AI for port intel)`);
-console.log(`🤖 LLM: Groq (${GROQ_MODEL})`);
+  console.log('  PCAP Intelligence Server - FULL PROTOCOL EDITION');
+  console.log('═══════════════════════════════════════════════════════════════');
+  console.log(`  Server running on port ${PORT}`);
+  console.log(`  CORS Origin: ${ALLOWED_ORIGIN}`);
+  console.log('');
+  console.log('  WHAT\'S NEW:');
+  console.log('  ✓ TShark: Single pass extracts 45+ protocols');
+  console.log('  ✓ B2: Only uploads non-empty protocol files (zero waste)');
+  console.log('  ✓ Risks: Dynamic from SearXNG (no hardcoded map!)');
+  console.log('  ✓ Agent: Smart keyword routing (fetches only relevant files)');
+  console.log('  ✓ Agent: Checks B2 existence before fetching (zero wasted tokens)');
+  console.log('  ✓ Protocols: DNS, TLS, HTTP, FTP, SMTP, POP3/IMAP, ICMP, ARP,');
+  console.log('               DHCP, SSH, SMB, RDP, SNMP, SIP/RTP, NBNS, QUIC,');
+  console.log('               LDAP, Telnet, Kerberos, RADIUS, NFS, TFTP, Syslog,');
+  console.log('               BGP, OSPF, GRE, IPSec/IKE, VLAN, Modbus, DNP3,');
+  console.log('               MQTT, mDNS, WSD, RPC, PostgreSQL, MySQL, Redis,');
+  console.log('               MongoDB, NetFlow, VXLAN, L2TP, PPP, CoAP, BACnet,');
+  console.log('               DIAMETER');
   console.log('═══════════════════════════════════════════════════════════════');
 });
