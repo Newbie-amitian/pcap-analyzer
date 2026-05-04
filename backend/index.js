@@ -857,14 +857,15 @@ setInterval(async () => {
       sessionPortIndexes.delete(id);
       sessionContentIndexes.delete(id);
 
-      const analysisTypes = ['summary', 'packets', 'dns', 'tls', 'http', 'ports', 'threats',
-        'ftp', 'smtp', 'pop3imap', 'icmp', 'arp', 'dhcp', 'ssh', 'smb', 'rdp', 'snmp',
-        'sip', 'nbns', 'quic', 'ldap', 'telnet', 'kerberos', 'radius', 'nfs', 'tftp',
-        'syslog', 'bgp', 'ospf', 'gre', 'ipsec', 'vlan', 'modbus', 'dnp3', 'mqtt',
-        'mdns', 'wsd', 'rpc', 'postgresql', 'mysql', 'redis', 'mongodb', 'netflow',
-        'vxlan', 'l2tp', 'ppp', 'coap', 'bacnet', 'diameter'
-      ];
-      await Promise.all(analysisTypes.map(type => deleteFromB2(`analysis/${id}-${type}.json`).catch(() => { })));
+// Fetch summary to know which protocol files actually exist
+const summary = await fetchB2JSON(`analysis/${id}-summary.json`);
+const dynamicTypes = ['summary', 'packets', 'ports', 'threats'];
+
+if (summary?.protocols_detected) {
+  Object.keys(summary.protocols_detected).forEach(proto => dynamicTypes.push(proto));
+}
+
+await Promise.all(dynamicTypes.map(type => deleteFromB2(`analysis/${id}-${type}.json`).catch(() => {})));
       sessions.delete(id);
       console.log(`[Session] Expired + B2 cleaned + MiniSearch cleared: ${id}`);
     }
@@ -1271,61 +1272,43 @@ function buildContentIndex(sessionId, tsharkData) {
   const docs = [];
   let idCounter = 0;
 
-  const add = (protocol, content, src_ip, dst_ip, port, extra = '') => {
-    if (!content || content.trim() === '') return;
-    docs.push({ id: `c-${idCounter++}`, content, protocol, src_ip: src_ip || '', dst_ip: dst_ip || '', port: port || 0, extra });
-  };
+  for (const [proto, data] of Object.entries(tsharkData)) {
+    if (proto === 'packets') continue;
+    if (!Array.isArray(data) || data.length === 0) continue;
 
-  // HTTP - URIs, hosts, user agents
-  // Dynamically index content from all buckets
-// Each bucket row has auto-keyed fields (e.g. request_uri, qry_name)
-// plus src_ip, dst_ip, src_port, dst_port, timestamp always present
+    for (const r of data.slice(0, 2000)) {
+      // Grab every field that has a non-blank string value
+      const contentParts = Object.entries(r)
+        .filter(([k, v]) =>
+          v !== null &&
+          v !== undefined &&
+          typeof v === 'string' &&
+          v.trim() !== '' &&
+          !['src_ip', 'dst_ip', 'src_port', 'dst_port', 'timestamp'].includes(k)
+        )
+        .map(([, v]) => v.trim());
 
-const CONTENT_FIELD_HINTS = {
-  http:       ['request_uri', 'host', 'user_agent', 'request_method'],
-  dns:        ['qry_name', 'a', 'aaaa'],
-  ftp:        ['request_arg', 'request_command'],
-  smb:        ['filename', 'path'],   // smb2.filename → filename, smb.path → path
-  smb2:       ['filename'],
-  smtp:       ['req_parameter', 'req_command'],
-  kerberos:   ['CNameString', 'realm'],
-  ldap:       ['baseObject', 'filter_string'],
-  mysql:      ['query'],
-  pgsql:      ['query'],
-  mqtt:       ['topic'],
-  telnet:     ['data'],
-  tls:        ['handshake_extensions_server_name'],
-  sip:        ['from_user', 'to_user', 'Call-ID'],
-};
+      if (contentParts.length === 0) continue;
 
-for (const [proto, data] of Object.entries(tsharkData)) {
-  if (proto === 'packets') continue;
-  const hints = CONTENT_FIELD_HINTS[proto];
-  if (!hints) continue; // skip protocols with nothing useful to index
-
-  for (const r of data.slice(0, 2000)) {
-    const parts = hints.map(f => r[f] || '').filter(Boolean);
-    if (parts.length > 0) {
-      add(
-        proto,
-        parts.join(' '),
-        r.src_ip,
-        r.dst_ip,
-        r.dst_port || r.src_port || 0
-      );
+      docs.push({
+        id: `c-${idCounter++}`,
+        content: contentParts.join(' '),
+        protocol: proto,
+        src_ip: r.src_ip || '',
+        dst_ip: r.dst_ip || '',
+        port: r.dst_port || r.src_port || 0,
+        extra: ''
+      });
     }
   }
-}
 
-if (docs.length > 0) {
-  index.addAll(docs);
-  console.log(
-    `[MiniSearch] Built content index for ${sessionId}: ${docs.length} entries indexed`
-  );
-}
+  if (docs.length > 0) {
+    index.addAll(docs);
+    console.log(`[MiniSearch] Built content index for ${sessionId}: ${docs.length} entries across ${Object.keys(tsharkData).filter(k => k !== 'packets').length} protocols`);
+  }
 
-sessionContentIndexes.set(sessionId, index);
-return index;
+  sessionContentIndexes.set(sessionId, index);
+  return index;
 }
 // ═══════════════════════════════════════════════════════════════════
 // SMART AGENT KEYWORD ROUTING (Hardcoded for 45 known protocols)
@@ -1752,39 +1735,34 @@ const server = http.createServer(async (req, res) => {
 
       // ── If MiniSearch indexes aren't in memory (server restart), rebuild from B2 ──
       if (!sessionPortIndexes.has(session_id) || !sessionContentIndexes.has(session_id)) {
-        console.log(`[Agent] MiniSearch indexes not in memory for ${session_id}, rebuilding from B2...`);
-        const [portIntelData, packetsData, ...protocolArrays] = await Promise.all([
-          fetchB2JSON(`analysis/${session_id}-ports.json`),
-          fetchB2JSON(`analysis/${session_id}-packets.json`),
-          fetchB2JSON(`analysis/${session_id}-http.json`),
-          fetchB2JSON(`analysis/${session_id}-dns.json`),
-          fetchB2JSON(`analysis/${session_id}-ftp.json`),
-          fetchB2JSON(`analysis/${session_id}-smb.json`),
-          fetchB2JSON(`analysis/${session_id}-smtp.json`),
-          fetchB2JSON(`analysis/${session_id}-kerberos.json`),
-          fetchB2JSON(`analysis/${session_id}-ldap.json`),
-          fetchB2JSON(`analysis/${session_id}-mysql.json`),
-          fetchB2JSON(`analysis/${session_id}-postgresql.json`),
-          fetchB2JSON(`analysis/${session_id}-mqtt.json`),
-          fetchB2JSON(`analysis/${session_id}-telnet.json`),
-          fetchB2JSON(`analysis/${session_id}-tls.json`),
-          fetchB2JSON(`analysis/${session_id}-sip.json`),
-        ]);
+  console.log(`[Agent] MiniSearch indexes not in memory for ${session_id}, rebuilding from B2...`);
 
-        if (portIntelData) buildPortIndex(session_id, portIntelData);
+  const [portIntelData, summary] = await Promise.all([
+    fetchB2JSON(`analysis/${session_id}-ports.json`),
+    fetchB2JSON(`analysis/${session_id}-summary.json`),
+  ]);
 
-        const rebuiltTsharkData = {
-          http: protocolArrays[0] || [], dns: protocolArrays[1] || [],
-          ftp: protocolArrays[2] || [], smb: protocolArrays[3] || [],
-          smtp: protocolArrays[4] || [], kerberos: protocolArrays[5] || [],
-          ldap: protocolArrays[6] || [], mysql: protocolArrays[7] || [],
-          postgresql: protocolArrays[8] || [], mqtt: protocolArrays[9] || [],
-          telnet: protocolArrays[10] || [], tls: protocolArrays[11] || [],
-          sip: protocolArrays[12] || [],
-        };
-        buildContentIndex(session_id, rebuiltTsharkData);
-      }
+  if (portIntelData) buildPortIndex(session_id, portIntelData);
 
+  if (summary?.protocols_detected) {
+    const rebuiltTsharkData = {};
+
+    await Promise.all(
+      Object.entries(summary.protocols_detected)
+        .filter(([, hasData]) => hasData)
+        .map(async ([proto]) => {
+          const data = await fetchB2JSON(`analysis/${session_id}-${proto}.json`);
+          if (data) rebuiltTsharkData[proto] = data;
+        })
+    );
+
+    buildContentIndex(session_id, rebuiltTsharkData);
+    console.log(`[Agent] Rebuilt content index from protocols: ${Object.keys(rebuiltTsharkData).join(', ')}`);
+  } else {
+    console.warn(`[Agent] No protocols_detected in summary for ${session_id}, content index will be empty`);
+    buildContentIndex(session_id, {});
+  }
+}
       // 1. Hybrid routing: hardcoded keywords + MiniSearch
       const routing = await resolveFilesForMessage(message, session_id);
       const { files: filesToFetch, unknownPortMatches, contentMatches } = routing;
