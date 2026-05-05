@@ -1495,8 +1495,39 @@ async function exportHttpObjects(sessionId, pcapPath) {
   })));
 
 // ── Upload all files to B2 + build manifest ──
+// ── Get HTTP object metadata from tshark ──
+  const httpMeta = await new Promise((resolve) => {
+    const { spawn } = require('child_process');
+    const proc = spawn(TSHARK_BIN, [
+      '-r', pcapPath,
+      '-Y', 'http.response or http.request',
+      '-T', 'fields',
+      '-e', 'frame.number',
+      '-e', 'ip.src',
+      '-e', 'ip.dst',
+      '-e', 'http.host',
+      '-e', 'http.request.uri',
+      '-e', 'http.response_for.uri',
+    ]);
+    let out = '';
+    proc.stdout.on('data', d => out += d.toString());
+    proc.stderr.resume();
+    proc.on('close', () => {
+      const rows = [];
+      for (const line of out.split('\n')) {
+        const [frame, src, dst, host, uri, ruri] = line.split('\t');
+        if (frame) rows.push({ frame: parseInt(frame), src, dst, host, uri: uri || ruri || '' });
+      }
+      resolve(rows);
+    });
+    proc.on('error', () => resolve([]));
+    setTimeout(() => { try { proc.kill(); } catch(_){} resolve([]); }, 15000);
+  });
+
+  // ── Upload all files to B2 + build manifest ──
   let uploaded = 0;
   const manifest = [];
+  let fileIndex = 0;
 
   const allDirs = exportTypes.map(t => ({ type: t, dir: path.join(exportDir, t) }));
 
@@ -1520,19 +1551,23 @@ async function exportHttpObjects(sessionId, pcapPath) {
           ContentType: contentType,
         }));
 
+const meta = httpMeta[fileIndex] || {};
         manifest.push({
           filename,
           artifact_key: b2Key,
           size: fileBuffer.length,
           content_type: contentType,
-          src_ip: 'unknown',
-          dst_ip: 'unknown',
+          src_ip: meta.src || 'unknown',
+          dst_ip: meta.dst || 'unknown',
+          host: meta.host || '',
+          uri: meta.uri || '',
           src_port: 0,
           dst_port: type === 'http' ? 80 : 0,
-          packet_num: 0,
+          packet_num: meta.frame || 0,
           is_image: contentType.startsWith('image/'),
           export_type: type,
         });
+        fileIndex++;
         uploaded++;
       } catch (e) {
         console.error(`[Export] Failed to upload ${filename}: ${e.message}`);
