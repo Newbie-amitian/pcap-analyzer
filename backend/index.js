@@ -1622,12 +1622,29 @@ async function analyzePCAP(sessionId, pcapPath) {
   const startTime = Date.now();
 
   try {
-    setProgress(sessionId, 0, 'Running TShark extraction');
+setProgress(sessionId, 0, 'Running TShark extraction');
     console.log('[Analysis] Running TShark + export-objects in parallel...');
+
+    // Send sub-progress updates while TShark runs (every 8s)
+    let subStep = 0;
+    const subLabels = [
+      'Running TShark extraction',
+      'Parsing packets & protocol layers...',
+      'Extracting protocol buckets...',
+      'Exporting HTTP objects...',
+      'Finalizing packet data...',
+    ];
+    const subTimer = setInterval(() => {
+      subStep = Math.min(subStep + 1, subLabels.length - 1);
+      setProgress(sessionId, 0, subLabels[subStep]);
+    }, 8000);
+
     const [tsharkData, exportedManifest] = await Promise.all([
       runTShark(pcapPath),
       exportHttpObjects(sessionId, pcapPath)
     ]);
+
+    clearInterval(subTimer);
 
     const session = sessions.get(sessionId);
     if (session) {
