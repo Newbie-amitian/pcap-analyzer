@@ -1851,7 +1851,9 @@ const server = http.createServer(async (req, res) => {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
-        ...getCorsHeaders(origin),
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET',
+        'Access-Control-Allow-Headers': 'Content-Type',
       });
 
       // Send current state immediately
