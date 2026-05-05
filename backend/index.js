@@ -1211,7 +1211,16 @@ if (packets.length === 0) {
           src_port:     parseInt(gv('tcp.srcport')) || parseInt(gv('tcp.src_port')) || parseInt(gv('udp.srcport')) || parseInt(gv('udp.src_port')) || 0,
           dst_port:     parseInt(gv('tcp.dstport')) || parseInt(gv('tcp.dst_port')) || parseInt(gv('udp.dstport')) || parseInt(gv('udp.dst_port')) || 0,
           tcp_flags:    gv('tcp.flags'),
-          protocol:     gv('_ws.col.Protocol') || gv('_ws_col_Protocol'),
+protocol:     (() => {
+  // In nested mode, _ws.col.Protocol is under layers['_ws']['_ws.col.Protocol']
+  const wsLayer = layers['_ws'];
+  if (wsLayer && typeof wsLayer === 'object') {
+    return wsLayer['_ws.col.Protocol'] || wsLayer['_ws_col_Protocol'] || '';
+  }
+  // Fallback: derive from bucket keys
+  const protoKeys = Object.keys(layers).filter(k => !['frame','eth','ip','ipv6','tcp','udp','_ws'].includes(k));
+  return protoKeys[protoKeys.length - 1] || '';
+})(),
           info:         gv('_ws.col.Info') || gv('_ws_col_Info'),
         };
         packets.push(pkt);
