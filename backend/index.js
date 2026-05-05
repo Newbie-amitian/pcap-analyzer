@@ -1890,16 +1890,6 @@ const server = http.createServer(async (req, res) => {
       return json(res, { images }, 200, origin, acceptEncoding);
     }
 
-  // Read manifest written by exportHttpObjects — fast, no B2 listing needed
-  const manifest = await fetchB2JSON(`artifacts/${sessionId}/_manifest.json`);
-  const images = manifest || [];
-
-  console.log(`[Images] Session ${sessionId}: ${images.length} artifacts found`);
-  return json(res, { images }, 200, origin, acceptEncoding);
-}
-      return json(res, { images }, 200, origin, acceptEncoding);
-    }
-
     // ── GET /pcap/image-data ──────────────────────────────────────
     if (req.method === 'GET' && url.startsWith('/pcap/image-data')) {
       const q = getQuery(url);
