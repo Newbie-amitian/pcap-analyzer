@@ -825,14 +825,19 @@ const SESSION_TTL_MS = 30 * 60 * 1000;
 
 // ── Analysis Progress Tracker ─────────────────────────────────
 const analysisProgress = new Map();   // sessionId → { step, label, done }
+const progressHistory = new Map();    // sessionId → array of all steps so far
 const progressListeners = new Map();  // sessionId → Set of SSE response objects
 
 function setProgress(sessionId, step, label, done = false) {
   const data = { step, label, done };
   analysisProgress.set(sessionId, data);
+
+  // Keep full history so late SSE connections can replay all missed steps
+  if (!progressHistory.has(sessionId)) progressHistory.set(sessionId, []);
+  progressHistory.get(sessionId).push(data);
+
   console.log(`[Progress] ${sessionId} → step ${step}: ${label}`);
 
-  // Push to all listening SSE clients immediately — zero polling
   const listeners = progressListeners.get(sessionId);
   if (listeners && listeners.size > 0) {
     const msg = `data: ${JSON.stringify(data)}\n\n`;
@@ -845,7 +850,6 @@ function setProgress(sessionId, step, label, done = false) {
     if (done) progressListeners.delete(sessionId);
   }
 }
-
 // MiniSearch indexes per session (cleaned up on expiry)
 const sessionPortIndexes = new Map();     // portIndex per sessionId
 const sessionContentIndexes = new Map();  // contentIndex per sessionId
@@ -904,7 +908,8 @@ await Promise.all(dynamicTypes.map(type => deleteFromB2(`analysis/${id}-${type}.
         }
       } catch (_) {}
 
-     analysisProgress.delete(id);
+analysisProgress.delete(id);
+      progressHistory.delete(id);
       progressListeners.delete(id);
       sessions.delete(id);
     }
@@ -1515,7 +1520,7 @@ async function exportHttpObjects(sessionId, pcapPath) {
       console.log(`[Export] ✓ ${type} export done (exit ${code})`);
       resolve();
     });
-    setTimeout(() => { try { proc.kill('SIGKILL'); } catch(_){} resolve(); }, 60000);
+    setTimeout(() => { try { proc.kill('SIGKILL'); } catch(_){} resolve(); }, 90000);
   })));
 
 // ── Upload all files to B2 + build manifest ──
@@ -1856,11 +1861,17 @@ const server = http.createServer(async (req, res) => {
         'Access-Control-Allow-Headers': 'Content-Type',
       });
 
-      // Send current state immediately
-      const current = analysisProgress.get(sessionId) || { step: 0, label: 'Waiting to start...', done: false };
-      res.write(`data: ${JSON.stringify(current)}\n\n`);
-
-      if (current.done) return res.end();
+// Replay ALL missed steps so frontend catches up instantly
+      const history = progressHistory.get(sessionId) || [];
+      if (history.length > 0) {
+        for (const event of history) {
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+        const last = history[history.length - 1];
+        if (last.done) return res.end();
+      } else {
+        res.write(`data: ${JSON.stringify({ step: 0, label: 'Waiting to start...', done: false })}\n\n`);
+      }
 
       // Register this response as a listener
       if (!progressListeners.has(sessionId)) progressListeners.set(sessionId, new Set());
