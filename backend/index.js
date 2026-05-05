@@ -1630,6 +1630,10 @@ async function analyzePCAP(sessionId, pcapPath) {
     // 1. Run TShark (single pass, all protocols)
     console.log('[Analysis] Running TShark (full protocol extraction)...');
     const tsharkData = await runTShark(pcapPath);
+    if (tsharkData['image-jfif']?.length > 0) {
+  console.log('[DEBUG] image-jfif entry keys:', Object.keys(tsharkData['image-jfif'][0]));
+  console.log('[DEBUG] image-jfif first entry:', JSON.stringify(tsharkData['image-jfif'][0]).slice(0, 300));
+}
 const { packets } = tsharkData;
 console.log(`[Analysis] Parsed ${packets.length} packets`);
 
