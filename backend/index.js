@@ -1457,41 +1457,11 @@ async function resolveFilesForMessage(message, sessionId) {
 // ═══════════════════════════════════════════════════════════════════
 // HTTP OBJECT EXPORT - tshark --export-objects
 // ═══════════════════════════════════════════════════════════════════
-async function exportHttpObjects(sessionId, pcapPath) {
+async function exportHttpObjects(sessionId, pcapPath, tsharkData) {
   const exportDir = path.join(EXPORT_DIR, sessionId);
   if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir, { recursive: true });
 
-  // All export types tshark supports — same as Wireshark "Export Objects" menu
   const exportTypes = ['http', 'imf', 'smb', 'tftp', 'dicom'];
-
-  console.log(`[Export] Running tshark --export-objects for session ${sessionId}...`);
-
-  await Promise.all(exportTypes.map(type => new Promise((resolve) => {
-    const { spawn } = require('child_process');
-    const typeDir = path.join(exportDir, type);
-    if (!fs.existsSync(typeDir)) fs.mkdirSync(typeDir, { recursive: true });
-
-const proc = spawn(TSHARK_BIN, [
-  '-r', pcapPath,
-  '--export-objects', `${type},${typeDir}`,
-], {
-  env: { ...process.env, WIRESHARK_RUN_FROM_BUILD: '1' }
-});
-
-    let stderr = '';
-    proc.stderr.on('data', chunk => stderr += chunk.toString());
-    proc.on('error', () => resolve());
-    proc.on('close', (code) => {
-      if (code !== 0) console.warn(`[Export] ${type} exited ${code}: ${stderr.slice(0, 100)}`);
-      else console.log(`[Export] ✓ ${type} export done`);
-      resolve();
-    });
-
-    setTimeout(() => { proc.kill('SIGKILL'); resolve(); }, 60000);
-  })));
-
-  // Upload everything from all type subdirs to B2
-  let uploaded = 0;
   const mimeMap = {
     jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
     gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
@@ -1499,34 +1469,155 @@ const proc = spawn(TSHARK_BIN, [
     json: 'application/json', txt: 'text/plain', pdf: 'application/pdf',
   };
 
-  for (const type of exportTypes) {
+  console.log(`[Export] Running tshark --export-objects for session ${sessionId}...`);
+
+  // ── Pass 1: tshark --export-objects for SMB/IMF/TFTP/DICOM/HTTP binary files ──
+  await Promise.all(exportTypes.map(type => new Promise((resolve) => {
+    const { spawn } = require('child_process');
     const typeDir = path.join(exportDir, type);
-    try {
-      const files = fs.readdirSync(typeDir);
-      await Promise.all(files.map(async (filename) => {
+    if (!fs.existsSync(typeDir)) fs.mkdirSync(typeDir, { recursive: true });
+
+    const proc = spawn(TSHARK_BIN, [
+      '-r', pcapPath,
+      '--export-objects', `${type},${typeDir}`,
+    ], {
+      env: { ...process.env, WIRESHARK_RUN_FROM_BUILD: '1' },
+      stdio: ['ignore', 'ignore', 'pipe'], // suppress stdout/stderr cleanly
+    });
+
+    proc.stderr.resume(); // drain stderr so process doesn't hang
+    proc.on('error', () => resolve());
+    proc.on('close', (code) => {
+      console.log(`[Export] ✓ ${type} export done (exit ${code})`);
+      resolve();
+    });
+    setTimeout(() => { try { proc.kill('SIGKILL'); } catch(_){} resolve(); }, 60000);
+  })));
+
+  // ── Pass 2: inline extraction from already-parsed tsharkData ──
+  // Covers image-jfif, image-png, data-text-lines that --export-objects misses
+  const inlineMimeMap = {
+    'image-jfif':  'image/jpeg',
+    'image_jfif':  'image/jpeg',
+    'image-png':   'image/png',
+    'image-gif':   'image/gif',
+    'image-webp':  'image/webp',
+    'image-bmp':   'image/bmp',
+  };
+  const inlineExtMap = {
+    'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif',
+    'image/webp': 'webp', 'image/bmp': 'bmp',
+  };
+
+  const inlineObjects = [];
+  for (const [proto, entries] of Object.entries(tsharkData)) {
+    if (proto === 'packets' || !Array.isArray(entries) || entries.length === 0) continue;
+
+    // Image protocols — raw bytes are hex-encoded in 'data' or 'media' field
+    if (inlineMimeMap[proto]) {
+      const contentType = inlineMimeMap[proto];
+      const ext = inlineExtMap[contentType] || 'bin';
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const rawHex = entry.data || entry.media || entry.payload;
+        if (!rawHex || typeof rawHex !== 'string') continue;
         try {
-          const fileBuffer = fs.readFileSync(path.join(typeDir, filename));
-          const ext = filename.split('.').pop()?.toLowerCase() || '';
-          const contentType = mimeMap[ext] || 'application/octet-stream';
-          await b2.send(new PutObjectCommand({
-            Bucket: process.env.B2_BUCKET_NAME,
-            Key: `artifacts/${sessionId}/${filename}`,
-            Body: fileBuffer,
-            ContentType: contentType,
-          }));
-          uploaded++;
+          const buffer = Buffer.from(rawHex.replace(/:/g, ''), 'hex');
+          if (buffer.length < 16) continue;
+          const filename = `${proto}-${i}.${ext}`;
+          const typeDir = path.join(exportDir, 'inline');
+          if (!fs.existsSync(typeDir)) fs.mkdirSync(typeDir, { recursive: true });
+          fs.writeFileSync(path.join(typeDir, filename), buffer);
+          inlineObjects.push({ filename, content_type: contentType, src_ip: entry.src_ip, dst_ip: entry.dst_ip, src_port: entry.src_port, dst_port: entry.dst_port });
+          console.log(`[Extract] ✓ Inline image: ${filename} (${buffer.length} bytes)`);
         } catch (e) {
-          console.error(`[Export] Failed to upload ${filename}: ${e.message}`);
+          console.error(`[Extract] ${proto}[${i}]: ${e.message}`);
         }
-      }));
-      console.log(`[Export] ✓ ${type}: uploaded ${files.length} files`);
-    } catch (_) {}
+      }
+    }
+
+    // data-text-lines — plaintext content
+    if (proto === 'data-text-lines') {
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const textVal = entry['data_text_lines'] || entry['data-text-lines'] ||
+          Object.values(entry).find(v => typeof v === 'string' && v.length > 20 && !v.match(/^[0-9a-f:]{5,}$/i));
+        if (!textVal) continue;
+        try {
+          const filename = `text-${i}.txt`;
+          const typeDir = path.join(exportDir, 'inline');
+          if (!fs.existsSync(typeDir)) fs.mkdirSync(typeDir, { recursive: true });
+          fs.writeFileSync(path.join(typeDir, filename), Buffer.from(String(textVal), 'utf8'));
+          inlineObjects.push({ filename, content_type: 'text/plain', src_ip: entry.src_ip, dst_ip: entry.dst_ip, src_port: entry.src_port, dst_port: entry.dst_port });
+        } catch(e) {}
+      }
+    }
   }
+
+  // ── Upload all files (from both passes) to B2 + build manifest ──
+  let uploaded = 0;
+  const manifest = [];
+
+  const allDirs = [...exportTypes.map(t => ({ type: t, dir: path.join(exportDir, t) })),
+                   { type: 'inline', dir: path.join(exportDir, 'inline') }];
+
+  for (const { type, dir } of allDirs) {
+    if (!fs.existsSync(dir)) continue;
+    let files;
+    try { files = fs.readdirSync(dir); } catch(_) { continue; }
+
+    await Promise.all(files.map(async (filename) => {
+      try {
+        const filePath = path.join(dir, filename);
+        const fileBuffer = fs.readFileSync(filePath);
+        const ext = filename.split('.').pop()?.toLowerCase() || '';
+        const contentType = mimeMap[ext] || 'application/octet-stream';
+        const b2Key = `artifacts/${sessionId}/${filename}`;
+
+        await b2.send(new PutObjectCommand({
+          Bucket: process.env.B2_BUCKET_NAME,
+          Key: b2Key,
+          Body: fileBuffer,
+          ContentType: contentType,
+        }));
+
+        // find matching inline metadata if available
+        const meta = inlineObjects.find(o => o.filename === filename) || {};
+        manifest.push({
+          filename,
+          artifact_key: b2Key,
+          size: fileBuffer.length,
+          content_type: contentType,
+          src_ip: meta.src_ip || 'unknown',
+          dst_ip: meta.dst_ip || 'unknown',
+          src_port: meta.src_port || 0,
+          dst_port: meta.dst_port || (type === 'http' ? 80 : 0),
+          packet_num: 0,
+          is_image: contentType.startsWith('image/'),
+          export_type: type,
+        });
+        uploaded++;
+      } catch (e) {
+        console.error(`[Export] Failed to upload ${filename}: ${e.message}`);
+      }
+    }));
+    console.log(`[Export] ✓ ${type}: uploaded ${files.length} files`);
+  }
+
+  // Save manifest so /pcap/images can read it instantly without listing B2
+  await b2.send(new PutObjectCommand({
+    Bucket: process.env.B2_BUCKET_NAME,
+    Key: `artifacts/${sessionId}/_manifest.json`,
+    Body: JSON.stringify(manifest),
+    ContentType: 'application/json',
+  }));
 
   console.log(`[Export] ✓ Total uploaded ${uploaded} objects to B2`);
 
-  // Cleanup
+  // Cleanup local tmp
   try { fs.rmSync(exportDir, { recursive: true }); } catch (_) {}
+
+  return manifest;
 }
 // ═══════════════════════════════════════════════════════════════════
 // MAIN ANALYSIS HANDLER
@@ -1542,9 +1633,13 @@ async function analyzePCAP(sessionId, pcapPath) {
 const { packets } = tsharkData;
 console.log(`[Analysis] Parsed ${packets.length} packets`);
 
-        // 1b. Export all objects (HTTP/SMB/IMF/TFTP/DICOM) — same as Wireshark Export Objects
-    await exportHttpObjects(sessionId, pcapPath);
-
+// 1b. Export all objects — tshark --export-objects + inline image extraction
+const exportedManifest = await exportHttpObjects(sessionId, pcapPath, tsharkData);
+const session = sessions.get(sessionId);
+if (session) {
+  session.export_done = true;
+  session.object_count = exportedManifest.length;
+}
     // 2. Aggregate base stats
     const ports = new Set();
     const srcIPs = new Set();
@@ -1774,52 +1869,25 @@ const server = http.createServer(async (req, res) => {
       return json(res, data, 200, origin, acceptEncoding);
     }
 
-   // ── GET /pcap/images ─────────────────────────────────────────
-    if (req.method === 'GET' && url.startsWith('/pcap/images')) {
-      const q = getQuery(url);
-      const sessionId = q.session_id;
-      if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
-      if (!await ensureSession(sessionId)) return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
+   // ── GET /pcap/images ─────────────────────────────────────────if (req.method === 'GET' && url.startsWith('/pcap/images')) {
+  const q = getQuery(url);
+  const sessionId = q.session_id;
+  if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
+  if (!await ensureSession(sessionId)) return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
 
-      const images = [];
-      const mimeMap = {
-        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
-        gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
-        html: 'text/html', css: 'text/css', js: 'application/javascript',
-        json: 'application/json', txt: 'text/plain', pdf: 'application/pdf',
-      };
+  // Return 202 if export still running (frontend should poll)
+  const sess = sessions.get(sessionId);
+  if (sess && sess.export_done === false) {
+    return json(res, { error: 'Export still in progress', retry: true }, 202, origin, acceptEncoding);
+  }
 
-      try {
-        const listed = await b2.send(new ListObjectsV2Command({
-          Bucket: process.env.B2_BUCKET_NAME,
-          Prefix: `artifacts/${sessionId}/`,
-        }));
+  // Read manifest written by exportHttpObjects — fast, no B2 listing needed
+  const manifest = await fetchB2JSON(`artifacts/${sessionId}/_manifest.json`);
+  const images = manifest || [];
 
-        for (const obj of listed.Contents || []) {
-          const filename = obj.Key.split('/').pop() || 'unknown';
-          const ext = filename.split('.').pop()?.toLowerCase() || '';
-          const contentType = mimeMap[ext] || 'application/octet-stream';
-          images.push({
-            filename,
-            request_uri: '/' + filename,
-            hostname: 'unknown',
-            artifact_key: obj.Key,
-            size: obj.Size || 0,
-            content_type: contentType,
-            method: 'HTTP-export',
-            src_ip: 'unknown',
-            dst_ip: 'unknown',
-            src_port: 80,
-            dst_port: 0,
-            packet_num: 0,
-            is_image: contentType.startsWith('image/'),
-          });
-        }
-      } catch (e) {
-        console.error(`[Images] B2 list error: ${e.message}`);
-      }
-
-      console.log(`[Images] Session ${sessionId}: ${images.length} artifacts found`);
+  console.log(`[Images] Session ${sessionId}: ${images.length} artifacts found`);
+  return json(res, { images }, 200, origin, acceptEncoding);
+}
       return json(res, { images }, 200, origin, acceptEncoding);
     }
 
