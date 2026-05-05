@@ -824,11 +824,26 @@ const sessions = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 // ── Analysis Progress Tracker ─────────────────────────────────
-const analysisProgress = new Map(); // sessionId → { step, label, done }
+const analysisProgress = new Map();   // sessionId → { step, label, done }
+const progressListeners = new Map();  // sessionId → Set of SSE response objects
 
-function setProgress(sessionId, step, label) {
-  analysisProgress.set(sessionId, { step, label, done: false });
+function setProgress(sessionId, step, label, done = false) {
+  const data = { step, label, done };
+  analysisProgress.set(sessionId, data);
   console.log(`[Progress] ${sessionId} → step ${step}: ${label}`);
+
+  // Push to all listening SSE clients immediately — zero polling
+  const listeners = progressListeners.get(sessionId);
+  if (listeners && listeners.size > 0) {
+    const msg = `data: ${JSON.stringify(data)}\n\n`;
+    for (const res of listeners) {
+      try {
+        res.write(msg);
+        if (done) res.end();
+      } catch (_) {}
+    }
+    if (done) progressListeners.delete(sessionId);
+  }
 }
 
 // MiniSearch indexes per session (cleaned up on expiry)
@@ -890,8 +905,8 @@ await Promise.all(dynamicTypes.map(type => deleteFromB2(`analysis/${id}-${type}.
       } catch (_) {}
 
      analysisProgress.delete(id);
+      progressListeners.delete(id);
       sessions.delete(id);
-      console.log(`[Session] Expired + B2 cleaned + MiniSearch cleared: ${id}`);
     }
   }
 }, 5 * 60 * 1000);
@@ -1760,7 +1775,7 @@ setProgress(sessionId, 5, 'Uploading results to B2');
       )
     );
 
-analysisProgress.set(sessionId, { step: 6, label: 'Analysis complete', done: true });
+setProgress(sessionId, 6, 'Analysis complete', true);
     console.log(`[Analysis] ✓ Complete in ${Date.now() - startTime}ms`);
     return { success: true, summary, port_intelligence: portIntel, threats };
 
@@ -1831,8 +1846,34 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.startsWith('/api/progress/')) {
       const sessionId = url.split('/api/progress/')[1]?.split('?')[0];
       if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
-      const progress = analysisProgress.get(sessionId) || { step: 0, label: 'Waiting to start...', done: false };
-      return json(res, progress, 200, origin, acceptEncoding);
+
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        ...getCorsHeaders(origin),
+      });
+
+      // Send current state immediately
+      const current = analysisProgress.get(sessionId) || { step: 0, label: 'Waiting to start...', done: false };
+      res.write(`data: ${JSON.stringify(current)}\n\n`);
+
+      if (current.done) return res.end();
+
+      // Register this response as a listener
+      if (!progressListeners.has(sessionId)) progressListeners.set(sessionId, new Set());
+      progressListeners.get(sessionId).add(res);
+
+      // Clean up when client disconnects
+      req.on('close', () => {
+        const listeners = progressListeners.get(sessionId);
+        if (listeners) {
+          listeners.delete(res);
+          if (listeners.size === 0) progressListeners.delete(sessionId);
+        }
+      });
+
+      return; // don't end — keep SSE open
     }
 
     // ── Get Summary ──────────────────────────────────────────────
