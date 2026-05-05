@@ -1457,7 +1457,7 @@ async function resolveFilesForMessage(message, sessionId) {
 // ═══════════════════════════════════════════════════════════════════
 // HTTP OBJECT EXPORT - tshark --export-objects
 // ═══════════════════════════════════════════════════════════════════
-async function exportHttpObjects(sessionId, pcapPath, tsharkData) {
+async function exportHttpObjects(sessionId, pcapPath) {
   const exportDir = path.join(EXPORT_DIR, sessionId);
   if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir, { recursive: true });
 
@@ -1494,72 +1494,11 @@ async function exportHttpObjects(sessionId, pcapPath, tsharkData) {
     setTimeout(() => { try { proc.kill('SIGKILL'); } catch(_){} resolve(); }, 60000);
   })));
 
-  // ── Pass 2: inline extraction from already-parsed tsharkData ──
-  // Covers image-jfif, image-png, data-text-lines that --export-objects misses
-  const inlineMimeMap = {
-    'image-jfif':  'image/jpeg',
-    'image_jfif':  'image/jpeg',
-    'image-png':   'image/png',
-    'image-gif':   'image/gif',
-    'image-webp':  'image/webp',
-    'image-bmp':   'image/bmp',
-  };
-  const inlineExtMap = {
-    'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif',
-    'image/webp': 'webp', 'image/bmp': 'bmp',
-  };
-
-  const inlineObjects = [];
-  for (const [proto, entries] of Object.entries(tsharkData)) {
-    if (proto === 'packets' || !Array.isArray(entries) || entries.length === 0) continue;
-
-    // Image protocols — raw bytes are hex-encoded in 'data' or 'media' field
-    if (inlineMimeMap[proto]) {
-      const contentType = inlineMimeMap[proto];
-      const ext = inlineExtMap[contentType] || 'bin';
-      for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i];
-        const rawHex = entry.data || entry.media || entry.payload;
-        if (!rawHex || typeof rawHex !== 'string') continue;
-        try {
-          const buffer = Buffer.from(rawHex.replace(/:/g, ''), 'hex');
-          if (buffer.length < 16) continue;
-          const filename = `${proto}-${i}.${ext}`;
-          const typeDir = path.join(exportDir, 'inline');
-          if (!fs.existsSync(typeDir)) fs.mkdirSync(typeDir, { recursive: true });
-          fs.writeFileSync(path.join(typeDir, filename), buffer);
-          inlineObjects.push({ filename, content_type: contentType, src_ip: entry.src_ip, dst_ip: entry.dst_ip, src_port: entry.src_port, dst_port: entry.dst_port });
-          console.log(`[Extract] ✓ Inline image: ${filename} (${buffer.length} bytes)`);
-        } catch (e) {
-          console.error(`[Extract] ${proto}[${i}]: ${e.message}`);
-        }
-      }
-    }
-
-    // data-text-lines — plaintext content
-    if (proto === 'data-text-lines') {
-      for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i];
-        const textVal = entry['data_text_lines'] || entry['data-text-lines'] ||
-          Object.values(entry).find(v => typeof v === 'string' && v.length > 20 && !v.match(/^[0-9a-f:]{5,}$/i));
-        if (!textVal) continue;
-        try {
-          const filename = `text-${i}.txt`;
-          const typeDir = path.join(exportDir, 'inline');
-          if (!fs.existsSync(typeDir)) fs.mkdirSync(typeDir, { recursive: true });
-          fs.writeFileSync(path.join(typeDir, filename), Buffer.from(String(textVal), 'utf8'));
-          inlineObjects.push({ filename, content_type: 'text/plain', src_ip: entry.src_ip, dst_ip: entry.dst_ip, src_port: entry.src_port, dst_port: entry.dst_port });
-        } catch(e) {}
-      }
-    }
-  }
-
-  // ── Upload all files (from both passes) to B2 + build manifest ──
+// ── Upload all files to B2 + build manifest ──
   let uploaded = 0;
   const manifest = [];
 
-  const allDirs = [...exportTypes.map(t => ({ type: t, dir: path.join(exportDir, t) })),
-                   { type: 'inline', dir: path.join(exportDir, 'inline') }];
+  const allDirs = exportTypes.map(t => ({ type: t, dir: path.join(exportDir, t) }));
 
   for (const { type, dir } of allDirs) {
     if (!fs.existsSync(dir)) continue;
@@ -1581,17 +1520,15 @@ async function exportHttpObjects(sessionId, pcapPath, tsharkData) {
           ContentType: contentType,
         }));
 
-        // find matching inline metadata if available
-        const meta = inlineObjects.find(o => o.filename === filename) || {};
         manifest.push({
           filename,
           artifact_key: b2Key,
           size: fileBuffer.length,
           content_type: contentType,
-          src_ip: meta.src_ip || 'unknown',
-          dst_ip: meta.dst_ip || 'unknown',
-          src_port: meta.src_port || 0,
-          dst_port: meta.dst_port || (type === 'http' ? 80 : 0),
+          src_ip: 'unknown',
+          dst_ip: 'unknown',
+          src_port: 0,
+          dst_port: type === 'http' ? 80 : 0,
           packet_num: 0,
           is_image: contentType.startsWith('image/'),
           export_type: type,
@@ -1603,7 +1540,6 @@ async function exportHttpObjects(sessionId, pcapPath, tsharkData) {
     }));
     console.log(`[Export] ✓ ${type}: uploaded ${files.length} files`);
   }
-
   // Save manifest so /pcap/images can read it instantly without listing B2
   await b2.send(new PutObjectCommand({
     Bucket: process.env.B2_BUCKET_NAME,
@@ -1627,23 +1563,21 @@ async function analyzePCAP(sessionId, pcapPath) {
   const startTime = Date.now();
 
   try {
-    // 1. Run TShark (single pass, all protocols)
-    console.log('[Analysis] Running TShark (full protocol extraction)...');
-    const tsharkData = await runTShark(pcapPath);
-    if (tsharkData['image-jfif']?.length > 0) {
-  console.log('[DEBUG] image-jfif entry keys:', Object.keys(tsharkData['image-jfif'][0]));
-  console.log('[DEBUG] image-jfif first entry:', JSON.stringify(tsharkData['image-jfif'][0]).slice(0, 300));
-}
-const { packets } = tsharkData;
-console.log(`[Analysis] Parsed ${packets.length} packets`);
+      // NEW — parallel, no timeout
+console.log('[Analysis] Running TShark + export-objects in parallel...');
+const [tsharkData, exportedManifest] = await Promise.all([
+  runTShark(pcapPath),
+  exportHttpObjects(sessionId, pcapPath) // no tsharkData param needed
+]);
 
-// 1b. Export all objects — tshark --export-objects + inline image extraction
-const exportedManifest = await exportHttpObjects(sessionId, pcapPath, tsharkData);
 const session = sessions.get(sessionId);
 if (session) {
   session.export_done = true;
   session.object_count = exportedManifest.length;
 }
+
+const { packets } = tsharkData;
+console.log(`[Analysis] Parsed ${packets.length} packets, exported ${exportedManifest.length} objects`);
     // 2. Aggregate base stats
     const ports = new Set();
     const srcIPs = new Set();
