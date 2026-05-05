@@ -1869,17 +1869,26 @@ const server = http.createServer(async (req, res) => {
       return json(res, data, 200, origin, acceptEncoding);
     }
 
-   // ── GET /pcap/images ─────────────────────────────────────────if (req.method === 'GET' && url.startsWith('/pcap/images')) {
-  const q = getQuery(url);
-  const sessionId = q.session_id;
-  if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
-  if (!await ensureSession(sessionId)) return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
+   // ── GET /pcap/images ─────────────────────────────────────────
+    if (req.method === 'GET' && url.startsWith('/pcap/images')) {
+      const q = getQuery(url);
+      const sessionId = q.session_id;
+      if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
+      if (!await ensureSession(sessionId)) return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
 
-  // Return 202 if export still running (frontend should poll)
-  const sess = sessions.get(sessionId);
-  if (sess && sess.export_done === false) {
-    return json(res, { error: 'Export still in progress', retry: true }, 202, origin, acceptEncoding);
-  }
+      // Return 202 if export still running (frontend should poll)
+      const sess = sessions.get(sessionId);
+      if (sess && sess.export_done === false) {
+        return json(res, { error: 'Export still in progress', retry: true }, 202, origin, acceptEncoding);
+      }
+
+      // Read manifest written by exportHttpObjects — fast, no B2 listing needed
+      const manifest = await fetchB2JSON(`artifacts/${sessionId}/_manifest.json`);
+      const images = manifest || [];
+
+      console.log(`[Images] Session ${sessionId}: ${images.length} artifacts found`);
+      return json(res, { images }, 200, origin, acceptEncoding);
+    }
 
   // Read manifest written by exportHttpObjects — fast, no B2 listing needed
   const manifest = await fetchB2JSON(`artifacts/${sessionId}/_manifest.json`);
