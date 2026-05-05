@@ -1,4 +1,5 @@
 const http = require('http');
+const { WebSocketServer } = require('ws');
 const https = require('https');
 const { exec } = require('child_process');
 const fs = require('fs');
@@ -824,30 +825,25 @@ const sessions = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 // ── Analysis Progress Tracker ─────────────────────────────────
-const analysisProgress = new Map();   // sessionId → { step, label, done }
-const progressHistory = new Map();    // sessionId → array of all steps so far
-const progressListeners = new Map();  // sessionId → Set of SSE response objects
+const analysisProgress = new Map();
+const progressHistory = new Map();
+const progressClients = new Map(); // sessionId → Set of WebSocket clients
 
 function setProgress(sessionId, step, label, done = false) {
   const data = { step, label, done };
   analysisProgress.set(sessionId, data);
-
-  // Keep full history so late SSE connections can replay all missed steps
   if (!progressHistory.has(sessionId)) progressHistory.set(sessionId, []);
   progressHistory.get(sessionId).push(data);
-
   console.log(`[Progress] ${sessionId} → step ${step}: ${label}`);
-
-  const listeners = progressListeners.get(sessionId);
-  if (listeners && listeners.size > 0) {
-    const msg = `data: ${JSON.stringify(data)}\n\n`;
-    for (const res of listeners) {
+  const clients = progressClients.get(sessionId);
+  if (clients && clients.size > 0) {
+    const msg = JSON.stringify(data);
+    for (const ws of clients) {
       try {
-        res.write(msg);
-        if (done) res.end();
+        if (ws.readyState === 1) ws.send(msg);
       } catch (_) {}
     }
-    if (done) progressListeners.delete(sessionId);
+    if (done) progressClients.delete(sessionId);
   }
 }
 // MiniSearch indexes per session (cleaned up on expiry)
@@ -910,7 +906,6 @@ await Promise.all(dynamicTypes.map(type => deleteFromB2(`analysis/${id}-${type}.
 
 analysisProgress.delete(id);
       progressHistory.delete(id);
-      progressListeners.delete(id);
       sessions.delete(id);
     }
   }
@@ -1848,46 +1843,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Get Summary ──────────────────────────────────────────────
 // ── Analysis Progress ─────────────────────────────────────────
-    if (req.method === 'GET' && url.startsWith('/api/progress/')) {
-      const sessionId = url.split('/api/progress/')[1]?.split('?')[0];
-      if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
-
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET',
-        'Access-Control-Allow-Headers': 'Content-Type',
-      });
-
-// Replay ALL missed steps so frontend catches up instantly
-      const history = progressHistory.get(sessionId) || [];
-      if (history.length > 0) {
-        for (const event of history) {
-          res.write(`data: ${JSON.stringify(event)}\n\n`);
-        }
-        const last = history[history.length - 1];
-        if (last.done) return res.end();
-      } else {
-        res.write(`data: ${JSON.stringify({ step: 0, label: 'Waiting to start...', done: false })}\n\n`);
-      }
-
-      // Register this response as a listener
-      if (!progressListeners.has(sessionId)) progressListeners.set(sessionId, new Set());
-      progressListeners.get(sessionId).add(res);
-
-      // Clean up when client disconnects
-      req.on('close', () => {
-        const listeners = progressListeners.get(sessionId);
-        if (listeners) {
-          listeners.delete(res);
-          if (listeners.size === 0) progressListeners.delete(sessionId);
-        }
-      });
-
-      return; // don't end — keep SSE open
-    }
+    
 
     // ── Get Summary ──────────────────────────────────────────────
     if (req.method === 'GET' && url.startsWith('/api/summary/')) {      const sessionId = url.split('/api/summary/')[1]?.split('?')[0];
@@ -2181,6 +2137,39 @@ if ((req.method === 'GET' || req.method === 'HEAD') && url === '/health') {
 
 // ── Start Server ───────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws, req) => {
+  const urlPath = req.url || '';
+  const match = urlPath.match(/\/api\/progress\/([^?]+)/);
+  if (!match) return ws.close();
+
+  const sessionId = match[1];
+  if (!isValidSessionId(sessionId)) return ws.close();
+
+  // Replay all missed steps instantly
+  const history = progressHistory.get(sessionId) || [];
+  for (const event of history) {
+    try { ws.send(JSON.stringify(event)); } catch (_) {}
+  }
+
+  // Already done — close immediately
+  const last = history[history.length - 1];
+  if (last?.done) return ws.close();
+
+  // Register client
+  if (!progressClients.has(sessionId)) progressClients.set(sessionId, new Set());
+  progressClients.get(sessionId).add(ws);
+
+  ws.on('close', () => {
+    const clients = progressClients.get(sessionId);
+    if (clients) {
+      clients.delete(ws);
+      if (clients.size === 0) progressClients.delete(sessionId);
+    }
+  });
+});
+
 server.listen(PORT, () => {
   console.log('═══════════════════════════════════════════════════════════════');
   console.log('  PCAP Intelligence Server - HYBRID PROTOCOL EDITION');
