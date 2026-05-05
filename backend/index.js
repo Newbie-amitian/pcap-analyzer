@@ -1471,11 +1471,9 @@ async function exportHttpObjects(sessionId, pcapPath) {
     const typeDir = path.join(exportDir, type);
     if (!fs.existsSync(typeDir)) fs.mkdirSync(typeDir, { recursive: true });
 
-    const proc = spawn(TSHARK_BIN, [
+const proc = spawn(TSHARK_BIN, [
   '-r', pcapPath,
   '--export-objects', `${type},${typeDir}`,
-  '--no-duplicate-keys',
-  '-o', 'console.log.level:warning',
 ], {
   env: { ...process.env, WIRESHARK_RUN_FROM_BUILD: '1' }
 });
