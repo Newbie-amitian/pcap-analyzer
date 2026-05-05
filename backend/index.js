@@ -823,6 +823,14 @@ exec(`"${TSHARK_BIN}" -v 2>/dev/null`, (err, stdout) => {
 const sessions = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
+// ── Analysis Progress Tracker ─────────────────────────────────
+const analysisProgress = new Map(); // sessionId → { step, label, done }
+
+function setProgress(sessionId, step, label) {
+  analysisProgress.set(sessionId, { step, label, done: false });
+  console.log(`[Progress] ${sessionId} → step ${step}: ${label}`);
+}
+
 // MiniSearch indexes per session (cleaned up on expiry)
 const sessionPortIndexes = new Map();     // portIndex per sessionId
 const sessionContentIndexes = new Map();  // contentIndex per sessionId
@@ -881,6 +889,7 @@ await Promise.all(dynamicTypes.map(type => deleteFromB2(`analysis/${id}-${type}.
         }
       } catch (_) {}
 
+     analysisProgress.delete(id);
       sessions.delete(id);
       console.log(`[Session] Expired + B2 cleaned + MiniSearch cleared: ${id}`);
     }
@@ -1598,21 +1607,23 @@ async function analyzePCAP(sessionId, pcapPath) {
   const startTime = Date.now();
 
   try {
-      // NEW — parallel, no timeout
-console.log('[Analysis] Running TShark + export-objects in parallel...');
-const [tsharkData, exportedManifest] = await Promise.all([
-  runTShark(pcapPath),
-  exportHttpObjects(sessionId, pcapPath) // no tsharkData param needed
-]);
+    setProgress(sessionId, 0, 'Running TShark extraction');
+    console.log('[Analysis] Running TShark + export-objects in parallel...');
+    const [tsharkData, exportedManifest] = await Promise.all([
+      runTShark(pcapPath),
+      exportHttpObjects(sessionId, pcapPath)
+    ]);
 
-const session = sessions.get(sessionId);
-if (session) {
-  session.export_done = true;
-  session.object_count = exportedManifest.length;
-}
+    const session = sessions.get(sessionId);
+    if (session) {
+      session.export_done = true;
+      session.object_count = exportedManifest.length;
+    }
 
-const { packets } = tsharkData;
-console.log(`[Analysis] Parsed ${packets.length} packets, exported ${exportedManifest.length} objects`);
+    const { packets } = tsharkData;
+    console.log(`[Analysis] Parsed ${packets.length} packets, exported ${exportedManifest.length} objects`);
+
+    setProgress(sessionId, 1, 'Resolving IANA port registry');
     // 2. Aggregate base stats
     const ports = new Set();
     const srcIPs = new Set();
@@ -1643,6 +1654,7 @@ console.log(`[Analysis] Parsed ${packets.length} packets, exported ${exportedMan
       portServiceMap.set(port, info?.service_name || 'Unknown');
     }
 
+    setProgress(sessionId, 2, 'Fetching CVEs from NVD');
     // 4. Batch resolve risks: hardcoded for known, SearXNG only for unknown
     console.log('[Analysis] Resolving port risks (hybrid: hardcoded + dynamic)...');
     const portRisksMap = await batchResolvePortRisks(portServiceMap);
@@ -1651,10 +1663,12 @@ console.log(`[Analysis] Parsed ${packets.length} packets, exported ${exportedMan
     console.log('[Analysis] Fetching CVEs...');
     const portCVEMap = await batchFetchCVEs(portServiceMap);
 
+    setProgress(sessionId, 3, 'Checking IP reputations');
     // 6. IP reputation
     console.log('[Analysis] Checking IP reputations...');
     const ipReputations = await batchCheckIPReputation([...srcIPs, ...dstIPs]);
 
+    setProgress(sessionId, 4, 'Building threat intelligence');
     // 7. Threat detection
     console.log('[Analysis] Running threat detection...');
     const threats = {
@@ -1732,6 +1746,7 @@ for (const [proto, data] of Object.entries(tsharkData)) {
     uploadedProtocols++;
   }
 }
+setProgress(sessionId, 5, 'Uploading results to B2');
     console.log(`[Analysis] ${uploadedProtocols} protocol files have data, uploading to B2...`);
 
     await Promise.all(
@@ -1745,6 +1760,7 @@ for (const [proto, data] of Object.entries(tsharkData)) {
       )
     );
 
+analysisProgress.set(sessionId, { step: 6, label: 'Analysis complete', done: true });
     console.log(`[Analysis] ✓ Complete in ${Date.now() - startTime}ms`);
     return { success: true, summary, port_intelligence: portIntel, threats };
 
@@ -1811,8 +1827,16 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ── Get Summary ──────────────────────────────────────────────
-    if (req.method === 'GET' && url.startsWith('/api/summary/')) {
-      const sessionId = url.split('/api/summary/')[1]?.split('?')[0];
+// ── Analysis Progress ─────────────────────────────────────────
+    if (req.method === 'GET' && url.startsWith('/api/progress/')) {
+      const sessionId = url.split('/api/progress/')[1]?.split('?')[0];
+      if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
+      const progress = analysisProgress.get(sessionId) || { step: 0, label: 'Waiting to start...', done: false };
+      return json(res, progress, 200, origin, acceptEncoding);
+    }
+
+    // ── Get Summary ──────────────────────────────────────────────
+    if (req.method === 'GET' && url.startsWith('/api/summary/')) {      const sessionId = url.split('/api/summary/')[1]?.split('?')[0];
       if (!isValidSessionId(sessionId)) return json(res, { error: 'Invalid session ID' }, 400, origin, acceptEncoding);
       if (!await ensureSession(sessionId)) return json(res, { error: 'Session not found' }, 404, origin, acceptEncoding);
       const data = await fetchB2JSON(`analysis/${sessionId}-summary.json`);
