@@ -2146,8 +2146,8 @@ Respond in a helpful, concise manner using markdown formatting. If data for a sp
     }
 
     // ── Health Check ──────────────────────────────────────────────
-    if (req.method === 'GET' && url === '/health') {
-      return json(res, {
+if ((req.method === 'GET' || req.method === 'HEAD') && url === '/health') {
+  return json(res, {
         status: 'ok',
         uptime: process.uptime(),
         sessions: sessions.size,
