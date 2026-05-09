@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.local
+server.log
+tmp_pcaps/
+tmp_exports/
+iana_ports_cache.json
+.next/
+*.log

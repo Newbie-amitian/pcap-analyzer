@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: pcap-analyzer-backend
+    env: node
+    buildCommand: echo "No build step needed"
+    startCommand: node index.js
+    envVars:
+      - key: PORT
+        value: 4000
+    autoDeploy: true
